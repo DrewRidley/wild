@@ -65,6 +65,7 @@ use crate::macho_object::CodeSignatureSuperBlob;
 use crate::macho_object::DYLD_CHAINED_IMPORT;
 use crate::macho_object::DYLD_CHAINED_PTR_64_OFFSET;
 use crate::macho_object::DyldChainedStartsInSegment;
+use crate::malfunction;
 use crate::output_section_id;
 use crate::output_section_id::SectionName;
 use crate::output_section_part_map::OutputSectionPartMap;
@@ -299,7 +300,17 @@ fn write_got_entries(layout: &MachOLayout<'_>, got: &mut [u8]) -> Result {
         */
         let bind = 1u64 << 63;
         // TODO: when crossing a page boundary, next is equal to zero
-        let next = if i == sorted_symbols.len() - 1 { 0 } else { 2 };
+        let mut next = if i == sorted_symbols.len() - 1 { 0 } else { 2 };
+
+        // Malfunction: terminate the fixup chain after its first entry. The
+        // `dyld_chained_import` table is left intact, so a checker that only reads the import
+        // table sees nothing wrong; only a checker that actually *walks* the page chain notices
+        // that every fixup after the first has become unreachable and will never be applied by
+        // dyld. Requires at least two imported symbols to have any effect.
+        if i == 0 && malfunction::malfunction_point("macho-drop-fixup") {
+            next = 0;
+        }
+
         let next = next << 51;
         let ordinal = i as u64;
         got[offset..end].copy_from_slice(&(bind | next | ordinal).to_le_bytes());
@@ -354,10 +365,17 @@ fn populate_file_header(
     header
         .sizeofcmds
         .set(LE, load_commands_info.segment_size.file_size as u32);
-    header.flags.set(
-        LE,
-        macho::MH_PIE | macho::MH_DYLDLINK | macho::MH_NOUNDEFS | macho::MH_TWOLEVEL,
-    );
+    let mut flags = macho::MH_PIE | macho::MH_DYLDLINK | macho::MH_NOUNDEFS | macho::MH_TWOLEVEL;
+
+    // Malfunction: clear MH_PIE. The binary still links and still runs, but it is no longer
+    // position independent, so the loader stops applying ASLR to it. This is the archetypal
+    // silent security regression, and it is invisible to anything that doesn't read the Mach-O
+    // header flags.
+    if malfunction::malfunction_point("macho-no-pie") {
+        flags = macho::FileFlags(flags.0 & !macho::MH_PIE.0);
+    }
+
+    header.flags.set(LE, flags);
     header.reserved.set(LE, 0);
     Ok(())
 }
@@ -751,6 +769,15 @@ fn write_entry_point_command(layout: &MachOLayout, command: &mut EntryPointComma
         .set(LE, size_of::<EntryPointCommand>() as u32);
     command.entryoff.set(LE, segment_size.file_offset as u64);
     command.stacksize.set(LE, 0);
+
+    // Malfunction: shift the entry point by one instruction. Deliberately expressed as a mutation
+    // of whatever value was computed above rather than as part of the computation, so that this
+    // stays valid if the way `entryoff` is derived changes.
+    if malfunction::malfunction_point("macho-wrong-entry-point") {
+        let entryoff = command.entryoff.get(LE);
+        command.entryoff.set(LE, entryoff.wrapping_add(4));
+    }
+
     Ok(())
 }
 
@@ -848,9 +875,17 @@ fn write_symtab_command(layout: &MachOLayout, command: &mut SymtabCommand) {
     command.cmd.set(LE, LC_SYMTAB);
     command.cmdsize.set(LE, size_of::<SymtabCommand>() as u32);
     command.symoff.set(LE, symtab.file_offset as u32);
-    command
-        .nsyms
-        .set(LE, (symtab.file_size / size_of::<SymtabEntry>()) as u32);
+
+    let mut nsyms = (symtab.file_size / size_of::<SymtabEntry>()) as u32;
+
+    // Malfunction: under-report the symbol count so that the last symbol in the table becomes
+    // invisible to anything reading LC_SYMTAB. The symbol bytes are still present in __LINKEDIT,
+    // so this is not detectable by hashing the file's contents - only by comparing symbol tables.
+    if malfunction::malfunction_point("macho-truncate-symtab") {
+        nsyms = nsyms.saturating_sub(1);
+    }
+
+    command.nsyms.set(LE, nsyms);
     command.stroff.set(LE, strtab.file_offset as u32);
     command.strsize.set(LE, strtab.file_size as u32);
 }
@@ -922,7 +957,19 @@ fn write_chained_fixup_table(layout: &MachOLayout, chained_fixup_table: &mut [u8
     };
 
     // Accounts for both seg_count and __PAGEZERO.
-    starts_in_image[data_const_segment_index + 2].set(LE, starts_in_image_len as u32);
+    //
+    // Malfunction: leave the `seg_info_offset` for this segment at zero. A zero offset means
+    // "this segment has no fixups", so dyld skips the segment entirely and none of its binds or
+    // rebases are ever applied - while the `dyld_chained_starts_in_segment` record we go on to
+    // write below is still physically present in the blob, just orphaned. This is the shape of
+    // the real bug that motivated this work (wild emits a starts record for only one segment),
+    // so any checker that claims to detect that bug must detect this.
+    let seg_info_offset = if malfunction::malfunction_point("macho-drop-segment-starts") {
+        0
+    } else {
+        starts_in_image_len as u32
+    };
+    starts_in_image[data_const_segment_index + 2].set(LE, seg_info_offset);
 
     let (starts_in_segment, rest) = DyldChainedStartsInSegment::mut_from_prefix(rest)
         .map_err(|_| error!("Invalid chained fixups starts in segment allocation"))?;
@@ -943,9 +990,16 @@ fn write_chained_fixup_table(layout: &MachOLayout, chained_fixup_table: &mut [u8
     starts_in_segment
         .pointer_format
         .set(DYLD_CHAINED_PTR_64_OFFSET);
-    starts_in_segment
-        .segment_offset
-        .set(data_const_segment.file_offset as u64);
+    // Malfunction: point the starts record at the wrong segment offset (one page too high). Every
+    // fixup slot in the chain is then computed relative to the wrong base, so dyld writes
+    // pointers into the wrong memory. `integration_tests::verify_chained_fixups_segment_offsets`
+    // already checks this field, so this injection also proves that check still bites.
+    let mut segment_offset = data_const_segment.file_offset as u64;
+    if malfunction::malfunction_point("macho-wrong-segment-offset") {
+        segment_offset = segment_offset.wrapping_add(MACHO_PAGE_ALIGNMENT.value());
+    }
+
+    starts_in_segment.segment_offset.set(segment_offset);
     starts_in_segment.max_valid_pointer.set(0);
     // TODO:
     starts_in_segment.page_count.set(1);
@@ -987,7 +1041,15 @@ fn write_chained_fixup_table(layout: &MachOLayout, chained_fixup_table: &mut [u8
             }
         };
 
-        let lib_ordinal = dynamic.ordinal.get();
+        let mut lib_ordinal = dynamic.ordinal.get();
+
+        // Malfunction: bind against the wrong library. The name offset is untouched, so the
+        // import still resolves to a plausible-looking symbol name; only the ordinal that says
+        // *which dylib to look in* is wrong. A checker that compares symbol names but not
+        // ordinals will not notice.
+        if malfunction::malfunction_point("macho-bad-import-ordinal") {
+            lib_ordinal = lib_ordinal.wrapping_add(1);
+        }
 
         imports[i].set(
             Endianness::Little,
