@@ -106,6 +106,13 @@
 //!
 //! RunEnabled:{bool} Defaults to true. Set to false to disable execution of the resulting binary.
 //!
+//! KnownFailure:{description} Marks the test as currently failing because of a known bug in wild.
+//! The description is mandatory and should say what is broken. While the test keeps failing it is
+//! reported as ignored (with the description and the real error), so the suite stays green. If the
+//! test *passes*, the test is reported as FAILED, telling you to delete the directive. That way a
+//! `KnownFailure` can never silently hide a test that has started working. Nothing else about the
+//! test is weakened: it is still built, linked, asserted, diffed and run exactly as normal.
+//!
 //! RunDynSym:{string} If set and RunEnabled:true, then, instead of executing the binary normally,
 //! the binary is loaded as a shared library and the function specified by the string is called. The
 //! function must return an integer to indicate status (status != 42 is an error). Such run is
@@ -1142,6 +1149,12 @@ struct Config {
     so_single_linker: Option<Linker>,
     available_linkers: Vec<Linker>,
     driver_mode: Option<DriverMode>,
+
+    /// If set, this test is currently expected to fail because of a known bug in wild. The string
+    /// is a human-readable description of the bug. The test is reported as ignored while it keeps
+    /// failing, but reported as *failed* if it starts passing, so that the directive can never
+    /// silently hide a working test. See `//#KnownFailure`.
+    known_failure: Option<String>,
 }
 
 /// These configs are used by the config file specified in `$WILD_TEST_CONFIG`
@@ -1164,6 +1177,10 @@ struct TestConfig {
 
     /// Run the diffing component of each test. By default, diffs are skipped.
     /// Enable this to verify that wild produces output matching other linkers.
+    ///
+    /// Can also be turned on without a config file by setting `WILD_TEST_RUN_ALL_DIFFS=1`, which
+    /// is how CI enables it for the Mach-O job. Note that diffing additionally requires at least
+    /// one reference linker to be available - see `available_linkers_for_mac`.
     #[serde(default)]
     run_all_diffs: bool,
 
@@ -1833,6 +1850,7 @@ impl Config {
             available_linkers: available_linkers.to_owned(),
             so_single_linker: None,
             driver_mode: None,
+            known_failure: None,
         }
     }
 }
@@ -2144,6 +2162,12 @@ fn process_directive(
             config.diff_match_any = arg.parse().context("Invalid bool for DiffMatchAny")?
         }
         "RunEnabled" => config.should_run = arg.parse().context("Invalid bool for RunEnabled")?,
+        "KnownFailure" => {
+            if arg.is_empty() {
+                bail!("KnownFailure requires a description of the bug being tracked");
+            }
+            config.known_failure = Some(arg.to_owned());
+        }
         "RunDynSym" => {
             config.run_dyn_sym = Some(arg.parse().context("Invalid string for RunDynSym")?)
         }
@@ -4443,6 +4467,7 @@ impl Assertions {
         verify_no_overlapping_sections(obj)?;
         verify_no_overlapping_segments(obj)?;
         verify_chained_fixups_segment_offsets(obj, bytes)?;
+        verify_macho_pie(obj)?;
 
         if linker_used.is_wild() {
             verify_uuid(obj, bytes)?;
@@ -5268,6 +5293,40 @@ fn verify_chained_fixups_segment_offsets(obj: &object::File, bytes: &[u8]) -> Re
             expected offset {expected_segment_offset:#x}"
         );
     }
+
+    Ok(())
+}
+
+/// Checks that Mach-O executables are position independent.
+///
+/// Without `MH_PIE` the kernel loads the image at its link-time address, the load bias is always
+/// zero and every missing rebase / chained fixup becomes invisible at run time. Since the test
+/// binaries are executed with a plain `posix_spawn` (nothing in this harness asks for
+/// `POSIX_SPAWN_DISABLE_ASLR`), `MH_PIE` is the only thing that makes ASLR actually happen, and
+/// therefore the only thing that makes a missing fixup observable. Assert it explicitly so that a
+/// regression which drops the flag cannot quietly disable that coverage.
+fn verify_macho_pie(obj: &object::File) -> Result {
+    let object::File::MachO64(file) = obj else {
+        return Ok(());
+    };
+
+    // Values from <mach-o/loader.h>.
+    const MH_EXECUTE: u32 = 0x2;
+    const MH_PIE: u32 = 0x0020_0000;
+
+    let header = file.macho_header();
+    let e = file.endianness();
+
+    if header.filetype.get(e).0 != MH_EXECUTE {
+        return Ok(());
+    }
+
+    let flags: u32 = header.flags.get(e).0;
+    ensure!(
+        flags & MH_PIE != 0,
+        "Mach-O executable is missing MH_PIE (header flags 0x{flags:x}). Without it the image \
+         loads at a fixed address, so ASLR is off and missing rebases become undetectable."
+    );
 
     Ok(())
 }
@@ -6487,7 +6546,23 @@ fn run_integration_test(
         )
     })?;
 
-    run_with_config(program_inputs, &config, cross_arch)?;
+    let result = run_with_config(program_inputs, &config, cross_arch);
+
+    if let Some(known_failure) = config.known_failure.as_deref() {
+        return match result {
+            Err(error) => Ok(libtest_mimic::Completion::ignored_with(format!(
+                "Known failure ({known_failure}). Actual error: {}",
+                error.to_string()
+            ))),
+            Ok(()) => bail!(
+                "This test is marked `//#KnownFailure:{known_failure}`, but it passed. If wild \
+                 has been fixed, delete the KnownFailure directive so the test starts guarding \
+                 the fix."
+            ),
+        };
+    }
+
+    result?;
 
     Ok(libtest_mimic::Completion::Completed)
 }
@@ -6706,6 +6781,13 @@ fn read_test_config() -> Result<TestConfig> {
     // The environment variable `WILD_TEST_CROSS` can override the config file setting.
     if let Some(qemu_arch_from_env) = get_wild_test_cross()? {
         config.qemu_arch = qemu_arch_from_env;
+    }
+
+    // `WILD_TEST_RUN_ALL_DIFFS` turns diffing on without needing a config file at all. Without
+    // this, `run_all_diffs` silently defaults to false, which means output diffing never runs
+    // unless someone has created the (gitignored) `test-config.toml`.
+    if let Ok(value) = std::env::var("WILD_TEST_RUN_ALL_DIFFS") {
+        config.run_all_diffs = !value.is_empty() && value != "0";
     }
 
     Ok(config)

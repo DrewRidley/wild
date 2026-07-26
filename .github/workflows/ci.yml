@@ -171,6 +171,9 @@ jobs:
     timeout-minutes: 10
     env:
       WILD_TEST_IGNORE_FORMAT: "1" # Checked by other jobs
+      # Without this, `TestConfig::run_all_diffs` defaults to false and linker-diff is never run
+      # for Mach-O, so the whole output-comparison layer is silently skipped in this job.
+      WILD_TEST_RUN_ALL_DIFFS: "1"
     steps:
       - run: brew install lld
       - uses: actions/checkout@v7
