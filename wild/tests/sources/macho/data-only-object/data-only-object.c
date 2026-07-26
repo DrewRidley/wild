@@ -3,12 +3,15 @@
 //#Object:only-data.c
 //#ExpectSym:_main
 //#DiffIgnore:section.__unwind_info
-//#KnownFailure:wild panics while laying out the output when an input object contains only data and no code (todo!() in Platform::is_zero_sized_section_content). ld64 links it and the binary exits 42.
 
 // An input object that contains only initialised data and no code at all. This
 // is completely ordinary in real links (generated tables, `const` blobs, Rust
-// `.rodata`-only CGUs) but currently makes wild abort while laying out the
-// Mach-O output.
+// `.rodata`-only CGUs). Such an object still carries a zero-sized `__TEXT,__text`
+// section, which used to make wild abort while laying out the Mach-O output.
+//
+// It also covers GOT-load relaxation: `table` is defined by another object, so the
+// compiler reaches it through the GOT, and the linker has to turn that back into
+// direct page-relative addressing.
 
 #include <stdio.h>
 

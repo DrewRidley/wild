@@ -4,7 +4,6 @@
 //#Object:data2.c
 //#ExpectSym:_main
 //#DiffIgnore:section.__unwind_info
-//#KnownFailure:wild fails to link this: "Unexpected memory offsets: Part #6 (section `__got` alignment: 1) expected: 0x100008000 actual: 0x100008018". ld64 links it and the binary exits 42.
 
 // Pointers in initialised data spread across three input objects, including
 // pointers that cross object boundaries in both directions. Each object
