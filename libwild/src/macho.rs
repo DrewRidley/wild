@@ -34,6 +34,7 @@ use crate::output_section_id::SectionName;
 use crate::output_section_id::SectionOutputInfo;
 use crate::output_section_part_map::OutputSectionPartMap;
 use crate::part_id;
+use crate::part_id::PartId;
 use crate::platform;
 use crate::platform::Args;
 use crate::platform::ObjectFile;
@@ -81,10 +82,18 @@ pub(crate) const DYLINKER_PATH: &[u8] = b"/usr/lib/dyld";
 // TODO: Getting the number of active segments in epilogue depends on determine_header_size
 // which is called later for the prologue. We potentially over-allocate a couple of bytes.
 pub(crate) const MAX_SEGMENT_COUNT: usize = 6;
+
+/// The number of segments that can hold chained fixups, and therefore the number of
+/// `dyld_chained_starts_in_segment` records the fixup table might have to hold. Applying a fixup
+/// is a store into the segment, so only the writable data segments qualify: `__DATA` and
+/// `__DATA_CONST`.
+pub(crate) const MAX_FIXUP_SEGMENT_COUNT: usize = 2;
+
 pub(crate) const CHAINED_FIXUP_TABLE_BASE_SIZE: u64 = (size_of::<ChainedFixupsHeader>()
     + size_of::<u32>() * (MAX_SEGMENT_COUNT + /* leading segment count */ 1)
-    + size_of::<DyldChainedStartsInSegment>())
-    as u64;
+    + MAX_FIXUP_SEGMENT_COUNT * size_of::<DyldChainedStartsInSegment>()
+    // The imports table is aligned, so there may be padding before it.
+    + size_of::<u32>()) as u64;
 pub(crate) const CHAINED_FIXUP_IMPORT_SIZE: u64 = size_of::<u32>() as u64;
 pub(crate) const CHAINED_FIXUP_PAGE_START_SIZE: u64 = size_of::<u16>() as u64;
 pub(crate) const GOT_ENTRY_SIZE: u64 = 8;
@@ -1316,15 +1325,51 @@ impl platform::Platform for MachO {
             })
             .sum::<u64>();
 
-        // Chained fixups record start information per page. At this point the final GOT size is
-        // known, so reserve the fixup table entries needed to describe the GOT pages.
-        fixup_table_size += CHAINED_FIXUP_PAGE_START_SIZE
-            * (state.imported_symbols.len() as u64).div_ceil(MACHO_PAGE_ALIGNMENT.value());
+        // The space taken by the per-page start information is added by
+        // `apply_late_size_adjustments_epilogue`, which is the first point at which the sizes of
+        // the writable segments are known.
 
         mem_sizes.increment(
             part_id::CHAINED_FIXUP_TABLE,
             alignment::USIZE.align_up(fixup_table_size),
         );
+    }
+
+    fn apply_late_size_adjustments_epilogue(
+        _state: &mut Self::EpilogueLayoutExt,
+        current_sizes: &crate::output_section_part_map::OutputSectionPartMap<u64>,
+        extra_sizes: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
+        _dynamic_symbol_defs: &[crate::layout::DynamicSymbolDefinition<Self>],
+        _format_specific: &Self::FinaliseSizesExt<'_>,
+        _args: &Self::Args,
+    ) -> Result {
+        // A `dyld_chained_starts_in_segment` record holds one `page_start` entry for every page of
+        // the segment it describes, whether or not that page has any fixups on it. How much space
+        // the fixup table needs therefore depends on the sizes of the writable segments, which
+        // aren't known until every group's sizes have been merged - later than
+        // `finalise_sizes_epilogue` runs.
+        let mut page_start_count = 0;
+
+        for section_id in [output_section_id::DATA, output_section_id::GOT] {
+            let mut section_size = 0;
+
+            for part_index in 0..current_sizes.num_parts() {
+                let part_id = PartId::from_usize(part_index);
+                if part_id.output_section_id() == section_id {
+                    section_size += *current_sizes.get(part_id);
+                }
+            }
+
+            // One extra page covers the segment being padded out to an alignment boundary.
+            page_start_count += section_size.div_ceil(MACHO_PAGE_ALIGNMENT.value()) + 1;
+        }
+
+        extra_sizes.increment(
+            part_id::CHAINED_FIXUP_TABLE,
+            alignment::USIZE.align_up(page_start_count * CHAINED_FIXUP_PAGE_START_SIZE),
+        );
+
+        Ok(())
     }
 
     fn finalise_sizes_all<'data>(

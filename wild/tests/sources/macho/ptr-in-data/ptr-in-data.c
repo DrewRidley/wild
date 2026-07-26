@@ -2,7 +2,6 @@
 //#LinkerDriver:clang
 //#ExpectSym:_main
 //#DiffIgnore:section.__unwind_info
-//#KnownFailure:wild emits no chained-fixup rebase for pointers in __data, so the binary dereferences an un-slid address and dies with SIGSEGV. ld64 emits the rebase and the same binary exits 42.
 
 // Pointers stored in initialised data. Every initialiser below needs a
 // load-time rebase (a chained-fixup entry in __DATA) because the value written

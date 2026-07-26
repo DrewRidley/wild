@@ -9,7 +9,6 @@ use crate::file_writer::SizedOutput;
 use crate::file_writer::split_buffers_by_alignment;
 use crate::file_writer::split_output_by_group;
 use crate::file_writer::split_output_into_sections;
-use crate::layout::EpilogueLayout;
 use crate::layout::FileLayout;
 use crate::layout::Layout;
 use crate::layout::ObjectLayout;
@@ -83,12 +82,11 @@ use crate::value_flags::ValueFlags;
 use crate::verbose_timing_phase;
 use itertools::Itertools;
 use linker_utils::elf::RelocationKind;
+use linker_utils::elf::RelocationSize;
 use linker_utils::utils::slice_from_all_bytes_mut;
 use object::BigEndian;
 use object::Endianness;
 use object::SymbolIndex;
-use object::U16;
-use object::U32;
 use object::from_bytes_mut;
 use object::macho;
 use object::macho::CPU_SUBTYPE_ARM64_ALL;
@@ -121,9 +119,11 @@ use rayon::slice::ParallelSlice;
 use sha2::Digest;
 use sha2::Sha256;
 use std::ops::BitAnd;
+use std::sync::Mutex;
 use tracing::debug_span;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
+use zerocopy::IntoBytes;
 
 const LE: Endianness = Endianness::Little;
 
@@ -139,6 +139,13 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
         split_output_into_sections(layout, &mut sized_output.out);
     padding.fill_zero();
 
+    // Addresses of pointer-sized slots that hold an address within this image. Each one needs a
+    // rebase entry in the chained-fixup table, otherwise dyld leaves the link-time address in
+    // place and the program dereferences an address that hasn't been slid by the load bias.
+    // They're discovered while relocations are applied, which happens in parallel, so each group
+    // accumulates its own list and merges it in once.
+    let rebase_addresses = Mutex::new(Vec::new());
+
     let mut writable_buckets = split_buffers_by_alignment(&mut section_buffers, layout);
     let groups_and_buffers = split_output_by_group(layout, &mut writable_buckets);
     groups_and_buffers
@@ -149,6 +156,7 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
             let mut symbol_writer = MachOSymbolTableWriter {
                 next_strtab_offset: group.strtab_start_offset,
             };
+            let mut group_rebases = Vec::new();
             for file in &group.files {
                 write_file::<A>(
                     file,
@@ -156,8 +164,15 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
                     layout,
                     &sized_output.trace,
                     &mut symbol_writer,
+                    &mut group_rebases,
                 )
                 .with_context(|| format!("Failed copying from {file} to output file"))?;
+            }
+            if !group_rebases.is_empty() {
+                rebase_addresses
+                    .lock()
+                    .expect("Rebase list mutex was poisoned")
+                    .append(&mut group_rebases);
             }
             Ok(())
         })?;
@@ -165,6 +180,12 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
     write_got_entries(layout, section_buffers.get_mut(output_section_id::GOT))?;
     write_plt_entries::<A>(layout, section_buffers.get_mut(output_section_id::PLT_GOT))?;
+    drop(section_buffers);
+
+    let rebase_addresses = rebase_addresses
+        .into_inner()
+        .expect("Rebase list mutex was poisoned");
+    write_chained_fixups(layout, sized_output, rebase_addresses)?;
 
     write_code_signature_metadata(layout, sized_output)?;
     write_uuid(layout, sized_output)?;
@@ -179,13 +200,13 @@ fn write_file<'data, A: Arch<Platform = MachO>>(
     layout: &MachOLayout<'data>,
     _trace: &TraceOutput,
     symbol_writer: &mut MachOSymbolTableWriter,
+    rebase_addresses: &mut Vec<u64>,
 ) -> Result {
     match file {
         FileLayout::Object(s) => {
-            write_object::<A>(s, buffers, layout, symbol_writer)?;
+            write_object::<A>(s, buffers, layout, symbol_writer, rebase_addresses)?;
         }
         FileLayout::Prelude(s) => write_prelude(s, buffers, layout)?,
-        FileLayout::Epilogue(s) => write_epilogue(s, buffers, layout)?,
         _ => {
             // TODO
         }
@@ -266,17 +287,6 @@ fn write_prelude<'data>(
     Ok(())
 }
 
-fn write_epilogue(
-    _epilogue: &EpilogueLayout<MachO>,
-    buffers: &mut OutputSectionPartMap<&mut [u8]>,
-    layout: &MachOLayout<'_>,
-) -> Result {
-    verbose_timing_phase!("Write epilogue");
-    write_chained_fixup_table(layout, buffers.get_mut(part_id::CHAINED_FIXUP_TABLE))?;
-
-    Ok(())
-}
-
 fn write_got_entries(layout: &MachOLayout<'_>, got: &mut [u8]) -> Result {
     let got_layout = layout.section_layouts.get(output_section_id::GOT);
 
@@ -299,21 +309,12 @@ fn write_got_entries(layout: &MachOLayout<'_>, got: &mut [u8]) -> Result {
           bind: 1 // == 1
         */
         let bind = 1u64 << 63;
-        // TODO: when crossing a page boundary, next is equal to zero
-        let mut next = if i == sorted_symbols.len() - 1 { 0 } else { 2 };
-
-        // Malfunction: terminate the fixup chain after its first entry. The
-        // `dyld_chained_import` table is left intact, so a checker that only reads the import
-        // table sees nothing wrong; only a checker that actually *walks* the page chain notices
-        // that every fixup after the first has become unreachable and will never be applied by
-        // dyld. Requires at least two imported symbols to have any effect.
-        if i == 0 && malfunction::malfunction_point("macho-drop-fixup") {
-            next = 0;
-        }
-
-        let next = next << 51;
         let ordinal = i as u64;
-        got[offset..end].copy_from_slice(&(bind | next | ordinal).to_le_bytes());
+
+        // The `next` field is deliberately left as zero here. Binds and rebases share a single
+        // chain per page, so the distance to the following link can only be computed once every
+        // fixup in the image is known. `write_chained_fixups` fills it in.
+        got[offset..end].copy_from_slice(&(bind | ordinal).to_le_bytes());
     }
 
     Ok(())
@@ -592,6 +593,7 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &MachOLayout<'data>,
     symbol_writer: &mut MachOSymbolTableWriter,
+    rebase_addresses: &mut Vec<u64>,
 ) -> Result {
     verbose_timing_phase!("Write object", file_id = object.file_id.as_u32());
 
@@ -600,7 +602,14 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
     for (i, sec) in object.sections.iter().enumerate() {
         match sec {
             SectionSlot::Loaded(sec) => {
-                write_object_section::<A>(object, layout, *sec, object::SectionIndex(i), buffers)?;
+                write_object_section::<A>(
+                    object,
+                    layout,
+                    *sec,
+                    object::SectionIndex(i),
+                    buffers,
+                    rebase_addresses,
+                )?;
             }
             _ => (),
         }
@@ -617,6 +626,7 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     section: Section,
     section_index: object::SectionIndex,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
+    rebase_addresses: &mut Vec<u64>,
 ) -> Result {
     let out = write_section_raw(object_layout, layout, section, section_index, buffers)?;
 
@@ -625,7 +635,14 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
         .context("Attempted to apply relocations to a section that we didn't load")?;
 
     for rel in object_layout.relocations(section_index)?.relocations {
-        apply_relocation::<A>(object_layout, section_address, rel.info(LE), layout, out)?;
+        apply_relocation::<A>(
+            object_layout,
+            section_address,
+            rel.info(LE),
+            layout,
+            out,
+            rebase_addresses,
+        )?;
     }
 
     Ok(())
@@ -638,6 +655,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     rel: RelocationInfo,
     layout: &MachOLayout<'data>,
     out: &mut [u8],
+    rebase_addresses: &mut Vec<u64>,
 ) -> Result {
     let offset_in_section = u64::from(rel.r_address);
     let place = section_address + offset_in_section;
@@ -677,6 +695,20 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
             value_hex = %HexU64::new(value),
             symbol_name = %layout.symbol_db.symbol_name_for_display(local_symbol_id),
             "relocation applied");
+
+    // A pointer-sized absolute reference to an address inside this image is written as the
+    // link-time address, which is only correct if dyld happens to load us at our preferred
+    // address. Record the slot so that a rebase fixup gets emitted for it; dyld then adds the
+    // load bias when it walks the chain. Absolute symbols (`N_ABS`) name a fixed value rather
+    // than a place in the image, so they must not be slid, and a resolution of zero is an
+    // undefined weak reference, which stays null.
+    if rel_info.kind == RelocationKind::Absolute
+        && rel_info.size == RelocationSize::ByteSize(size_of::<u64>())
+        && !flags.is_absolute()
+        && value != 0
+    {
+        rebase_addresses.push(place);
+    }
 
     rel_info
         .write_to_buffer(value, &mut out[offset_in_section as usize..])
@@ -921,132 +953,413 @@ fn write_code_signature_command(layout: &MachOLayout, command: &mut CodeSignatur
     command.datasize.set(LE, code_signature.file_size as u32);
 }
 
-fn write_chained_fixup_table(layout: &MachOLayout, chained_fixup_table: &mut [u8]) -> Result {
-    let symbols = &layout.format_specific.imported_symbols;
+/// The `page_start` value that says a page holds no fixups at all.
+const DYLD_CHAINED_PTR_START_NONE: u16 = 0xffff;
 
-    let active_segments = PROGRAM_SEGMENT_DEFS
+/// Position of the `next` field shared by every 64-bit chained-pointer format. It counts
+/// `CHAINED_PTR_NEXT_STRIDE` sized units from one link of a chain to the following one; zero ends
+/// the chain.
+const CHAINED_PTR_NEXT_SHIFT: u32 = 51;
+const CHAINED_PTR_NEXT_MASK: u64 = 0xfff << CHAINED_PTR_NEXT_SHIFT;
+const CHAINED_PTR_NEXT_STRIDE: u64 = 4;
+
+/// Width of the `target` field of a `DYLD_CHAINED_PTR_64_OFFSET` rebase.
+const CHAINED_PTR_64_TARGET_BITS: u32 = 36;
+
+/// Width of the `name_offset` field of a `dyld_chained_import`.
+const CHAINED_IMPORT_NAME_OFFSET_BITS: u32 = 23;
+
+/// A slot in the output image that dyld has to write to at load time.
+#[derive(Clone, Copy)]
+struct FixupSite {
+    /// Memory address of the slot in the output image.
+    address: u64,
+
+    /// Whether the slot is bound to an imported symbol. Bind slots have already had their ordinal
+    /// encoded by `write_got_entries` and only need their `next` field filling in. The rest hold
+    /// an address within this image and need re-encoding as a rebase.
+    is_bind: bool,
+}
+
+/// A segment that can hold chained fixups, together with the fixups that landed in it.
+struct SegmentFixups {
+    /// Index of the segment among the output's `LC_SEGMENT_64` commands, which is what
+    /// `dyld_chained_starts_in_image::seg_info_offset` is indexed by. Segments without fixups
+    /// still take up an index, so this cannot be a position within `SegmentFixups` values.
+    segment_index: usize,
+
+    segment_type: SegmentType,
+    sizes: OutputRecordLayout,
+    sites: Vec<FixupSite>,
+
+    /// Offset within each page of the first link of that page's chain, or
+    /// `DYLD_CHAINED_PTR_START_NONE`.
+    page_starts: Vec<u16>,
+}
+
+/// Writes the pointer chains that dyld walks at load time, and the `LC_DYLD_CHAINED_FIXUPS`
+/// payload that describes where those chains start.
+///
+/// Both kinds of fixup - a bind against an imported symbol and a rebase of an address within this
+/// image - are links of the same singly linked list, so they have to be emitted together. There is
+/// one chain per page of each segment: `page_starts[p]` locates the first link in page `p` and each
+/// link's `next` field gives the distance to the following one. A chain never crosses a page
+/// boundary, which is what lets the kernel apply fixups a page at a time.
+fn write_chained_fixups(
+    layout: &MachOLayout,
+    sized_output: &mut SizedOutput,
+    rebase_addresses: Vec<u64>,
+) -> Result {
+    verbose_timing_phase!("Write chained fixups");
+
+    let page_size = MACHO_PAGE_ALIGNMENT.value();
+
+    // dyld applies a rebase as `mach_header_address + target`, so targets are relative to the
+    // start of `SegmentType::Text`, which is the segment that contains the mach header.
+    let image_base = get_segment_sections(layout, SegmentType::Text)
+        .ok_or_else(|| error!("Text segment is mandatory"))?
+        .segment_size
+        .mem_offset;
+
+    // `write_segment_commands` emits `__PAGEZERO` before everything in `PROGRAM_SEGMENT_DEFS`, so
+    // it takes segment index 0 and the definitions that count as segments follow in order.
+    let mut segment_count = 1;
+    let mut segments = Vec::new();
+
+    for def in PROGRAM_SEGMENT_DEFS
         .iter()
-        .filter(|segment| {
-            segment.count_as_segment && get_segment_sections(layout, segment.segment_type).is_some()
-        })
-        .collect_vec();
-    // The __PAGEZERO segment needs to be added manually.
-    let segment_count = active_segments.len() + 1;
+        .filter(|def| def.count_as_segment)
+    {
+        let Some(info) = get_segment_sections(layout, def.segment_type) else {
+            continue;
+        };
+
+        let segment_index = segment_count;
+        segment_count += 1;
+
+        // Only the writable data segments can hold fixups: applying one is a store into the
+        // segment, and everything else is mapped read-only.
+        if matches!(
+            def.segment_type,
+            SegmentType::DataSections | SegmentType::DataConstSections
+        ) {
+            segments.push(SegmentFixups {
+                segment_index,
+                segment_type: def.segment_type,
+                sizes: info.segment_size,
+                sites: Vec::new(),
+                page_starts: Vec::new(),
+            });
+        }
+    }
+
     ensure!(
         segment_count <= MAX_SEGMENT_COUNT,
         "unexpected number of active segments"
     );
-    let starts_in_image_len = size_of::<u32>() * (segment_count + 1);
-    let starts_in_segment_len =
-        size_of::<DyldChainedStartsInSegment>() + CHAINED_FIXUP_PAGE_START_SIZE as usize;
-    let imports_len = size_of::<u32>() * symbols.len();
 
+    let mut sites = layout
+        .format_specific
+        .imported_symbols
+        .iter()
+        .map(|imported_symbol| FixupSite {
+            address: imported_symbol.got_address.get(),
+            is_bind: true,
+        })
+        .chain(rebase_addresses.into_iter().map(|address| FixupSite {
+            address,
+            is_bind: false,
+        }))
+        .collect_vec();
+
+    // dyld walks each chain from low to high address, so that's the order the links go in.
+    sites.sort_unstable_by_key(|site| site.address);
+
+    for site in sites {
+        let segment = segments
+            .iter_mut()
+            .find(|segment| {
+                site.address >= segment.sizes.mem_offset
+                    && site.address - segment.sizes.mem_offset < segment.sizes.mem_size
+            })
+            .with_context(|| {
+                format!(
+                    "Fixup at address 0x{:x} is outside __DATA and __DATA_CONST, so dyld has \
+                     nowhere to apply it. A pointer in initialised data has ended up in a \
+                     read-only segment - note that `__DATA,__const` is currently mapped into \
+                     __TEXT rather than __DATA_CONST",
+                    site.address
+                )
+            })?;
+
+        segment.sites.push(site);
+    }
+
+    write_fixup_chains(sized_output, &mut segments, image_base, page_size)?;
+
+    let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
+
+    write_chained_fixup_table(
+        layout,
+        section_buffers.get_mut(output_section_id::CHAINED_FIXUP_TABLE),
+        &segments,
+        segment_count,
+        image_base,
+        page_size,
+    )
+}
+
+/// Encodes each page's chain in place in the output buffer and records where it starts.
+fn write_fixup_chains(
+    sized_output: &mut SizedOutput,
+    segments: &mut [SegmentFixups],
+    image_base: u64,
+    page_size: u64,
+) -> Result {
+    let out = &mut *sized_output.out;
+    let mut fixup_dropped = false;
+
+    for segment in segments {
+        if segment.sites.is_empty() {
+            continue;
+        }
+
+        let last_offset =
+            segment.sites.last().expect("checked above").address - segment.sizes.mem_offset;
+
+        // `page_count` is just the length of the `page_start` array, so it has to reach the last
+        // page that has a fixup on it. Covering the whole segment as well matches what ld64 does.
+        let page_count =
+            (last_offset / page_size + 1).max(segment.sizes.mem_size.div_ceil(page_size));
+        segment.page_starts = vec![DYLD_CHAINED_PTR_START_NONE; usize::try_from(page_count)?];
+
+        for (i, site) in segment.sites.iter().enumerate() {
+            let offset_in_segment = site.address - segment.sizes.mem_offset;
+            let page = offset_in_segment / page_size;
+            let offset_in_page = offset_in_segment % page_size;
+
+            ensure!(
+                offset_in_page.is_multiple_of(CHAINED_PTR_NEXT_STRIDE),
+                "Chained fixup at address 0x{:x} isn't aligned to the chain stride",
+                site.address
+            );
+
+            let page_start = &mut segment.page_starts[usize::try_from(page)?];
+            if *page_start == DYLD_CHAINED_PTR_START_NONE {
+                *page_start = offset_in_page as u16;
+            }
+
+            // The chain stops at the end of the page. Whatever comes next starts a new chain that
+            // is reached through `page_starts` instead.
+            let mut next = match segment.sites.get(i + 1) {
+                Some(following)
+                    if (following.address - segment.sizes.mem_offset) / page_size == page =>
+                {
+                    (following.address - site.address) / CHAINED_PTR_NEXT_STRIDE
+                }
+                _ => 0,
+            };
+
+            ensure!(
+                next <= CHAINED_PTR_NEXT_MASK >> CHAINED_PTR_NEXT_SHIFT,
+                "Chained fixup at address 0x{:x} is too far from the following fixup",
+                site.address
+            );
+
+            // Malfunction: cut the first chain that has more than one link short after its first
+            // entry. The `dyld_chained_import` table and the `page_starts` array are left intact,
+            // so a checker that only reads those sees nothing wrong; only a checker that actually
+            // *walks* the page chain notices that every fixup after the first has become
+            // unreachable and will never be applied by dyld. Skipping over chains that are
+            // already a single link is what makes this bite regardless of which segment happens
+            // to come first.
+            if next != 0 && !fixup_dropped && malfunction::malfunction_point("macho-drop-fixup") {
+                next = 0;
+                fixup_dropped = true;
+            }
+
+            let file_offset =
+                usize::try_from(segment.sizes.file_offset as u64 + offset_in_segment)?;
+            let slot = out
+                .get_mut(file_offset..file_offset + size_of::<u64>())
+                .with_context(|| {
+                    format!(
+                        "Chained fixup at address 0x{:x} is outside of the output file",
+                        site.address
+                    )
+                })?;
+            let existing = u64::from_le_bytes(slot.try_into().expect("slot is 8 bytes"));
+
+            let value = if site.is_bind {
+                (existing & !CHAINED_PTR_NEXT_MASK) | (next << CHAINED_PTR_NEXT_SHIFT)
+            } else {
+                /* DYLD_CHAINED_PTR_64_OFFSET rebase format:
+                uint64_t dyld_chained_ptr_64_rebase:
+                  target: 36 // offset from the address the mach header is loaded at
+                  high8: 8
+                  reserved: 7 // all zeros
+                  next: 12 // 4-byte stride
+                  bind: 1 // == 0
+                */
+                let target = existing.checked_sub(image_base).with_context(|| {
+                    format!(
+                        "Rebase at address 0x{site_address:x} points at 0x{existing:x}, \
+                         which is before the image base 0x{image_base:x}",
+                        site_address = site.address
+                    )
+                })?;
+
+                ensure!(
+                    target < (1 << CHAINED_PTR_64_TARGET_BITS),
+                    "Rebase at address 0x{:x} points at 0x{existing:x}, which is too far from \
+                     the image base to encode",
+                    site.address
+                );
+
+                target | (next << CHAINED_PTR_NEXT_SHIFT)
+            };
+
+            slot.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    Ok(())
+}
+
+fn write_chained_fixup_table(
+    layout: &MachOLayout,
+    chained_fixup_table: &mut [u8],
+    segments: &[SegmentFixups],
+    segment_count: usize,
+    image_base: u64,
+    page_size: u64,
+) -> Result {
+    let symbols = &layout.format_specific.imported_symbols;
+
+    // 1) work out the offsets of everything. `dyld_chained_starts_in_image` is `seg_count` (u32)
+    //    followed by `seg_info_offset` ([u32; seg_count]), where a zero offset means the segment
+    //    has no fixups. The `dyld_chained_starts_in_segment` records for the segments that do
+    //    follow it, and the offsets that point at them are relative to `seg_count`.
     let starts_offset = size_of::<ChainedFixupsHeader>();
-    let imports_offset = starts_offset + starts_in_image_len + starts_in_segment_len;
-    let symbols_offset = imports_offset + imports_len;
+    let starts_in_image_len = size_of::<u32>() * (segment_count + 1);
+    let mut seg_info_offsets = vec![0u32; segment_count];
+    let mut starts_in_segment_len = 0;
 
-    let (header, rest) = ChainedFixupsHeader::mut_from_prefix(chained_fixup_table)
-        .map_err(|_| error!("Invalid chained fixups header allocation"))?;
-    let (starts_in_image, rest) = slice_from_bytes_mut::<U32<Endianness>>(rest, segment_count + 1)
-        .map_err(|_| error!("Invalid chained fixups starts allocation"))?;
+    for segment in segments {
+        if segment.sites.is_empty() {
+            continue;
+        }
 
-    // 1) fill up ChainedFixupsHeader
+        // Malfunction: leave the `seg_info_offset` for this segment at zero. A zero offset means
+        // "this segment has no fixups", so dyld skips the segment entirely and none of its binds
+        // or rebases are ever applied - while the `dyld_chained_starts_in_segment` record we go
+        // on to write below is still physically present in the blob, just orphaned. This is the
+        // shape of the real bug that motivated this work (wild used to emit a starts record for
+        // only one segment), so any checker that claims to detect that bug must detect this.
+        if segment.segment_type != SegmentType::DataConstSections
+            || !malfunction::malfunction_point("macho-drop-segment-starts")
+        {
+            seg_info_offsets[segment.segment_index] =
+                u32::try_from(starts_in_image_len + starts_in_segment_len)?;
+        }
+
+        starts_in_segment_len += size_of::<DyldChainedStartsInSegment>()
+            + CHAINED_FIXUP_PAGE_START_SIZE as usize * segment.page_starts.len();
+    }
+
+    let imports_offset = (starts_offset + starts_in_image_len + starts_in_segment_len)
+        .next_multiple_of(size_of::<u32>());
+
+    // 2) fill up the header
+    let mut header = ChainedFixupsHeader::new_zeroed();
     header.fixups_version.set(0);
-    header.starts_offset.set(starts_offset as u32);
-    header.imports_offset.set(imports_offset as u32);
-    header.symbols_offset.set(symbols_offset as u32);
-    header.imports_count.set(symbols.len() as u32);
+    header.starts_offset.set(u32::try_from(starts_offset)?);
+    header.imports_offset.set(u32::try_from(imports_offset)?);
+    header.symbols_offset.set(u32::try_from(
+        imports_offset + size_of::<u32>() * symbols.len(),
+    )?);
+    header.imports_count.set(u32::try_from(symbols.len())?);
     header.imports_format.set(DYLD_CHAINED_IMPORT);
     header.symbols_format.set(0);
 
-    let data_const_segment_index = active_segments
-        .iter()
-        .position(|segment_type| segment_type.segment_type == SegmentType::DataConstSections);
+    let mut blob = Vec::with_capacity(imports_offset);
+    blob.extend_from_slice(header.as_bytes());
 
-    // 2) fill up dyld_chained_starts_in_image, which is `seg_count` (u32) followed by
-    //    `seg_info_offset` ([u32; seg_count]); only __DATA_CONST,__got segment is covered
-    starts_in_image[0].set(LE, segment_count as u32);
-    starts_in_image[1..].fill(U32::new(LE, 0));
-
-    // Early exit if we don't have any GOT entry to be encoded.
-    let Some(data_const_segment_index) = data_const_segment_index else {
-        rest.zero();
-        return Ok(());
-    };
-
-    // Accounts for both seg_count and __PAGEZERO.
-    //
-    // Malfunction: leave the `seg_info_offset` for this segment at zero. A zero offset means
-    // "this segment has no fixups", so dyld skips the segment entirely and none of its binds or
-    // rebases are ever applied - while the `dyld_chained_starts_in_segment` record we go on to
-    // write below is still physically present in the blob, just orphaned. This is the shape of
-    // the real bug that motivated this work (wild emits a starts record for only one segment),
-    // so any checker that claims to detect that bug must detect this.
-    let seg_info_offset = if malfunction::malfunction_point("macho-drop-segment-starts") {
-        0
-    } else {
-        starts_in_image_len as u32
-    };
-    starts_in_image[data_const_segment_index + 2].set(LE, seg_info_offset);
-
-    let (starts_in_segment, rest) = DyldChainedStartsInSegment::mut_from_prefix(rest)
-        .map_err(|_| error!("Invalid chained fixups starts in segment allocation"))?;
-    let (page_starts, rest) = slice_from_bytes_mut::<U16<Endianness>>(rest, 1)
-        .map_err(|_| error!("Invalid chained fixups page starts allocation"))?;
-    let (imports, string_pool) = slice_from_bytes_mut::<U32<Endianness>>(rest, symbols.len())
-        .map_err(|_| error!("Invalid chained fixups imports allocation"))?;
-
-    // 3) fill up DyldChainedStartsInSegment for the __got section
-    let data_const_segment = get_segment_sections(layout, SegmentType::DataConstSections)
-        .ok_or_else(|| error!("__DATA_CONST segment expected"))?
-        .segment_size;
-
-    starts_in_segment.size.set(starts_in_segment_len as u32);
-    starts_in_segment
-        .page_size
-        .set(MACHO_PAGE_ALIGNMENT.value() as u16);
-    starts_in_segment
-        .pointer_format
-        .set(DYLD_CHAINED_PTR_64_OFFSET);
-    // Malfunction: point the starts record at the wrong segment offset (one page too high). Every
-    // fixup slot in the chain is then computed relative to the wrong base, so dyld writes
-    // pointers into the wrong memory. `integration_tests::verify_chained_fixups_segment_offsets`
-    // already checks this field, so this injection also proves that check still bites.
-    let mut segment_offset = data_const_segment.file_offset as u64;
-    if malfunction::malfunction_point("macho-wrong-segment-offset") {
-        segment_offset = segment_offset.wrapping_add(MACHO_PAGE_ALIGNMENT.value());
+    // 3) fill up dyld_chained_starts_in_image
+    blob.extend_from_slice(&u32::try_from(segment_count)?.to_le_bytes());
+    for seg_info_offset in &seg_info_offsets {
+        blob.extend_from_slice(&seg_info_offset.to_le_bytes());
     }
 
-    starts_in_segment.segment_offset.set(segment_offset);
-    starts_in_segment.max_valid_pointer.set(0);
-    // TODO:
-    starts_in_segment.page_count.set(1);
-    page_starts[0].set(LE, 0);
+    // 4) fill up one dyld_chained_starts_in_segment per segment that has fixups
+    for segment in segments {
+        if segment.sites.is_empty() {
+            continue;
+        }
 
-    // 4) fill up all imported symbols chunked by the pages
-    // TODO: support more pages
-    assert!(symbols.len() < MACHO_PAGE_ALIGNMENT.value() as usize / size_of::<u32>());
+        let mut starts_in_segment = DyldChainedStartsInSegment::new_zeroed();
+        starts_in_segment.size.set(u32::try_from(
+            size_of::<DyldChainedStartsInSegment>()
+                + CHAINED_FIXUP_PAGE_START_SIZE as usize * segment.page_starts.len(),
+        )?);
+        starts_in_segment.page_size.set(u16::try_from(page_size)?);
+        starts_in_segment
+            .pointer_format
+            .set(DYLD_CHAINED_PTR_64_OFFSET);
 
-    let sorted_symbols = &layout.format_specific.imported_symbols;
-    let mut symbol_offsets = Vec::with_capacity(sorted_symbols.len());
-    let mut str_offset = 0;
-    for imported_symbol in sorted_symbols {
+        // `segment_offset` is where the segment is relative to the mach header, which is how dyld
+        // finds the page that a `page_start` belongs to.
+        let mut segment_offset = segment
+            .sizes
+            .mem_offset
+            .checked_sub(image_base)
+            .context("Segment with fixups is before the image base")?;
+
+        // Malfunction: point the starts record at the wrong segment offset (one page too high).
+        // Every fixup slot in the chain is then computed relative to the wrong base, so dyld
+        // writes pointers into the wrong memory.
+        // `integration_tests::verify_chained_fixups_segment_offsets` already checks this field,
+        // so this injection also proves that check still bites.
+        if segment.segment_type == SegmentType::DataConstSections
+            && malfunction::malfunction_point("macho-wrong-segment-offset")
+        {
+            segment_offset = segment_offset.wrapping_add(page_size);
+        }
+
+        starts_in_segment.segment_offset.set(segment_offset);
+        starts_in_segment.max_valid_pointer.set(0);
+        starts_in_segment
+            .page_count
+            .set(u16::try_from(segment.page_starts.len())?);
+
+        blob.extend_from_slice(starts_in_segment.as_bytes());
+        for page_start in &segment.page_starts {
+            blob.extend_from_slice(&page_start.to_le_bytes());
+        }
+    }
+
+    // Pad out to the (aligned) start of the imports table.
+    blob.resize(imports_offset, 0);
+
+    // 5) build the symbol string pool, which the imports below refer to by offset
+    let mut string_pool = Vec::new();
+    let mut symbol_offsets = Vec::with_capacity(symbols.len());
+
+    for imported_symbol in symbols {
         let symbol_name = layout
             .symbol_db
-            .symbol_name(imported_symbol.symbol_id)
-            .unwrap()
+            .symbol_name(imported_symbol.symbol_id)?
             .bytes();
-        string_pool[str_offset..str_offset + symbol_name.len()].copy_from_slice(symbol_name);
-        string_pool[str_offset + symbol_name.len()] = b'\0';
-        symbol_offsets.push(str_offset);
-        str_offset += symbol_name.len() + 1;
+        symbol_offsets.push(u32::try_from(string_pool.len())?);
+        string_pool.extend_from_slice(symbol_name);
+        string_pool.push(b'\0');
     }
 
-    // Emit `dyld_chained_import` that is built by 3 pieces:
+    // 6) emit `dyld_chained_import`, which is built from 3 pieces:
     // lib_ordinal: 8
     // weak_import: 1
     // name_offset: 23
-    for (i, imported_symbol) in sorted_symbols.iter().enumerate() {
+    for (imported_symbol, symbol_offset) in symbols.iter().zip(&symbol_offsets) {
         let file_id = layout
             .symbol_db
             .file_id_for_symbol(imported_symbol.symbol_id);
@@ -1069,18 +1382,29 @@ fn write_chained_fixup_table(layout: &MachOLayout, chained_fixup_table: &mut [u8
             lib_ordinal = lib_ordinal.wrapping_add(1);
         }
 
-        imports[i].set(
-            Endianness::Little,
-            u32::from(lib_ordinal) | ((symbol_offsets[i] as u32) << 9),
+        ensure!(
+            *symbol_offset < (1 << CHAINED_IMPORT_NAME_OFFSET_BITS),
+            "Chained fixup symbol string pool is too large"
         );
+
+        blob.extend_from_slice(&(u32::from(lib_ordinal) | (symbol_offset << 9)).to_le_bytes());
     }
 
-    // Pad a couple of bytes (related to the MAX_SEGMENT_COUNT).
-    string_pool[str_offset..].fill(0);
+    blob.extend_from_slice(&string_pool);
+
+    ensure!(
+        blob.len() <= chained_fixup_table.len(),
+        "Insufficient allocation for the chained fixup table: needed {} bytes but have {}",
+        blob.len(),
+        chained_fixup_table.len()
+    );
+
+    chained_fixup_table[..blob.len()].copy_from_slice(&blob);
+    // Anything left over is the padding that keeps `__LINKEDIT` aligned.
+    chained_fixup_table[blob.len()..].fill(0);
 
     Ok(())
 }
-
 fn write_uuid(layout: &MachOLayout, sized_output: &mut SizedOutput) -> Result {
     verbose_timing_phase!("Write UUID");
 

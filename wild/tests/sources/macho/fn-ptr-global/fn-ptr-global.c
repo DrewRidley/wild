@@ -2,7 +2,6 @@
 //#LinkerDriver:clang
 //#ExpectSym:_main
 //#DiffIgnore:section.__unwind_info
-//#KnownFailure:wild emits no chained-fixup rebase for function pointers in __data, so the indirect call branches to an un-slid address and the binary dies with SIGSEGV. ld64 emits the rebases and the same binary exits 42.
 
 // Indirect calls through function pointers held in initialised data. Like data
 // pointers these require a load-time rebase, but the failure mode is worse: an
