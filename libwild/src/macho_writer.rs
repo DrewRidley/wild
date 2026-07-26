@@ -759,15 +759,33 @@ fn get_resolution<'data>(
 }
 
 fn write_entry_point_command(layout: &MachOLayout, command: &mut EntryPointCommand) -> Result {
-    let SegmentSectionsInfo { segment_size, .. } =
-        get_segment_sections(layout, SegmentType::TextSections)
-            .ok_or_else(|| error!("TextSections segment is mandatory"))?;
+    // `entryoff` is relative to the address at which the mach header is loaded, since that's how
+    // dyld computes the entry point (`mach_header_addr + entryoff`). `SegmentType::Text` is the
+    // segment that contains the mach header and load commands, so its memory offset is the image
+    // base. Note that this is deliberately not `SegmentType::TextSections`, which starts after the
+    // load commands.
+    let SegmentSectionsInfo { segment_size, .. } = get_segment_sections(layout, SegmentType::Text)
+        .ok_or_else(|| error!("Text segment is mandatory"))?;
+
+    let entry_address = layout.entry_symbol_address()?;
+
+    let entryoff = entry_address
+        .checked_sub(segment_size.mem_offset)
+        .filter(|offset| *offset < segment_size.mem_size)
+        .ok_or_else(|| {
+            error!(
+                "Entry point address 0x{entry_address:x} is not within the __TEXT segment \
+                 (0x{:x}..0x{:x})",
+                segment_size.mem_offset,
+                segment_size.mem_offset + segment_size.mem_size,
+            )
+        })?;
 
     command.cmd.set(LE, LC_MAIN);
     command
         .cmdsize
         .set(LE, size_of::<EntryPointCommand>() as u32);
-    command.entryoff.set(LE, segment_size.file_offset as u64);
+    command.entryoff.set(LE, entryoff);
     command.stacksize.set(LE, 0);
 
     // Malfunction: shift the entry point by one instruction. Deliberately expressed as a mutation
