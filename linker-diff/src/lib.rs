@@ -45,6 +45,7 @@ mod header_diff;
 mod init_order;
 mod loongarch64;
 mod macho_dyld_info;
+mod macho_entry_point;
 mod macho_fixups;
 mod ppc64;
 mod riscv64;
@@ -1056,6 +1057,7 @@ impl Report {
         symbol_diff::report_diffs(self, objects);
         segment::report_diffs(self, objects);
         macho_fixups::report_diffs(self, objects);
+        macho_entry_point::report_diffs(self, objects);
         macho_dyld_info::report_diffs(self, objects);
 
         match arch {
@@ -1169,6 +1171,64 @@ impl Report {
     #[must_use]
     pub fn has_problems(&self) -> bool {
         !self.diffs.is_empty() || self.failing_gaps().next().is_some()
+    }
+
+    /// Every key that this report is unhappy about: reported differences plus unacknowledged
+    /// coverage gaps. Exactly the set that makes [`Report::has_problems`] true, so
+    /// `report.problem_keys().is_empty() == !report.has_problems()`.
+    ///
+    /// The integration test harness uses this to check that a malfunction was detected *by the
+    /// check that is supposed to detect it*, rather than merely coinciding with some unrelated
+    /// pre-existing difference. See `MalfunctionExpectKey` in `wild/tests/integration_tests.rs`.
+    #[must_use]
+    pub fn problem_keys(&self) -> Vec<String> {
+        self.problem_details()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
+    }
+
+    /// As [`Report::problem_keys`], but each key is paired with the rendered body that would be
+    /// printed beneath it.
+    ///
+    /// The harness compares these bodies between a malfunctioning link and the otherwise-identical
+    /// clean link. Key presence alone is too coarse: `macho-drop-fixup`, for instance, truncates a
+    /// fixup chain, which changes the *contents* of the `macho.fixups` table without introducing
+    /// any new key. Comparing bodies catches that; comparing key sets does not.
+    #[must_use]
+    pub fn problem_details(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+
+        for diff in &self.diffs {
+            let mut body = String::new();
+            // Writing to a String is infallible.
+            let _ = self.write_diff_body(&mut body, diff);
+            out.push((diff.key.clone(), body));
+        }
+
+        for gap in self.failing_gaps() {
+            let mut body = String::new();
+            let _ = write_gap_body(&mut body, gap);
+            out.push((gap.key.clone(), body));
+        }
+
+        out
+    }
+
+    fn write_diff_body(&self, f: &mut impl std::fmt::Write, diff: &Diff) -> std::fmt::Result {
+        match &diff.values {
+            DiffValues::PerObject(values) => {
+                for (filename, result) in self.names.iter().zip(values) {
+                    writeln!(f, "  {filename} {result}")?;
+                }
+            }
+            DiffValues::PreFormatted(values) => {
+                for line in values.lines() {
+                    writeln!(f, "  {line}")?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// A human-readable inventory of the validation passes that checked nothing, for printing on
@@ -1303,20 +1363,7 @@ impl Display for Report {
 
         for diff in &self.diffs {
             writeln!(f, "{}", diff.key)?;
-
-            match &diff.values {
-                DiffValues::PerObject(values) => {
-                    for (filename, result) in self.names.iter().zip(values) {
-                        writeln!(f, "  {filename} {result}")?;
-                    }
-                }
-                DiffValues::PreFormatted(values) => {
-                    for line in values.lines() {
-                        writeln!(f, "  {line}")?;
-                    }
-                }
-            }
-
+            self.write_diff_body(f, diff)?;
             writeln!(f)?;
         }
 
@@ -1325,25 +1372,29 @@ impl Display for Report {
         // `coverage_gap_report`, which the CLI prints on every run.
         for gap in self.failing_gaps() {
             writeln!(f, "{}", gap.key)?;
-            writeln!(
-                f,
-                "  This validation pass has no implementation for `{}`, so it checked NOTHING.",
-                gap.format
-            )?;
-            for line in wrap_note(&gap.note, 92) {
-                writeln!(f, "  {line}")?;
-            }
-            writeln!(
-                f,
-                "  Either implement it, or add `{}` to MACHO_ACKNOWLEDGED_GAPS in \
-                 linker-diff/src/lib.rs with a justification.",
-                gap.key
-            )?;
+            write_gap_body(f, gap)?;
             writeln!(f)?;
         }
 
         Ok(())
     }
+}
+
+fn write_gap_body(f: &mut impl std::fmt::Write, gap: &UnimplementedPass) -> std::fmt::Result {
+    writeln!(
+        f,
+        "  This validation pass has no implementation for `{}`, so it checked NOTHING.",
+        gap.format
+    )?;
+    for line in wrap_note(&gap.note, 92) {
+        writeln!(f, "  {line}")?;
+    }
+    writeln!(
+        f,
+        "  Either implement it, or add `{}` to MACHO_ACKNOWLEDGED_GAPS in \
+         linker-diff/src/lib.rs with a justification.",
+        gap.key
+    )
 }
 
 impl Display for Binary<'_> {

@@ -143,10 +143,10 @@ struct SectionInfo {
 }
 
 /// The bits of the Mach-O image that we need in order to interpret the fixups blob.
-struct ImageInfo {
+pub(crate) struct ImageInfo {
     /// The virtual address that the image is nominally loaded at, i.e. the address of the Mach-O
     /// header. All `segment_offset` and `runtimeOffset` values are relative to this.
-    image_base: u64,
+    pub(crate) image_base: u64,
     segments: Vec<SegmentInfo>,
     /// Install names of `LC_LOAD_DYLIB` (and friends) commands, in load-command order. The
     /// chained-fixup `lib_ordinal` is a 1-based index into this.
@@ -155,7 +155,7 @@ struct ImageInfo {
     fixups_data: Option<(u64, u64)>,
 }
 
-fn read_image_info(bin: &Binary) -> Result<ImageInfo> {
+pub(crate) fn read_image_info(bin: &Binary) -> Result<ImageInfo> {
     let object::File::MachO64(file) = bin.file else {
         bail!("Not a 64-bit Mach-O file");
     };
@@ -275,7 +275,7 @@ fn install_name_stem(install_name: &str) -> String {
 /// symbol covers the address then we use `symbol` or `symbol+0xN`. Otherwise we fall back to
 /// `__SEG/__sect`. We deliberately do *not* include an offset in the fall-back: linkers may order
 /// anonymous entries (e.g. GOT slots) differently and that isn't a bug.
-fn describe_address(bin: &Binary, image: &ImageInfo, address: u64) -> String {
+pub(crate) fn describe_address(bin: &Binary, image: &ImageInfo, address: u64) -> String {
     let mut best: Option<(u64, &str)> = None;
 
     for symbol in bin.file.symbols() {

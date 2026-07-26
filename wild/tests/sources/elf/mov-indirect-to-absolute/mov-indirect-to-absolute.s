@@ -1,5 +1,6 @@
 //#Config:malfunction-no-mov-indirect-to-absolute
 //#Malfunction:no-mov-indirect-to-absolute
+//#MalfunctionExpectKey:rel.missing-opt.R_X86_64_GOTPCRELX.MovIndirectToAbsolute.static-non-pie
 //#LinkArgs:-z noexecstack
 //#Object:runtime.c
 //#Arch: x86_64

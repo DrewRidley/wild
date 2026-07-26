@@ -3,6 +3,7 @@
 
 //#Config:malfunction-elf-incorrect-type:default
 //#Malfunction:elf-incorrect-type
+//#MalfunctionExpectKey:file-header.type
 //#Arch:x86_64
 
 #include "../common/runtime.h"

@@ -143,7 +143,32 @@
 //! ExpectErrorWild:{error regex} As for ExpectError, but only checks Wild's error output.
 //!
 //! Malfunction:{malfunction-id} Run with the specified malfunction enabled. Linking should still
-//! succeed, but linker-diff should report a diff. That diff will be snapshot tested.
+//! succeed, but linker-diff must report a diff that is *caused by that malfunction*. Requires at
+//! least one `MalfunctionExpectKey` directive; see there for how detection is established. For ELF
+//! the resulting diff is additionally snapshot tested.
+//!
+//! MalfunctionExpectKey:{linker-diff-key} Mandatory for, and only meaningful with, `Malfunction`.
+//! May be repeated. Names a linker-diff key that must *change* as a result of the malfunction.
+//!
+//! This exists because "the report is non-empty" proves nothing when the report was already
+//! non-empty. The Mach-O malfunction configs sat in exactly that state: `linker-diff-macho.c`
+//! contains `int *pg = &g;`, which trips a real, unfixed rebase bug, so every malfunction config
+//! passed on the strength of a diff it had not caused - including `macho-wrong-entry-point`, whose
+//! corruption nothing in linker-diff could see at all.
+//!
+//! So the harness links the program twice: once with the malfunction and once without, diffs both
+//! against the same reference binaries, and requires each named key to be
+//!   1. present in the malfunctioning report, and
+//!   2. rendered differently there than in the clean report (where "absent" counts as a rendering).
+//!
+//! Property (2) is what makes the check independent of whatever else happens to be broken. If the
+//! rebase bug is fixed tomorrow, the clean report goes empty, the malfunction report still contains
+//! the named key, and the assertion means precisely what it meant before. If instead the *checker*
+//! for a key is deleted or broken, the key stops changing and the config fails - which is the whole
+//! point of a malfunction test.
+//!
+//! Both links use identical inputs and flags and produce identical layouts, so any difference in a
+//! key's rendering is attributable to the malfunction.
 //!
 //! SecEquiv:{sec-name}={sec-name} Tells linker-diff that the two section names should be considered
 //! as equivalent.
@@ -1129,6 +1154,11 @@ struct Config {
     expect_stderr: Vec<ErrorMatcher>,
     expect_stdout: Vec<ErrorMatcher>,
     active_malfunction: Option<String>,
+
+    /// linker-diff keys that `active_malfunction` must change. See the `MalfunctionExpectKey`
+    /// directive docs at the top of this file. Mandatory whenever `active_malfunction` is set.
+    malfunction_expect_keys: Vec<String>,
+
     support_architectures: Vec<Architecture>,
     requires_glibc: bool,
     requires_glibc_version: Option<String>,
@@ -1830,6 +1860,7 @@ impl Config {
             expect_stderr: Default::default(),
             expect_stdout: Default::default(),
             active_malfunction: None,
+            malfunction_expect_keys: Vec::new(),
             cross_enabled: true,
             support_architectures: platform.supported_architectures().to_owned(),
             requires_glibc: false,
@@ -2230,8 +2261,18 @@ fn process_directive(
             if !config.config_name.starts_with(&prefix) {
                 bail!("Config name must be prefixed with '{prefix}'");
             }
+            if arg == NO_MALFUNCTION {
+                bail!(
+                    "`{NO_MALFUNCTION}` is reserved: the harness passes it to \
+                     WILD_MALFUNCTION to produce the un-corrupted half of a malfunction test, so \
+                     an injection point by that name would corrupt the control link too"
+                );
+            }
             config.active_malfunction = Some(arg.to_owned());
             config.should_run = false;
+        }
+        "MalfunctionExpectKey" => {
+            config.malfunction_expect_keys.push(arg.to_owned());
         }
         "SecEquiv" => config.section_equiv.push(
             arg.split_once('=')
@@ -5886,6 +5927,16 @@ fn diff_shared_objects(config: &Config, programs: &[Program]) -> Result {
         return Ok(());
     }
 
+    // No malfunction config diffs intermediate shared objects today, and `diff_files` requires a
+    // clean-link baseline whenever a malfunction is active. Rather than silently skipping the
+    // malfunction verification for shared objects (a fresh way for a malfunction test to pass
+    // vacuously), say so.
+    assert!(
+        config.active_malfunction.is_none() || programs.iter().all(|p| p.shared_objects.is_empty()),
+        "Malfunction configs that produce shared objects need baseline plumbing in \
+         `diff_shared_objects`, mirroring `diff_executables`."
+    );
+
     // All our programs should have the same number of shared objects and they should be in the same
     // order. We use this to group shared objects at the corresponding index so that we can then
     // diff them.
@@ -5905,17 +5956,87 @@ fn diff_shared_objects(config: &Config, programs: &[Program]) -> Result {
             filenames,
             // Shared objects should always have a command.
             so_group.last().unwrap().command.as_ref().unwrap(),
+            None,
         )?;
     }
     Ok(())
 }
 
-fn diff_executables(config: &Config, programs: &[Program]) -> Result {
+fn diff_executables(
+    config: &Config,
+    programs: &[Program],
+    baseline: Option<&MalfunctionBaseline>,
+) -> Result {
     let filenames = programs
         .iter()
         .map(|p| p.link_output.binary.clone())
         .collect_vec();
-    diff_files_report_command(config, filenames, programs.last().unwrap())
+    diff_files_report_command(config, filenames, programs.last().unwrap(), baseline)
+}
+
+/// The name given to `WILD_MALFUNCTION` for the clean half of a malfunction test.
+///
+/// `malfunction_point` compares the environment variable against each injection point's name, so
+/// any name that no injection point uses is a no-op. Using one - rather than unsetting the
+/// variable - keeps the clean link on byte-for-byte the same code path as the malfunctioning one:
+/// same `WILD_MALFUNCTION` handling, and in particular still a subprocess link rather than the
+/// in-process one that `Config::can_use_wild_in_process` would otherwise select.
+const NO_MALFUNCTION: &str = "none";
+
+/// Links `program_inputs` again with the malfunction disabled and records how linker-diff renders
+/// each problem key for that clean output. This is the control against which the malfunctioning
+/// link is judged; see the `MalfunctionExpectKey` directive docs at the top of this file.
+fn build_malfunction_baseline(
+    program_inputs: &ProgramInputs,
+    config: &Config,
+    cross_arch: Option<Architecture>,
+) -> Result<MalfunctionBaseline> {
+    let mut clean_config = config.clone();
+    clean_config.active_malfunction = Some(NO_MALFUNCTION.to_owned());
+    // A separate output directory, so the clean binary can't overwrite the malfunctioning one.
+    clean_config.config_name = format!("{}.no-malfunction", config.config_name);
+
+    std::fs::create_dir_all(clean_config.build_dir()).with_context(|| {
+        format!(
+            "Failed to create directory `{}`",
+            clean_config.build_dir().display()
+        )
+    })?;
+
+    let programs = clean_config
+        .available_linkers
+        .iter()
+        .filter(|linker| clean_config.is_linker_enabled(linker))
+        .map(|linker| {
+            program_inputs
+                .build(linker, &clean_config, cross_arch)
+                .with_context(|| {
+                    format!(
+                        "Failed to produce the no-malfunction baseline for config `{}`",
+                        config.config_name
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let files = programs
+        .iter()
+        .map(|program| program.link_output.binary.clone())
+        .collect_vec();
+
+    let details = if files.len() < 2 {
+        // Caller has already established that we have enough linkers to diff; being defensive
+        // here just means an empty baseline, i.e. every key counts as changed.
+        HashMap::new()
+    } else {
+        let diff_config = create_diff_config(&clean_config, files)?;
+        produce_diff_report(&diff_config)?
+            .problem_details()
+            .into_iter()
+            .collect()
+    };
+
+    Ok(MalfunctionBaseline { details })
 }
 
 fn normalise_report(report: &linker_diff::Report) -> String {
@@ -5997,6 +6118,7 @@ fn diff_files_report_command(
     config: &Config,
     files: Vec<PathBuf>,
     command_display: &dyn Display,
+    baseline: Option<&MalfunctionBaseline>,
 ) -> Result {
     if !config.should_diff || files.len() < 2 {
         return Ok(());
@@ -6004,7 +6126,7 @@ fn diff_files_report_command(
 
     let diff_config = create_diff_config(config, files)?;
 
-    diff_files(config, &diff_config).with_context(|| {
+    diff_files(config, &diff_config, baseline).with_context(|| {
         format!(
             "Diff reported error: {command_display}\nTo revalidate:\n\
             cargo run --bin linker-diff -- {}",
@@ -6013,13 +6135,36 @@ fn diff_files_report_command(
     })
 }
 
+/// How each problem key was rendered by linker-diff for the same program linked *without* the
+/// malfunction. See the `MalfunctionExpectKey` directive docs at the top of this file.
+struct MalfunctionBaseline {
+    /// Key -> rendered body. A key that is absent from the map was not a problem at all in the
+    /// clean link, which is the strongest form of "this changed".
+    details: HashMap<String, String>,
+}
+
 /// Diff the supplied files. The last file should be the one that we produced.
-fn diff_files(config: &Config, diff_config: &linker_diff::Config) -> Result {
+fn diff_files(
+    config: &Config,
+    diff_config: &linker_diff::Config,
+    baseline: Option<&MalfunctionBaseline>,
+) -> Result {
     let report = produce_diff_report(diff_config)?;
 
     if let Some(malfunction) = config.active_malfunction.as_ref() {
-        if !report.has_problems() {
-            bail!("No diff reported when running with malfunction `{malfunction}`");
+        let baseline = baseline.context(
+            "Internal error: no clean-link baseline was computed for a malfunction config",
+        )?;
+
+        verify_malfunction_detected(config, malfunction, &report, baseline)?;
+
+        // Snapshot the whole report as well, but only where the snapshot is portable. The Mach-O
+        // reference linker differs between machines - `ld64.lld` where it's installed, Apple's
+        // `ld` otherwise - and the two produce different (both correct) layouts, so a byte-exact
+        // snapshot would be a machine-specific artifact rather than a test. Mach-O detection is
+        // established by `verify_malfunction_detected` above instead.
+        if config.platform == PlatformKind::MachO {
+            return Ok(());
         }
 
         let path = config.test_src_dir.join(format!(
@@ -6035,6 +6180,67 @@ fn diff_files(config: &Config, diff_config: &linker_diff::Config) -> Result {
         bail!("Validation failed.\n{report}");
     }
     Ok(())
+}
+
+/// Checks that `report` differs from the clean-link `baseline` in each of the ways that
+/// `//#MalfunctionExpectKey` says it should.
+///
+/// A malfunction config that merely produces *a* diff proves nothing, because the diff may predate
+/// the malfunction entirely - which is exactly how all seven Mach-O malfunction configs used to
+/// pass while one of them (`macho-wrong-entry-point`) was detected by nothing whatsoever.
+fn verify_malfunction_detected(
+    config: &Config,
+    malfunction: &str,
+    report: &linker_diff::Report,
+    baseline: &MalfunctionBaseline,
+) -> Result {
+    let details: HashMap<String, String> = report.problem_details().into_iter().collect();
+
+    if config.malfunction_expect_keys.is_empty() {
+        bail!(
+            "Malfunction config `{malfunction}` has no `//#MalfunctionExpectKey:` directive, so \
+             nothing establishes that the malfunction was detected rather than merely coinciding \
+             with an unrelated diff. Keys reported for this link: {}",
+            format_key_list(details.keys())
+        );
+    }
+
+    for key in &config.malfunction_expect_keys {
+        let Some(actual) = details.get(key) else {
+            bail!(
+                "Malfunction `{malfunction}` was NOT detected: linker-diff reported nothing for \
+                 the expected key `{key}`. Either the check that is supposed to catch this \
+                 malfunction has regressed, or the malfunction injection point is no longer \
+                 reached. Keys actually reported: {}",
+                format_key_list(details.keys())
+            );
+        };
+
+        if baseline
+            .details
+            .get(key)
+            .is_some_and(|clean| clean == actual)
+        {
+            bail!(
+                "Malfunction `{malfunction}` was NOT detected: linker-diff reports `{key}`, but \
+                 it reports exactly the same thing for the *same program linked without the \
+                 malfunction*, so this difference is not evidence that anything detected the \
+                 malfunction. Pick a key that the malfunction actually changes, or make the check \
+                 for `{key}` sensitive to it.\n{key}\n{actual}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn format_key_list<'a>(keys: impl Iterator<Item = &'a String>) -> String {
+    let keys = keys.sorted().join(", ");
+    if keys.is_empty() {
+        "(none)".to_owned()
+    } else {
+        keys
+    }
 }
 
 fn create_diff_config(config: &Config, files: Vec<PathBuf>) -> Result<linker_diff::Config> {
@@ -6256,6 +6462,24 @@ fn available_linkers_for_mac() -> Result<Vec<Linker>> {
         }));
     }
 
+    // Apple's own linker (`ld-prime`). Present on any machine with the Xcode command line tools,
+    // whereas `ld64.lld` usually is not. Without it, a developer on macOS gets exactly one linker,
+    // `files.len() < 2` in `diff_files_report_command`, and therefore *no* output diffing at all -
+    // which in turn means the Mach-O malfunction configs pass without linker-diff ever running.
+    //
+    // It is NOT enabled by default: Wild's Mach-O output does not yet match ld-prime closely
+    // enough for the whole suite to diff clean (15 of 21 tests fail if you turn it on globally).
+    // Tests that want it opt in with `//#ReferenceLinkers:ld`.
+    if let Ok(path) = find_bin(&["ld"]) {
+        linkers.push(Linker::ThirdParty(ThirdPartyLinker {
+            name: "ld",
+            gcc_name: "ld",
+            path,
+            cross_paths: HashMap::new(),
+            enabled_by_default: false,
+        }));
+    }
+
     linkers.push(Linker::Wild);
 
     Ok(linkers)
@@ -6342,12 +6566,24 @@ fn run_with_config(
             .with_context(|| format!("Output binary assertions failed. {program}"))?;
     }
 
+    // A malfunction config exists solely to prove that a linker-diff check works, so it always
+    // diffs. Without this it would be gated behind `run_all_diffs`, which defaults to false, and
+    // the whole test would reduce to "the corrupted binary still linked".
+    let diffing_required = config.active_malfunction.is_some();
+
     // ppc64le: full output-diff parity against the reference linker is pending (glink /
     // DT_PPC64_GLINK emission and section alignment aren't matched yet), so we validate that
     // binaries link and run, but don't byte-compare them. Drop this carve-out as parity lands.
-    if config.test_config.run_all_diffs && config.arch != Architecture::Ppc64 {
+    if (config.test_config.run_all_diffs || diffing_required) && config.arch != Architecture::Ppc64
+    {
+        let baseline = config
+            .active_malfunction
+            .as_ref()
+            .map(|_| build_malfunction_baseline(program_inputs, config, cross_arch))
+            .transpose()?;
+
         diff_shared_objects(config, &programs)?;
-        diff_executables(config, &programs)?;
+        diff_executables(config, &programs, baseline.as_ref())?;
     }
 
     if should_print_timing() {
@@ -6555,10 +6791,41 @@ fn run_integration_test(
         return Ok(libtest_mimic::Completion::ignored_with(error.to_string()));
     }
 
-    if !cfg!(debug_assertions) && config.active_malfunction.is_some() {
-        return Ok(libtest_mimic::Completion::ignored_with(
-            "Malfunction tests are allowed only in Debug profile",
-        ));
+    if let Some(malfunction) = config.active_malfunction.as_deref() {
+        // Checked before any of the "ignore" paths below, so that a malfunction config which can
+        // never prove anything is rejected on every machine, not just on the ones that would have
+        // run it.
+        if config.malfunction_expect_keys.is_empty() {
+            bail!(
+                "Malfunction config `{malfunction}` has no `//#MalfunctionExpectKey:` directive. \
+                 Without one, the test only asserts that linker-diff reported *something*, which \
+                 is satisfied by any pre-existing difference and therefore proves nothing about \
+                 the malfunction. See the directive docs in integration_tests.rs."
+            );
+        }
+
+        if !cfg!(debug_assertions) {
+            return Ok(libtest_mimic::Completion::ignored_with(
+                "Malfunction tests are allowed only in Debug profile",
+            ));
+        }
+
+        // Detection is established by diffing against a reference linker. With no reference
+        // linker there is nothing to diff against and the test can only assert that the corrupted
+        // binary still linked - so report it as skipped rather than as a pass.
+        let enabled_linkers = config
+            .available_linkers
+            .iter()
+            .filter(|linker| config.is_linker_enabled(linker))
+            .count();
+
+        if !config.should_diff || enabled_linkers < 2 || config.arch == Architecture::Ppc64 {
+            return Ok(libtest_mimic::Completion::ignored_with(format!(
+                "Malfunction `{malfunction}` cannot be verified here: linker-diff needs a \
+                 reference linker to compare against and {enabled_linkers} linker(s) are enabled \
+                 for this config"
+            )));
+        }
     }
 
     std::fs::create_dir_all(config.build_dir()).with_context(|| {
