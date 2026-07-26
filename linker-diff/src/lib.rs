@@ -317,6 +317,19 @@ pub(crate) const WILD_MACHO_KNOWN_DEFECTS: &[KnownDefect] = &[
                omits LC_DYLD_EXPORTS_TRIE, so the image advertises no exports either.",
     },
     KnownDefect {
+        key: "macho.dyld-info.fixups",
+        note: "`xcrun dyld_info -fixups` SIGSEGVs on every dynamically-linked Wild executable, so \
+               the differential against it reports a crashed tool rather than a fixup listing. \
+               This is a downstream symptom of `macho.dysymtab` above: the three dyld_info modes \
+               that need the dynamic symbol view (-fixups, -symbolic_fixups, -objc) all die, while \
+               -platform/-segments/-dependents/-imports/-exports all succeed. It is suppressed \
+               here rather than ignored so that it stays visible on every run and disappears by \
+               itself once LC_DYSYMTAB is emitted. Note that Wild's chained fixups are still \
+               genuinely checked, by `macho.fixups` (our own reader) and by \
+               `macho.dyld-info.chain-starts` (otool, which does not crash) - neither is \
+               suppressed, so this entry does not blind the fixup checks.",
+    },
+    KnownDefect {
         key: "file-header.flags.MH_WEAK_DEFINES",
         note: "Linking C++ (weak/coalesced definitions from inline functions and templates), ld64 \
                sets MH_WEAK_DEFINES in the Mach header and Wild does not. dyld uses this flag to \

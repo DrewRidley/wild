@@ -27,15 +27,16 @@
 //#Config:malfunction-macho-drop-fixup:default
 //#Malfunction:macho-drop-fixup
 
-// NOT ENABLED: the `macho-wrong-segment-offset` malfunction (starts record points one page too
-// high). The injection point exists in macho_writer.rs and works, but this corruption is already
-// caught by `verify_chained_fixups_segment_offsets` in integration_tests.rs, which runs as an
-// output-binary assertion *before* any diffing. The harness has no notion of "this malfunction is
-// expected to trip a binary assertion", so enabling a config for it produces a hard test failure
-// ("Chained fixups segment 3 has segment_offset 0xc000, expected offset 0x8000") rather than a
-// diff snapshot. To enable it, the harness must first skip output-binary assertions - or treat a
-// failing one as a successful detection - when a malfunction is active. Until then, verify it by
-// hand: link with WILD_MALFUNCTION=macho-wrong-segment-offset and observe that assertion fire.
+// Points the starts record one page too high, so every fixup slot in the chain is computed from
+// the wrong base.
+//
+// This one is also caught by `verify_chained_fixups_segment_offsets` in integration_tests.rs.
+// That used to make it unusable as a malfunction config, because the binary assertion fired
+// before any diffing and produced a hard failure rather than a diff snapshot. `check_macho_path`
+// now skips the structural self-consistency verifiers when a malfunction is active, so detection
+// is left to linker-diff, where it belongs.
+//#Config:malfunction-macho-wrong-segment-offset:default
+//#Malfunction:macho-wrong-segment-offset
 
 // Binds every import against the wrong library ordinal while keeping the symbol names correct.
 //#Config:malfunction-macho-bad-import-ordinal:default

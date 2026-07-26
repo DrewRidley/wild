@@ -4,7 +4,6 @@
 //#ExpectSym:_main
 //#ExpectSym:_level1
 //#DiffIgnore:section.__unwind_info
-//#KnownFailure:wild writes LC_MAIN entryoff pointing at the start of __text rather than at _main, so execution starts in the wrong function. Delete this directive once write_entry_point_command is fixed - this test is the regression guard for that fix.
 
 // `main` is deliberately the *last* function in this file, and part of the work
 // lives in a second input object. That exercises entry-point resolution

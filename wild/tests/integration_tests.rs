@@ -2944,7 +2944,7 @@ fn build_linker_input(
                 linker.link_intermediate(&objects, &obj_path, &config, cross_arch, kind)?;
             let assertions = Assertions::default();
             assertions
-                .check_path(&out.path, linker)
+                .check_path(&out.path, linker, config.active_malfunction.is_some())
                 .with_context(|| format!("Assertions failed for `{}`", out.path.display()))?;
 
             if let Some(fat_kind) = dep.input_type.fat_kind() {
@@ -4342,7 +4342,7 @@ fn get_script(inputs: &[LinkerInput]) -> Option<(PathBuf, &[LinkerInput])> {
 }
 
 impl Assertions {
-    fn check(&self, link_output: &LinkOutput) -> Result {
+    fn check(&self, link_output: &LinkOutput, malfunction_active: bool) -> Result {
         // If the output file doesn't exist and we have no assertions, then skip parsing the output
         // file. This allows tests like the one that writes to /dev/null to succeed, while still
         // checking that the output file is valid in cases where we don't have any assertions.
@@ -4350,7 +4350,11 @@ impl Assertions {
             return Ok(());
         }
 
-        self.check_path(&link_output.binary, &link_output.linker_used)?;
+        self.check_path(
+            &link_output.binary,
+            &link_output.linker_used,
+            malfunction_active,
+        )?;
         self.check_output_files(link_output)?;
         Ok(())
     }
@@ -4375,7 +4379,12 @@ impl Assertions {
         Ok(())
     }
 
-    fn check_path(&self, path: &PathBuf, linker_used: &Linker) -> Result {
+    /// `malfunction_active` is true when this binary was linked with `WILD_MALFUNCTION` set, i.e.
+    /// when it has been *deliberately* corrupted. Structural self-consistency checks over the
+    /// whole binary are then skipped, because the corruption is the point of the test and the
+    /// detection is supposed to come from linker-diff. Assertions that a test explicitly asked
+    /// for via a `//#` directive still run.
+    fn check_path(&self, path: &PathBuf, linker_used: &Linker, malfunction_active: bool) -> Result {
         let bytes =
             std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
 
@@ -4388,7 +4397,7 @@ impl Assertions {
 
         // For Mach-O.
         if matches!(obj, object::File::MachO64(_)) {
-            return self.check_macho_path(&obj, &bytes, linker_used);
+            return self.check_macho_path(&obj, &bytes, linker_used, malfunction_active);
         }
 
         self.verify_file_kind(&obj)?;
@@ -4431,7 +4440,13 @@ impl Assertions {
         Ok(())
     }
 
-    fn check_macho_path(&self, obj: &object::File, bytes: &[u8], linker_used: &Linker) -> Result {
+    fn check_macho_path(
+        &self,
+        obj: &object::File,
+        bytes: &[u8],
+        linker_used: &Linker,
+        malfunction_active: bool,
+    ) -> Result {
         // Allowlist of assertion fields implemented for Mach-O.
         let supported = Assertions {
             expected_symtab_entries: self.expected_symtab_entries.clone(),
@@ -4464,13 +4479,20 @@ impl Assertions {
         self.verify_absent_sections(obj)?;
         self.verify_section_bytes(obj)?;
         self.verify_strings(bytes)?;
-        verify_no_overlapping_sections(obj)?;
-        verify_no_overlapping_segments(obj)?;
-        verify_chained_fixups_segment_offsets(obj, bytes)?;
-        verify_macho_pie(obj)?;
 
-        if linker_used.is_wild() {
-            verify_uuid(obj, bytes)?;
+        // Structural self-consistency checks. A malfunction test corrupts the output on purpose,
+        // so running these would turn "the corruption was applied" into a hard test failure
+        // instead of letting linker-diff be the thing that catches it. Skipping them is what makes
+        // malfunctions like `macho-no-pie` and `macho-wrong-segment-offset` usable at all.
+        if !malfunction_active {
+            verify_no_overlapping_sections(obj)?;
+            verify_no_overlapping_segments(obj)?;
+            verify_chained_fixups_segment_offsets(obj, bytes)?;
+            verify_macho_pie(obj)?;
+
+            if linker_used.is_wild() {
+                verify_uuid(obj, bytes)?;
+            }
         }
         Ok(())
     }
@@ -6316,7 +6338,7 @@ fn run_with_config(
     for program in &programs {
         program
             .assertions
-            .check(&program.link_output)
+            .check(&program.link_output, config.active_malfunction.is_some())
             .with_context(|| format!("Output binary assertions failed. {program}"))?;
     }
 
