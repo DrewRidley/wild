@@ -44,6 +44,8 @@ mod gnu_hash;
 mod header_diff;
 mod init_order;
 mod loongarch64;
+mod macho_dyld_info;
+mod macho_fixups;
 mod ppc64;
 mod riscv64;
 mod riscv_attributes;
@@ -108,6 +110,12 @@ pub struct Config {
     #[arg(long, alias = "color", default_value = "auto")]
     pub colour: ColourMode,
 
+    /// Treat validation passes that have no implementation for the file format under test as
+    /// failures, even when they're acknowledged by the ignore list. Use this to see the true
+    /// verification coverage rather than the acknowledged-gap-adjusted coverage.
+    #[arg(long)]
+    pub fail_on_unimplemented: bool,
+
     /// Primary file that we're validating against the reference file(s)
     pub file: PathBuf,
 }
@@ -134,6 +142,213 @@ struct NameIndex<'data> {
     globals_by_name: HashMap<&'data [u8], Vec<object::SymbolIndex>>,
     locals_by_name: HashMap<&'data [u8], Vec<object::SymbolIndex>>,
     dynamic_by_name: HashMap<&'data [u8], Vec<object::SymbolIndex>>,
+}
+
+/// Why a validation pass doesn't cover a particular file format.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GapCategory {
+    /// The thing the pass validates doesn't exist in this file format, so there's nothing to
+    /// implement. Closing one of these means deleting the row, not writing code.
+    NotApplicable,
+
+    /// The pass *should* cover this format, but doesn't. **This number should only ever go down.**
+    NotImplemented,
+}
+
+/// A validation pass that is known not to cover a particular file format.
+pub(crate) struct CoverageGap {
+    /// Always `unimplemented.<pass>.<format>`. This is also the ignore key.
+    pub(crate) key: &'static str,
+    pub(crate) category: GapCategory,
+    /// Why the gap exists and, for `NotImplemented`, what would close it.
+    pub(crate) note: &'static str,
+}
+
+/// THE INVENTORY OF THINGS LINKER-DIFF DOESN'T CHECK.
+///
+/// Every entry here is a validation pass that runs for ELF but does nothing for Mach-O. Before
+/// this table existed those passes were *silent*: they returned an empty set of fields,
+/// `diff_fields` found nothing to compare, and a half-finished module was indistinguishable from a
+/// passing one.
+///
+/// The rules:
+///  * A pass that can't handle a binary's file format MUST call `Report::report_unimplemented`.
+///  * If the resulting key isn't in this table, it is a hard failure. You cannot add a blind pass
+///    without also adding a row here, and the row demands a justification.
+///  * `--wild-defaults` adds every key here to the ignore list, so the existing tests stay green,
+///    but `linker-diff` prints the whole inventory on every run and `--fail-on-unimplemented` turns
+///    them all back into failures.
+///
+/// `grep -c NotImplemented linker-diff/src/lib.rs` is the number that has to shrink.
+pub(crate) const MACHO_ACKNOWLEDGED_GAPS: &[CoverageGap] = &[
+    CoverageGap {
+        key: "unimplemented.asm-diff.macho",
+        category: GapCategory::NotImplemented,
+        note: "Relocations inside function bodies are NOT compared for Mach-O. asm_diff is built \
+               on ELF dynamic tables, .rela sections and GOT/PLT indexing; making it Mach-O \
+               capable is a rewrite, not a patch. This is the single largest verification hole.",
+    },
+    CoverageGap {
+        key: "unimplemented.asm-index.macho",
+        category: GapCategory::NotImplemented,
+        note: "AddressIndex::build_indexes only indexes ELF, so there is no relocation/GOT/PLT \
+               index to validate. Blocks asm-diff.",
+    },
+    CoverageGap {
+        key: "unimplemented.dynamic.macho",
+        category: GapCategory::NotImplemented,
+        note: "Dylib dependencies are not diffed. The Mach-O equivalents of .dynamic are \
+               LC_LOAD_DYLIB / LC_ID_DYLIB / LC_RPATH / LC_LOAD_WEAK_DYLIB.",
+    },
+    CoverageGap {
+        key: "unimplemented.dynsym.macho",
+        category: GapCategory::NotImplemented,
+        note: "Exported symbols are not diffed. Mach-O exports live in the LC_DYLD_EXPORTS_TRIE \
+               export trie, not in a .dynsym section.",
+    },
+    CoverageGap {
+        key: "unimplemented.eh-frame.macho",
+        category: GapCategory::NotImplemented,
+        note: "Unwind info is not diffed. Mach-O uses __TEXT,__unwind_info (plus __eh_frame), \
+               not .eh_frame_hdr. Note the Mach-O tests all pass `--ignore section.__unwind_info`, \
+               so __unwind_info is currently unchecked in every dimension.",
+    },
+    CoverageGap {
+        key: "unimplemented.debug-info.macho",
+        category: GapCategory::NotImplemented,
+        note: "DWARF compilation units are not diffed. gimli is asked for `.debug_info`, which \
+               never matches Mach-O's `__debug_info`, so zero units are found and zero are \
+               compared.",
+    },
+    CoverageGap {
+        key: "unimplemented.init-order.macho",
+        category: GapCategory::NotImplemented,
+        note: "Initialiser order is not diffed. The pass looks for .init_array/.fini_array; \
+               Mach-O uses __DATA,__mod_init_func and __DATA,__mod_term_func.",
+    },
+    CoverageGap {
+        key: "unimplemented.got-plt.macho",
+        category: GapCategory::NotImplemented,
+        note: "Mach-O has no .got.plt, but it does have __DATA_CONST,__got and __TEXT,__stubs, \
+               whose contents are equally unchecked.",
+    },
+    CoverageGap {
+        key: "unimplemented.gnu-hash.macho",
+        category: GapCategory::NotApplicable,
+        note: "Mach-O has no .gnu.hash section. dyld resolves symbols through the export trie.",
+    },
+    CoverageGap {
+        key: "unimplemented.sysv-hash.macho",
+        category: GapCategory::NotApplicable,
+        note: "Mach-O has no SysV .hash section.",
+    },
+    CoverageGap {
+        key: "unimplemented.dynsym-partition.macho",
+        category: GapCategory::NotApplicable,
+        note: "Mach-O has a single LC_SYMTAB rather than a separate .dynsym. Its \
+               local/extdef/undef partition is validated by the `macho.dysymtab` pass.",
+    },
+    CoverageGap {
+        key: "unimplemented.version.macho",
+        category: GapCategory::NotApplicable,
+        note: "Mach-O has no symbol versioning (no .gnu.version / .gnu.version_d).",
+    },
+];
+
+/// Greedy word wrap. Only used for rendering coverage-gap notes.
+fn wrap_note(note: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in note.split_whitespace() {
+        if !current.is_empty() && current.len() + 1 + word.len() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn find_acknowledged_gap(key: &str) -> Option<&'static CoverageGap> {
+    MACHO_ACKNOWLEDGED_GAPS.iter().find(|g| g.key == key)
+}
+
+/// A difference that `--wild-defaults` suppresses even though it is believed to be a genuine defect
+/// in Wild's output, as opposed to a legitimate linker-to-linker difference.
+///
+/// The two are kept apart on purpose. The ignore list above is a list of things that don't matter;
+/// putting a real bug in it makes the bug indistinguishable from noise, which is how a
+/// verification tool rots. Everything here is still *reported* - see
+/// [`Report::coverage_gap_report`] - it just doesn't fail the build.
+pub(crate) struct KnownDefect {
+    pub(crate) key: &'static str,
+    pub(crate) note: &'static str,
+}
+
+/// Suppressed-but-real differences in Wild's Mach-O output. **Delete rows from here as they are
+/// fixed.** Adding a row requires a description of the defect.
+pub(crate) const WILD_MACHO_KNOWN_DEFECTS: &[KnownDefect] = &[
+    KnownDefect {
+        key: "section.__got.type",
+        note: "Wild marks __DATA_CONST,__got as S_REGULAR. ld64 marks it \
+               S_NON_LAZY_SYMBOL_POINTERS. Tools that enumerate indirect symbols (otool -I, \
+               dyld_info) can't describe Wild's __got as a result.",
+    },
+    KnownDefect {
+        key: "section.__got.reserved1",
+        note: "Follows from the above: reserved1 is the index of the section's first entry in the \
+               indirect symbol table, and Wild leaves it 0 while ld64 sets a real index.",
+    },
+    KnownDefect {
+        key: "section.__got.alignment",
+        note: "Wild gives __got align=2^0. It is an array of 8-byte pointers and ld64 gives it \
+               align=2^3.",
+    },
+    KnownDefect {
+        key: "macho.dysymtab",
+        note: "Wild emits no LC_DYSYMTAB load command at all; ld64 emits one for every image it \
+               links. Without it nothing can tell which run of LC_SYMTAB entries is local, which \
+               is externally defined and which is undefined (`nm`, `otool -I`, dyld). Wild also \
+               omits LC_DYLD_EXPORTS_TRIE, so the image advertises no exports either.",
+    },
+    KnownDefect {
+        key: "file-header.flags.MH_WEAK_DEFINES",
+        note: "Linking C++ (weak/coalesced definitions from inline functions and templates), ld64 \
+               sets MH_WEAK_DEFINES in the Mach header and Wild does not. dyld uses this flag to \
+               decide whether the image needs weak-symbol coalescing at load time.",
+    },
+    KnownDefect {
+        key: "file-header.flags.MH_BINDS_TO_WEAK",
+        note: "As above, for the importing side: ld64 sets MH_BINDS_TO_WEAK when the image binds \
+               to a weak definition, Wild does not.",
+    },
+];
+
+fn find_known_defect(key: &str) -> Option<&'static KnownDefect> {
+    WILD_MACHO_KNOWN_DEFECTS.iter().find(|d| d.key == key)
+}
+
+/// Short name for a binary's file format. Used to key coverage gaps, so that
+/// `unimplemented.asm-diff.macho` can be acknowledged without also blinding ELF.
+pub(crate) fn file_format_name(file: &File) -> &'static str {
+    match file {
+        // "elf" and "macho" mean 64-bit. Every reader in this crate matches on `Elf64` / `MachO64`
+        // specifically, so a 32-bit input gets its own name and therefore an *unacknowledged*
+        // coverage gap - a loud failure - rather than quietly falling through the 64-bit readers.
+        File::Elf64(_) => "elf",
+        File::MachO64(_) => "macho",
+        File::Elf32(_) => "elf32",
+        File::MachO32(_) => "macho32",
+        // `object::File` is `#[non_exhaustive]` and most other variants are feature-gated out of
+        // this build. Anything that reaches here still gets a distinct, greppable format name so
+        // that a gap is recorded rather than swallowed.
+        _ => "other-format",
+    }
 }
 
 impl Config {
@@ -275,6 +490,38 @@ impl Config {
             .into_iter()
             .map(ToOwned::to_owned),
         );
+
+        self.ignore.extend(
+            [
+                // --- Mach-O: legitimate linker-to-linker differences. ---
+                //
+                // ld64 emits load commands Wild doesn't (LC_UUID, LC_SOURCE_VERSION,
+                // LC_FUNCTION_STARTS, LC_DATA_IN_CODE, ...), so the command count and total size
+                // can't match. Note this means a *missing* load command is not caught here; the
+                // individual load commands that matter are diffed by their own passes.
+                "file-header.ncmds",
+                "file-header.sizeofcmds",
+                // Wild and ld64 legitimately group input sections differently. e.g. for a
+                // freestanding binary Wild emits __TEXT,{__text,__cstring,__const,__stubs} where
+                // ld64 emits __TEXT,{__text,__const,__unwind_info}. Since every Mach-O test also
+                // passes `--ignore section.__unwind_info`, this can never match.
+                "segment.__TEXT.nsects",
+                "segment.__DATA.nsects",
+                "segment.__DATA_CONST.nsects",
+            ]
+            .into_iter()
+            .map(ToOwned::to_owned),
+        );
+
+        // Mach-O validation passes that don't exist yet. Suppressed so the existing tests stay
+        // runnable; still printed on every run by `Report::coverage_gap_report`.
+        self.ignore
+            .extend(MACHO_ACKNOWLEDGED_GAPS.iter().map(|g| g.key.to_owned()));
+
+        // Real bugs in Wild's Mach-O output, suppressed so they don't mask unrelated regressions.
+        // Also still printed on every run.
+        self.ignore
+            .extend(WILD_MACHO_KNOWN_DEFECTS.iter().map(|d| d.key.to_owned()));
 
         match arch {
             ArchKind::Aarch64 => self.ignore.extend(
@@ -544,6 +791,45 @@ fn validate_objects(
     });
 }
 
+/// Like [`validate_objects`], but for validations that only understand some file formats.
+///
+/// This exists because `validate_objects` collapses each binary to "OK" or an error string and
+/// then compares those strings. A validation that doesn't understand the format therefore produces
+/// the *same* result for every binary, which compares equal, which reports nothing. Instead of
+/// letting the pass run and silently agree with itself, we record the gap.
+fn validate_objects_for_formats(
+    report: &mut Report,
+    objects: &[Binary],
+    validation_name: &str,
+    pass_name: &str,
+    supported_formats: &[&str],
+    validation_fn: impl Fn(&Binary) -> Result,
+) {
+    if !report.require_format(pass_name, objects, supported_formats) {
+        return;
+    }
+    validate_objects(report, objects, validation_name, validation_fn);
+}
+
+/// For a validation that is *by design* specific to one file format and has a sibling pass
+/// covering the others. No coverage gap is recorded, because there is no gap - use
+/// [`validate_objects_for_formats`] instead if there is.
+fn validate_objects_format_specific(
+    report: &mut Report,
+    objects: &[Binary],
+    validation_name: &str,
+    formats: &[&str],
+    validation_fn: impl Fn(&Binary) -> Result,
+) {
+    let Some(first) = objects.first() else {
+        return;
+    };
+    if !formats.contains(&file_format_name(first.file)) {
+        return;
+    }
+    validate_objects(report, objects, validation_name, validation_fn);
+}
+
 pub struct Report {
     /// The names of each of our binaries. These should be short, not a full path, since we often
     /// prefix lines with these names.
@@ -555,10 +841,32 @@ pub struct Report {
     /// The differences that were detected.
     diffs: Vec<Diff>,
 
+    /// Validation passes that had no implementation for the file format of the binaries being
+    /// compared. See [`MACHO_ACKNOWLEDGED_GAPS`]. A pass recorded here checked NOTHING; it is not
+    /// evidence of correctness.
+    unimplemented: Vec<UnimplementedPass>,
+
+    /// Diff keys that were suppressed but are listed in [`WILD_MACHO_KNOWN_DEFECTS`], i.e. known
+    /// bugs that were actually hit on this run.
+    suppressed_defects: Vec<String>,
+
     /// The configuration that was used.
     config: Config,
 
     pub coverage: Option<Coverage>,
+}
+
+struct UnimplementedPass {
+    /// `unimplemented.<pass>.<format>`
+    key: String,
+    format: String,
+    /// Why the pass doesn't cover this format. Comes from [`MACHO_ACKNOWLEDGED_GAPS`] when the gap
+    /// is acknowledged, otherwise from the call site.
+    note: String,
+    category: Option<GapCategory>,
+    /// Whether the gap is acknowledged by the ignore list (which `--wild-defaults` populates from
+    /// [`MACHO_ACKNOWLEDGED_GAPS`]). Unacknowledged gaps are failures.
+    acknowledged: bool,
 }
 
 #[derive(Default)]
@@ -628,6 +936,8 @@ impl Report {
             names: objects.iter().map(|o| o.name.clone()).collect(),
             paths: objects.iter().map(|o| o.path.clone()).collect(),
             diffs: Default::default(),
+            unimplemented: Default::default(),
+            suppressed_defects: Default::default(),
             coverage: config.coverage.then(|| Coverage {
                 colour: config.colour,
                 ..Coverage::default()
@@ -641,35 +951,86 @@ impl Report {
     }
 
     fn run_on_objects(&mut self, objects: &[Binary], arch: ArchKind) {
-        validate_objects(
+        // Comparing binaries in different file formats isn't meaningful and would make every
+        // "unimplemented for this format" record ambiguous, so refuse rather than guess.
+        let formats = objects
+            .iter()
+            .map(|o| file_format_name(o.file))
+            .collect_vec();
+        if !first_equals_all(formats.iter()) {
+            self.add_error(format!(
+                "Binaries have different file formats: {}",
+                self.names
+                    .iter()
+                    .zip(&formats)
+                    .map(|(name, format)| format!("{name}={format}"))
+                    .join(", ")
+            ));
+            return;
+        }
+
+        validate_objects_for_formats(
             self,
             objects,
             GNU_HASH_SECTION_NAME_STR,
+            "gnu-hash",
+            &["elf"],
             gnu_hash::check_object,
         );
-        validate_objects(
+        validate_objects_for_formats(
             self,
             objects,
             HASH_SECTION_NAME_STR,
+            "sysv-hash",
+            &["elf"],
             sysv_hash::check_object,
         );
-        validate_objects(self, objects, "index", asm_diff::validate_indexes);
-        validate_objects(
+        validate_objects_for_formats(
+            self,
+            objects,
+            "index",
+            "asm-index",
+            &["elf"],
+            asm_diff::validate_indexes,
+        );
+        validate_objects_for_formats(
             self,
             objects,
             GOT_PLT_SECTION_NAME_STR,
+            "got-plt",
+            &["elf"],
             asm_diff::validate_got_plt,
         );
-        validate_objects(
+        // `.symtab` and `macho.dysymtab` are a matched pair: each is specific to one format and
+        // together they cover both, so neither records a coverage gap for the other's format. They
+        // are kept as separate keys so that suppressing a Mach-O finding can never blind ELF.
+        validate_objects_format_specific(
             self,
             objects,
             SYMTAB_SECTION_NAME_STR,
+            &["elf"],
             symtab::validate_debug,
         );
-        validate_objects(
+        validate_objects_format_specific(
+            self,
+            objects,
+            "macho.dysymtab",
+            &["macho"],
+            symtab::validate_macho_dysymtab_present,
+        );
+        validate_objects_format_specific(
+            self,
+            objects,
+            "macho.dysymtab.partition",
+            &["macho"],
+            symtab::validate_macho_dysymtab_partition,
+        );
+        validate_objects_for_formats(
             self,
             objects,
             DYNSYM_SECTION_NAME_STR,
+            "dynsym-partition",
+            &["elf"],
             symtab::validate_dynamic,
         );
         header_diff::check_dynamic_headers(self, objects);
@@ -681,6 +1042,8 @@ impl Report {
         debug_info_diff::check_debug_info(self, objects);
         symbol_diff::report_diffs(self, objects);
         segment::report_diffs(self, objects);
+        macho_fixups::report_diffs(self, objects);
+        macho_dyld_info::report_diffs(self, objects);
 
         match arch {
             ArchKind::X86_64 => {
@@ -710,6 +1073,13 @@ impl Report {
 
     fn add_diff(&mut self, diff: Diff) {
         if self.should_ignore(&diff.key) {
+            // A suppressed difference that we've written down as a real bug still gets reported,
+            // it just doesn't fail. Otherwise the ignore list would be a place bugs go to die.
+            if find_known_defect(&diff.key).is_some()
+                && !self.suppressed_defects.contains(&diff.key)
+            {
+                self.suppressed_defects.push(diff.key);
+            }
             return;
         }
         self.diffs.push(diff);
@@ -721,9 +1091,157 @@ impl Report {
         }
     }
 
+    /// Records that the validation pass `pass` has no implementation for `format`, so it checked
+    /// nothing. Exists so that a half-finished module is distinguishable from a passing one.
+    ///
+    /// Key namespace: `unimplemented.<pass>.<format>`. If the key isn't listed in
+    /// [`MACHO_ACKNOWLEDGED_GAPS`] (which is what `--wild-defaults` feeds into the ignore list),
+    /// this is a hard failure — you can't add a blind pass without writing down why.
+    pub(crate) fn report_unimplemented(&mut self, pass: &str, format: &str) {
+        self.report_unimplemented_with_reason(
+            pass,
+            format,
+            "This pass has no implementation for this file format and checked nothing.",
+        );
+    }
+
+    /// As [`Report::report_unimplemented`], but with a call-site explanation used when the gap
+    /// isn't listed in [`MACHO_ACKNOWLEDGED_GAPS`].
+    pub(crate) fn report_unimplemented_with_reason(
+        &mut self,
+        pass: &str,
+        format: &str,
+        reason: &str,
+    ) {
+        let key = format!("unimplemented.{pass}.{format}");
+        if self.unimplemented.iter().any(|u| u.key == key) {
+            return;
+        }
+
+        let acknowledged_gap = find_acknowledged_gap(&key);
+        let acknowledged = !self.config.fail_on_unimplemented && self.should_ignore(&key);
+
+        self.unimplemented.push(UnimplementedPass {
+            note: acknowledged_gap.map_or_else(|| reason.to_owned(), |g| g.note.to_owned()),
+            category: acknowledged_gap.map(|g| g.category),
+            key,
+            format: format.to_owned(),
+            acknowledged,
+        });
+    }
+
+    /// Returns whether the binaries' file format is one this pass understands. If not, records the
+    /// gap and returns false so the caller can bail out loudly rather than quietly.
+    pub(crate) fn require_format(
+        &mut self,
+        pass: &str,
+        objects: &[Binary],
+        supported_formats: &[&str],
+    ) -> bool {
+        let Some(first) = objects.first() else {
+            return false;
+        };
+        let format = file_format_name(first.file);
+        if supported_formats.contains(&format) {
+            return true;
+        }
+        self.report_unimplemented(pass, format);
+        false
+    }
+
+    fn failing_gaps(&self) -> impl Iterator<Item = &UnimplementedPass> {
+        self.unimplemented.iter().filter(|u| !u.acknowledged)
+    }
+
     #[must_use]
     pub fn has_problems(&self) -> bool {
-        !self.diffs.is_empty()
+        !self.diffs.is_empty() || self.failing_gaps().next().is_some()
+    }
+
+    /// A human-readable inventory of the validation passes that checked nothing, for printing on
+    /// *every* run — including successful ones. The whole point of this crate is to be an oracle,
+    /// and an oracle that silently declines to look at half the binary needs to say so out loud.
+    ///
+    /// Returns `None` when every pass ran.
+    #[must_use]
+    pub fn coverage_gap_report(&self) -> Option<String> {
+        use std::fmt::Write as _;
+
+        if self.unimplemented.is_empty() && self.suppressed_defects.is_empty() {
+            return None;
+        }
+
+        let format = self
+            .unimplemented
+            .first()
+            .map_or("?", |u| u.format.as_str());
+
+        let not_implemented = self
+            .unimplemented
+            .iter()
+            .filter(|u| u.category != Some(GapCategory::NotApplicable))
+            .count();
+
+        let total = self.unimplemented.len();
+        let mut out = String::new();
+
+        if total > 0 {
+            let _ = writeln!(
+                out,
+                "!! VERIFICATION COVERAGE GAP: {total} validation pass(es) did not run for \
+                 `{format}`; {not_implemented} of them should have."
+            );
+            let _ = writeln!(
+                out,
+                "!! A pass listed below reported nothing because it LOOKED at nothing. That is not \
+                 evidence that the output is correct."
+            );
+
+            for gap in &self.unimplemented {
+                let status = match (gap.acknowledged, gap.category) {
+                    (false, _) => "UNACKNOWLEDGED",
+                    (true, Some(GapCategory::NotApplicable)) => "not-applicable",
+                    (true, _) => "NOT-IMPLEMENTED",
+                };
+                let _ = writeln!(out, "   [{status:<14}] {}", gap.key);
+                for line in wrap_note(&gap.note, 92) {
+                    let _ = writeln!(out, "        {line}");
+                }
+            }
+        }
+
+        if !self.suppressed_defects.is_empty() {
+            let _ = writeln!(
+                out,
+                "!! SUPPRESSED KNOWN DEFECTS: {} difference(s) were found and NOT failed, because \
+                 they are",
+                self.suppressed_defects.len()
+            );
+            let _ = writeln!(
+                out,
+                "!! already recorded as bugs in Wild's output rather than acceptable differences."
+            );
+            for key in &self.suppressed_defects {
+                let _ = writeln!(out, "   [known-defect  ] {key}");
+                if let Some(defect) = find_known_defect(key) {
+                    for line in wrap_note(defect.note, 92) {
+                        let _ = writeln!(out, "        {line}");
+                    }
+                }
+            }
+        }
+
+        let _ = writeln!(
+            out,
+            "!! Inventories: `MACHO_ACKNOWLEDGED_GAPS` and `WILD_MACHO_KNOWN_DEFECTS` in \
+             linker-diff/src/lib.rs."
+        );
+        let _ = writeln!(
+            out,
+            "!! Pass --fail-on-unimplemented to turn the coverage gaps into failures."
+        );
+
+        Some(out)
     }
 
     #[must_use]
@@ -786,6 +1304,28 @@ impl Display for Report {
                 }
             }
 
+            writeln!(f)?;
+        }
+
+        // Only unacknowledged gaps are rendered here. Acknowledged ones would otherwise churn every
+        // malfunction `.exp` snapshot as gaps get closed; they're reported by
+        // `coverage_gap_report`, which the CLI prints on every run.
+        for gap in self.failing_gaps() {
+            writeln!(f, "{}", gap.key)?;
+            writeln!(
+                f,
+                "  This validation pass has no implementation for `{}`, so it checked NOTHING.",
+                gap.format
+            )?;
+            for line in wrap_note(&gap.note, 92) {
+                writeln!(f, "  {line}")?;
+            }
+            writeln!(
+                f,
+                "  Either implement it, or add `{}` to MACHO_ACKNOWLEDGED_GAPS in \
+                 linker-diff/src/lib.rs with a justification.",
+                gap.key
+            )?;
             writeln!(f)?;
         }
 
@@ -973,9 +1513,18 @@ fn parse_string_equality(
     Ok((a.to_owned(), b.to_owned()))
 }
 
+/// # Panics
+///
+/// Panics on any non-ELF relocation. Every pass that reaches this must first gate on file format
+/// via [`Report::require_format`], so that an unsupported format is reported as a coverage gap
+/// rather than crashing the differ (or, worse, being quietly routed around).
 fn get_r_type<R: arch::RType>(rel: &object::Relocation) -> R {
     let object::RelocationFlags::Elf { r_type } = rel.flags() else {
-        panic!("Unsupported object type (relocation flags)");
+        panic!(
+            "get_r_type called with non-ELF relocation flags ({:?}). The calling pass is missing a \
+             `Report::require_format` gate.",
+            rel.flags()
+        );
     };
     R::from_raw(r_type)
 }

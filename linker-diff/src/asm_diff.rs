@@ -101,6 +101,17 @@ const SUPPORTED_SECTION_KINDS: &[SectionKind] = &[SectionKind::Text, SectionKind
 /// Reports differences in sections in particular differences in the relocations that were applied
 /// to those sections, although the literal bytes between the relocations are also diffed.
 pub(crate) fn report_section_diffs<A: Arch>(report: &mut Report, binaries: &[Binary]) {
+    // This is the only pass that compares the *contents* of function bodies and the relocations
+    // applied to them, and it is ELF-only from top to bottom: `AddressIndex::build_indexes` only
+    // indexes ELF, `IndexedLayout::get_elf_section` bails on anything else, and `get_r_type`
+    // panics on `RelocationFlags::MachO`. Making it Mach-O capable is a rewrite, not a patch.
+    //
+    // Until then, say so. Running it against Mach-O would find no matched sections and report
+    // nothing, which is indistinguishable from having verified every instruction.
+    if !report.require_format("asm-diff", binaries, &["elf"]) {
+        return;
+    }
+
     let Some(layout) = binaries[0].indexed_layout.as_ref() else {
         report.add_error("A .layout file is required");
         return;
@@ -3202,15 +3213,24 @@ impl<'data> AddressIndex<'data> {
     }
 
     fn build_indexes(&mut self, file: &File<'data>) -> Result {
-        if let object::File::Elf64(elf_file) = file {
-            self.index_dynamic(elf_file);
-            self.verdef = Self::index_verdef(elf_file)?;
-            self.verneed = Self::index_verneed(elf_file)?;
-            self.dynamic_symbols = self.index_dynamic_symbols(elf_file)?;
-            self.index_got_tables(elf_file).unwrap();
-            self.index_relocations(elf_file);
-            self.index_plt_sections(elf_file)?;
-        }
+        let object::File::Elf64(elf_file) = file else {
+            // Record that the index is empty rather than leaving it looking successfully built.
+            // Every consumer of this index (relocation lookup, GOT/PLT matching, section diffing)
+            // would otherwise silently find nothing and conclude there was nothing to find.
+            bail!(
+                "AddressIndex has no implementation for `{}`: no relocations, GOT/PLT entries or \
+                 dynamic symbols were indexed",
+                crate::file_format_name(file)
+            );
+        };
+
+        self.index_dynamic(elf_file);
+        self.verdef = Self::index_verdef(elf_file)?;
+        self.verneed = Self::index_verneed(elf_file)?;
+        self.dynamic_symbols = self.index_dynamic_symbols(elf_file)?;
+        self.index_got_tables(elf_file).unwrap();
+        self.index_relocations(elf_file);
+        self.index_plt_sections(elf_file)?;
         Ok(())
     }
 

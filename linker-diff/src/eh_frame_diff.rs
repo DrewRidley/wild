@@ -23,6 +23,12 @@ use zerocopy::Immutable;
 use zerocopy::KnownLayout;
 
 pub(crate) fn report_diffs(report: &mut crate::Report, objects: &[crate::Binary]) {
+    // `eh_frame_segment` returns None for anything that isn't ELF, which makes this pass insert a
+    // single "GNU_EH_FRAME: Missing" field for every binary and then report no difference. That
+    // looks identical to a pass, so gate on format instead.
+    if !report.require_format("eh-frame", objects, &["elf"]) {
+        return;
+    }
     report.add_diffs(crate::header_diff::diff_fields(
         objects,
         read_eh_frame_hdr_fields,
