@@ -671,6 +671,25 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     let (resolution, _symbol_index, local_symbol_id) = get_resolution(rel, object_layout, layout)?;
     let flags = layout.flags_for_symbol(local_symbol_id);
 
+    // Layout only gives a `__got` slot to symbols whose address isn't known until dyld binds them.
+    // A GOT-style relocation against anything else has to be turned into a direct reference, which
+    // means rewriting the instruction as well as computing a different value for it. Keying this
+    // off the resolution rather than off the flags means the writer can't disagree with whatever
+    // layout decided (see `macho::Indirection`).
+    if matches!(
+        rel_info.kind,
+        RelocationKind::Got | RelocationKind::GotRelative
+    ) && resolution.format_specific.got_address.is_none()
+    {
+        A::relax_got_load(rel, &mut out[offset_in_section as usize..]).with_context(|| {
+            format!(
+                "Failed to relax {} against {}",
+                A::rel_type_to_string(rel),
+                layout.symbol_debug(local_symbol_id)
+            )
+        })?;
+    }
+
     let mask = get_page_mask(rel_info.mask);
     let value = match rel_info.kind {
         RelocationKind::Absolute => resolution.raw_value.bitand(mask.symbol_plus_addend),

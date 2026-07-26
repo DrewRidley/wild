@@ -3,6 +3,7 @@
 
 use crate::bail;
 use crate::ensure;
+use crate::error;
 use crate::macho::MachO;
 use linker_utils::elf::AArch64Instruction;
 use linker_utils::elf::AllowedRange;
@@ -27,6 +28,16 @@ const STUB_TEMPLATE: &[u8] = &[
 const _ASSERTS: () = {
     assert!(STUB_TEMPLATE.len() as u64 == crate::macho::PLT_ENTRY_SIZE);
 };
+
+/// Bits [31:22] of a load/store or add/sub immediate instruction - everything above the 12-bit
+/// immediate. Rn and Rd live below the immediate and so survive a rewrite of these bits.
+const LDR_UIMM_MASK: u32 = 0xffc0_0000;
+
+/// `LDR <Xt>, [<Xn|SP>{, #imm}]` - C6.2.192, size=0b11, V=0, opc=0b01.
+const LDR_UIMM_64: u32 = 0xf940_0000;
+
+/// `ADD <Xd|SP>, <Xn|SP>, #imm` - C6.2.5, sf=1, op=0, S=0, sh=0.
+const ADD_IMM_64: u32 = 0x9100_0000;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Relaxation {}
@@ -174,6 +185,44 @@ impl crate::platform::Arch for MachOAArch64 {
         })
     }
 
+    fn relax_got_load(
+        rel: object::macho::RelocationInfo,
+        instruction: &mut [u8],
+    ) -> crate::error::Result {
+        match rel.r_type {
+            // The ADRP half needs no rewrite: it forms a page address either way, and the
+            // relocation value it is given is now the symbol's page rather than the GOT slot's.
+            object::macho::ARM64_RELOC_GOT_LOAD_PAGE21 => Ok(()),
+
+            // `ldr xD, [xN, #imm]` becomes `add xD, xN, #imm`. Rn/Rd are kept; the immediate is
+            // filled in afterwards by `AArch64Instruction::MachOLow12`, which derives its scaling
+            // from the opcode, so the opcode has to be rewritten first.
+            object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => {
+                let bytes: [u8; 4] = instruction
+                    .get(..4)
+                    .and_then(|b| b.try_into().ok())
+                    .ok_or_else(|| error!("Truncated ARM64 instruction"))?;
+                let value = u32::from_le_bytes(bytes);
+
+                ensure!(
+                    value & LDR_UIMM_MASK == LDR_UIMM_64,
+                    "Expected a 64-bit LDR (immediate) for ARM64_RELOC_GOT_LOAD_PAGEOFF12, \
+                     found instruction 0x{value:08x}"
+                );
+
+                let relaxed = ADD_IMM_64 | (value & !LDR_UIMM_MASK);
+                instruction[..4].copy_from_slice(&relaxed.to_le_bytes());
+
+                Ok(())
+            }
+
+            _ => bail!(
+                "Cannot relax non GOT-load relocation: {}",
+                Self::rel_type_to_string(rel)
+            ),
+        }
+    }
+
     fn rel_type_to_string(info: object::macho::RelocationInfo) -> Cow<'static, str> {
         let r_type = info.r_type;
         if let Some(name) = object::macho::NAMES_ARM64_RELOC.name(r_type) {
@@ -219,5 +268,75 @@ impl crate::platform::Arch for MachOAArch64 {
         relax_deltas: Option<&linker_utils::relaxation::SectionRelaxDeltas>,
     ) -> Option<Self::Relaxation> {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::Arch as _;
+
+    fn relocation(r_type: u8) -> object::macho::RelocationInfo {
+        object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel: false,
+            r_length: 2,
+            r_extern: true,
+            r_type,
+        }
+    }
+
+    /// The relaxed sequence has to be exactly what ld64 emits, since the same test programs are
+    /// diffed against it. `add x8, x8, #0x8` is what ld64 produces where the unrelaxed form would
+    /// have been `ldr x8, [x8, #<got slot>]`.
+    #[test]
+    fn got_load_pageoff12_becomes_add() {
+        // `ldr x8, [x8, #0x8]`. The immediate is scaled by 8 in this encoding, hence imm12 == 1.
+        let mut instruction = 0xf940_0508_u32.to_le_bytes();
+
+        MachOAArch64::relax_got_load(
+            relocation(object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12),
+            &mut instruction,
+        )
+        .unwrap();
+
+        // Writing the relocation value is what the caller does next. It has to land unscaled now
+        // that the instruction is an ADD, which `MachOLow12` works out from the opcode.
+        AArch64Instruction::MachOLow12.write_to_value(0x8, false, &mut instruction);
+
+        // `add x8, x8, #0x8`
+        assert_eq!(u32::from_le_bytes(instruction), 0x9100_2108);
+    }
+
+    /// The ADRP of the pair is already correct; only the value written into it changes.
+    #[test]
+    fn got_load_page21_is_left_alone() {
+        // `adrp x8, #0`
+        let mut instruction = 0x9000_0008_u32.to_le_bytes();
+
+        MachOAArch64::relax_got_load(
+            relocation(object::macho::ARM64_RELOC_GOT_LOAD_PAGE21),
+            &mut instruction,
+        )
+        .unwrap();
+
+        assert_eq!(u32::from_le_bytes(instruction), 0x9000_0008);
+    }
+
+    /// Silently leaving an unrecognised instruction alone would produce a binary that loads
+    /// through a symbol's address instead of using it, so refuse instead.
+    #[test]
+    fn unexpected_instruction_is_rejected() {
+        // `add x8, x8, #0x8` - already relaxed, so not something we should be asked to relax.
+        let mut instruction = 0x9100_2108_u32.to_le_bytes();
+
+        assert!(
+            MachOAArch64::relax_got_load(
+                relocation(object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12),
+                &mut instruction,
+            )
+            .is_err()
+        );
     }
 }

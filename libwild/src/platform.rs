@@ -102,6 +102,18 @@ pub(crate) trait Arch: Send + Sync + 'static {
         r_type: <Self::Platform as Platform>::RelocationInfo,
     ) -> Cow<'static, str>;
 
+    /// Rewrites the instruction at the start of `instruction` so that it forms the address of the
+    /// symbol directly rather than loading it from a GOT entry. This is only called for GOT-style
+    /// relocations against a symbol that layout decided not to give a GOT entry to, which is why
+    /// the default is to refuse rather than to silently leave the instruction alone. Platforms
+    /// that always allocate a GOT entry for GOT-style relocations never reach this.
+    fn relax_got_load(
+        _r_type: <Self::Platform as Platform>::RelocationInfo,
+        _instruction: &mut [u8],
+    ) -> Result {
+        bail!("GOT-load relaxation is not implemented for this architecture");
+    }
+
     /// Get DTV OFFSET.
     fn get_dtv_offset() -> u64 {
         0

@@ -1513,10 +1513,12 @@ impl platform::Platform for MachO {
         _output_kind: crate::output_kind::OutputKind,
         _args: &Self::Args,
     ) {
-        if flags.is_dynamic() && flags.needs_plt() {
+        let indirection = Indirection::for_symbol(flags);
+
+        if indirection.plt {
             mem_sizes.increment(part_id::PLT_GOT, PLT_ENTRY_SIZE);
         }
-        if flags.is_dynamic() && flags.needs_got() {
+        if indirection.got {
             mem_sizes.increment(part_id::GOT, GOT_ENTRY_SIZE);
         }
     }
@@ -1602,15 +1604,19 @@ impl platform::Platform for MachO {
             flags,
         };
 
-        if flags.needs_plt() {
+        let indirection = Indirection::for_symbol(flags);
+
+        if indirection.plt {
             let plt_address = allocate_plt(memory_offsets);
             resolution.raw_value = plt_address.get();
             resolution.format_specific.plt_address = Some(plt_address);
-            resolution.format_specific.got_address = Some(allocate_got(memory_offsets));
-        } else if flags.needs_got() {
+        }
+        if indirection.got {
             let got_address = allocate_got(memory_offsets);
-            resolution.raw_value = got_address.get();
             resolution.format_specific.got_address = Some(got_address);
+            if !indirection.plt {
+                resolution.raw_value = got_address.get();
+            }
         }
 
         resolution
@@ -1840,6 +1846,38 @@ pub(crate) struct DynamicLayoutExt {
 pub(crate) struct ResolutionExt {
     pub(crate) got_address: Option<NonZeroU64>,
     pub(crate) plt_address: Option<NonZeroU64>,
+}
+
+/// Which pieces of indirection a symbol gets: a `__stubs` (PLT) entry and/or a `__got` entry.
+///
+/// This exists so that the two passes that care can't drift apart. `allocate_resolution` runs
+/// during sizing and reserves the bytes; `create_resolution` runs during address assignment and
+/// hands out the addresses. If they disagree, addresses run past the space that was reserved and
+/// `OffsetVerifier` reports "Unexpected memory offsets" for `__got`.
+#[derive(Clone, Copy)]
+struct Indirection {
+    plt: bool,
+    got: bool,
+}
+
+impl Indirection {
+    /// Only symbols imported from a dylib need indirection, because only their addresses are
+    /// unknown until dyld binds them. A symbol defined in the output has a known address, so a
+    /// `GOT_LOAD` relocation against it is relaxed into a direct reference when the relocation is
+    /// applied (`Arch::relax_got_load`), which is what ld64 does too - it emits a `__got` holding
+    /// only the dylib imports.
+    ///
+    /// Giving a locally defined symbol a `__got` slot instead would mean emitting a rebase fixup
+    /// for the slot, and would also corrupt plain absolute relocations against that symbol, since
+    /// `Resolution::raw_value` is repurposed to hold the GOT address when a GOT entry exists.
+    fn for_symbol(flags: ValueFlags) -> Self {
+        let indirect = flags.is_dynamic();
+
+        Self {
+            plt: indirect && flags.needs_plt(),
+            got: indirect && (flags.needs_got() || flags.needs_plt()),
+        }
+    }
 }
 
 fn allocate_got(memory_offsets: &mut OutputSectionPartMap<u64>) -> NonZeroU64 {
