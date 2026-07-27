@@ -327,6 +327,16 @@ fn write_prelude<'data>(
     layout: &MachOLayout<'data>,
 ) -> Result {
     verbose_timing_phase!("Write prelude");
+
+    // The deduplicated strings are laid out as one block per output section, and sized into the
+    // prelude's share of it, so the prelude is what writes them.
+    layout.merged_strings.for_each(|section_id, merged| {
+        if merged.len() > 0 {
+            let buffer = buffers.get_mut(section_id.part_id_with_alignment(crate::alignment::MIN));
+            crate::elf_writer::write_merged_strings_to_buffer(merged, buffer);
+        }
+    });
+
     debug_assert_eq!(
         prelude.format_specific.imported_library_file_ids.len(),
         prelude.format_specific.load_dylib_command_sizes.len()
@@ -2669,7 +2679,10 @@ fn write_symbols<'data>(
         let (section, symbol_type, desc) =
             if let Some(section_index) = object.object.symbol_section(sym, sym_index)? {
                 let section_id = match &object.sections[section_index.0] {
-                    SectionSlot::Loaded(_) => object
+                    // A symbol in a merged section still belongs to the section it came from; only
+                    // its offset within the output moved, and the resolution already accounts for
+                    // that.
+                    SectionSlot::Loaded(_) | SectionSlot::MergeStrings(_) => object
                         .section_part_id(section_index, &layout.symbol_db.section_part_ids)
                         .output_section_id(),
                     _ => bail!(

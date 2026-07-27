@@ -1021,7 +1021,10 @@ pub(crate) fn get_merged_string_output_address<'data, P: Platform>(
     let SectionSlot::MergeStrings(merge_slot) = &sections[section_index.0] else {
         return Ok(None);
     };
-    let mut input_offset = symbol.value();
+    // Where the symbol sits inside its section, which is not the same as its value: on Mach-O a
+    // symbol's value is an address in the object's own address space, and sections within an object
+    // do not start at zero.
+    let mut input_offset = object.symbol_offset_in_section(symbol, section_index)?;
 
     // When we reference data in a string-merge section via a named symbol, we determine which
     // string we're referencing without taking the addend into account, then apply the addend

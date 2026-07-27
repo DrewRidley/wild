@@ -489,11 +489,19 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
     fn section_data(
         &self,
-        _section: &<Self::Platform as platform::Platform>::SectionHeader,
+        section: &<Self::Platform as platform::Platform>::SectionHeader,
         _member: &bumpalo_herd::Member<'data>,
-        _loaded_metrics: &crate::resolution::LoadedMetrics,
+        loaded_metrics: &crate::resolution::LoadedMetrics,
     ) -> crate::error::Result<&'data [u8]> {
-        todo!()
+        // Nothing to decompress: Mach-O has no equivalent of ELF's compressed sections, so the
+        // bytes in the file are the bytes of the section and no scratch allocation is needed.
+        let data = self.raw_section_data(section)?;
+
+        loaded_metrics
+            .loaded_bytes
+            .fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
+
+        Ok(data)
     }
 
     fn copy_section_data(&self, section: &SectionHeader, out: &mut [u8]) -> Result {
@@ -631,8 +639,18 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn is_merge_section(&self) -> bool {
-        // TODO
-        false
+        // A literal section holds constants the compiler put in their own section precisely so the
+        // linker could drop the duplicates - the same string appears in every object that mentions
+        // it. Which of these actually get merged is narrowed further by `should_merge_sections`,
+        // which currently only takes sections aligned to a byte, so in practice this means
+        // `__cstring`.
+        matches!(
+            self.section_type(LE),
+            macho::S_CSTRING_LITERALS
+                | macho::S_4BYTE_LITERALS
+                | macho::S_8BYTE_LITERALS
+                | macho::S_16BYTE_LITERALS
+        )
     }
 
     fn is_strings(&self) -> bool {
