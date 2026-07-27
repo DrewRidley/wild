@@ -2,7 +2,6 @@
 // a rebase: before binds were emitted for anything outside __got, it got a rebase of a nonsense
 // address and the binary took SIGBUS the first time the pointer was called.
 //#LinkerDriver:clang
-//#DiffIgnore:section.__unwind_info
 
 #include <stdio.h>
 

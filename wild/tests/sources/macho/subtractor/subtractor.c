@@ -1,7 +1,6 @@
 //#Config:default
 //#LinkerDriver:clang
 //#Object:subtractor-data.s
-//#DiffIgnore:section.__unwind_info
 
 // `ARM64_RELOC_SUBTRACTOR` and `ARM64_RELOC_ADDEND` are both only half a relocation: each one
 // modifies the relocation that follows it, so applying them one at a time gets the wrong answer.

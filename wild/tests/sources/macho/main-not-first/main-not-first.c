@@ -3,7 +3,6 @@
 //#Object:helper.c
 //#ExpectSym:_main
 //#ExpectSym:_level1
-//#DiffIgnore:section.__unwind_info
 
 // `main` is deliberately the *last* function in this file, and part of the work
 // lives in a second input object. That exercises entry-point resolution

@@ -1,7 +1,6 @@
 //#Config:default
 //#LinkerDriver:clang
 //#ExpectSym:_main
-//#DiffIgnore:section.__unwind_info
 
 // Pointers stored in initialised data. Every initialiser below needs a
 // load-time rebase (a chained-fixup entry in __DATA) because the value written

@@ -102,6 +102,55 @@ pub(crate) const GOT_ENTRY_SIZE: u64 = 8;
 pub(crate) const INDIRECT_SYMTAB_ENTRY_SIZE: u64 = size_of::<u32>() as u64;
 pub(crate) const PLT_ENTRY_SIZE: u64 = 12;
 
+/// One `compact_unwind_entry`: the function's address, its length, how to unwind it, and where its
+/// personality routine and language-specific data are.
+pub(crate) const COMPACT_UNWIND_ENTRY_SIZE: u64 = 32;
+/// Offset of the personality field within an entry.
+pub(crate) const COMPACT_UNWIND_PERSONALITY_OFFSET: u64 = 16;
+/// Offset of the language-specific data area field within an entry.
+pub(crate) const COMPACT_UNWIND_LSDA_OFFSET: u64 = 24;
+
+/// What one function costs in `__unwind_info`: eight bytes for its second-level entry, and eight
+/// more for an LSDA index entry in case it has one. Reserving the LSDA entry for every function
+/// rather than counting them means the size is known from the entry count alone, which is what lets
+/// it be reserved before the table is built. The slack is at most eight bytes per function.
+pub(crate) const UNWIND_INFO_BYTES_PER_ENTRY: u64 = 16;
+
+/// `unwind_info_section_header`: version, then a (offset, count) pair for each of the common
+/// encodings, the personalities and the index.
+pub(crate) const UNWIND_INFO_HEADER_SIZE: u64 = 7 * size_of::<u32>() as u64;
+/// An entry's encoding names its personality by a two-bit index into the personality array, so
+/// there is no room for a fourth.
+pub(crate) const UNWIND_INFO_MAX_PERSONALITIES: u64 = 3;
+/// `unwind_info_section_header_index_entry`: the first function on the page, where the page is, and
+/// where its LSDA index starts.
+pub(crate) const UNWIND_INFO_INDEX_ENTRY_SIZE: u64 = 3 * size_of::<u32>() as u64;
+/// `unwind_info_regular_second_level_page_header`: the kind, then where its entries start and how
+/// many there are.
+pub(crate) const UNWIND_INFO_PAGE_HEADER_SIZE: u64 = 2 * size_of::<u32>() as u64;
+/// How many functions one second-level page describes. The page is addressed by 16-bit offsets, so
+/// it can't exceed 64 KiB; ld64 uses 4 KiB pages and so do we.
+pub(crate) const UNWIND_INFO_PAGE_CAPACITY: u64 =
+    (4096 - UNWIND_INFO_PAGE_HEADER_SIZE) / UNWIND_INFO_ENTRY_SIZE;
+/// `unwind_info_regular_second_level_entry`: the function's address and how to unwind it.
+pub(crate) const UNWIND_INFO_ENTRY_SIZE: u64 = 2 * size_of::<u32>() as u64;
+/// `unwind_info_section_header_lsda_index_entry`: the function's address and its LSDA's.
+pub(crate) const UNWIND_INFO_LSDA_ENTRY_SIZE: u64 = 2 * size_of::<u32>() as u64;
+/// The only version of the format there has ever been.
+pub(crate) const UNWIND_SECTION_VERSION: u32 = 1;
+/// A second-level page whose entries each carry their own encoding, as opposed to the compressed
+/// form, where they carry an index into the common encodings array instead.
+pub(crate) const UNWIND_SECOND_LEVEL_REGULAR: u32 = 2;
+/// Selects which of the four ways of describing a function an encoding uses.
+pub(crate) const UNWIND_ARM64_MODE_MASK: u32 = 0x0f00_0000;
+/// The function can't be described compactly, so the encoding names a DWARF frame in `__eh_frame`
+/// instead - by its offset, in the remaining bits.
+pub(crate) const UNWIND_ARM64_MODE_DWARF: u32 = 0x0300_0000;
+pub(crate) const UNWIND_ARM64_DWARF_SECTION_OFFSET: u32 = 0x00ff_ffff;
+/// Position of the personality index within a compact unwind encoding. Two bits wide, which is what
+/// limits an image to three personality routines.
+pub(crate) const UNWIND_PERSONALITY_SHIFT: u32 = 28;
+
 pub(crate) const SEG_DATA_CONST: &str = "__DATA_CONST";
 
 type SectionHeader = Section64<crate::macho::Endianness>;
@@ -431,9 +480,11 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
     fn raw_section_data(
         &self,
-        _section: &<Self::Platform as platform::Platform>::SectionHeader,
+        section: &<Self::Platform as platform::Platform>::SectionHeader,
     ) -> crate::error::Result<&'data [u8]> {
-        todo!()
+        section
+            .data(LE, self.data)
+            .map_err(|()| error!("Cannot get section data"))
     }
 
     fn section_data(
@@ -840,6 +891,8 @@ fn mapped_segment_type(section_id: crate::output_section_id::OutputSectionId) ->
         output_section_id::TEXT
         | output_section_id::CSTRING
         | output_section_id::GCC_EXCEPT_TABLE
+        | output_section_id::UNWIND_INFO
+        | output_section_id::MACHO_EH_FRAME
         | output_section_id::PLT_GOT => SegmentType::TextSections,
         // `__const` holds constants, but constants include pointers, and a pointer has to be
         // rebased before it's read - which means living somewhere dyld can write to. ld64 sorts the
@@ -1143,10 +1196,16 @@ impl platform::Platform for MachO {
     ) -> Self::GroupLayoutExt {
     }
 
+    /// The address a `__compact_unwind` section would have been given, had we emitted one.
+    ///
+    /// We don't: the entries are read during layout and become `__unwind_info`, so the input
+    /// section has no place in the output and nothing resolves against its address. ELF needs this
+    /// because it copies `.eh_frame` through and its frames refer to each other by offset within
+    /// it.
     fn frame_data_base_address(
         _memory_offsets: &crate::output_section_part_map::OutputSectionPartMap<u64>,
     ) -> u64 {
-        todo!()
+        0
     }
 
     fn activate_dynamic<'data>(
@@ -1406,15 +1465,66 @@ impl platform::Platform for MachO {
         Ok(layout_ext)
     }
 
+    /// Accounts for one input `__LD,__compact_unwind` section.
+    ///
+    /// Each entry describes one function, and becomes one entry of the `__unwind_info` table we
+    /// build in its place. Nothing is copied: what's reserved here is space in that table, and what
+    /// the relocations are walked for is the symbols they name - the personality routines in
+    /// particular, which the table reaches through the GOT and so need slots.
     fn load_exception_frame_data<'data, 'scope, A: platform::Arch<Platform = Self>>(
-        _object: &mut crate::layout::ObjectLayoutState<'data, Self>,
-        _common: &mut crate::layout::CommonGroupState<'data, Self>,
-        _eh_frame_section_index: object::SectionIndex,
-        _resources: &'scope crate::layout::GraphResources<'data, '_, Self>,
-        _queue: &mut crate::layout::LocalWorkQueue,
-        _scope: &rayon::Scope<'scope>,
+        object: &mut crate::layout::ObjectLayoutState<'data, Self>,
+        common: &mut crate::layout::CommonGroupState<'data, Self>,
+        eh_frame_section_index: object::SectionIndex,
+        resources: &'scope crate::layout::GraphResources<'data, '_, Self>,
+        queue: &mut crate::layout::LocalWorkQueue,
+        scope: &rayon::Scope<'scope>,
     ) -> crate::error::Result {
-        todo!()
+        let section = object.object.section(eh_frame_section_index)?;
+        let data = object.object.raw_section_data(section)?;
+
+        let entry_count = data.len() as u64 / COMPACT_UNWIND_ENTRY_SIZE;
+        common.allocate(
+            part_id::UNWIND_INFO,
+            entry_count * UNWIND_INFO_BYTES_PER_ENTRY,
+        );
+
+        let relocations = object
+            .object
+            .relocations(eh_frame_section_index, &object.relocations)?
+            .relocations;
+
+        for relocation in relocations {
+            let info = relocation.info(LE);
+
+            process_relocation::<A>(
+                object,
+                relocation,
+                eh_frame_section_index,
+                resources,
+                queue,
+                scope,
+            )?;
+
+            // The personality is reached through a slot rather than directly, because the entry
+            // stores where the routine's address is rather than the address itself - so it needs a
+            // GOT entry even when the routine is defined right here, which is how Rust's is.
+            if info.r_extern
+                && u64::from(info.r_address) % COMPACT_UNWIND_ENTRY_SIZE
+                    == COMPACT_UNWIND_PERSONALITY_OFFSET
+            {
+                let local_symbol_id = object
+                    .symbol_id_range
+                    .input_to_id(SymbolIndex(info.r_symbolnum as usize));
+                let symbol_id = resources.symbol_db.definition(local_symbol_id);
+
+                resources
+                    .per_symbol_flags
+                    .get_atomic(symbol_id)
+                    .fetch_or(ValueFlags::GOT_ENTRY_REQUIRED);
+            }
+        }
+
+        Ok(())
     }
 
     fn non_empty_section_loaded<'data, 'scope, A: platform::Arch<Platform = Self>>(
@@ -1581,6 +1691,26 @@ impl platform::Platform for MachO {
             part_id::INDIRECT_SYMTAB,
             indirect_entry_count * INDIRECT_SYMTAB_ENTRY_SIZE,
         );
+
+        // The per-function part of `__unwind_info` was reserved as the input sections were read;
+        // what's left is the part that depends on how many functions there are in total - the
+        // header, and the index of the pages they're split across.
+        let unwind_entry_count =
+            *current_sizes.get(part_id::UNWIND_INFO) / UNWIND_INFO_BYTES_PER_ENTRY;
+
+        if unwind_entry_count > 0 {
+            let pages = unwind_entry_count.div_ceil(UNWIND_INFO_PAGE_CAPACITY);
+
+            extra_sizes.increment(
+                part_id::UNWIND_INFO,
+                UNWIND_INFO_HEADER_SIZE
+                    + UNWIND_INFO_MAX_PERSONALITIES * size_of::<u32>() as u64
+                    // One index entry per page, plus a sentinel that marks the end of the last
+                    // function.
+                    + (pages + 1) * UNWIND_INFO_INDEX_ENTRY_SIZE
+                    + pages * UNWIND_INFO_PAGE_HEADER_SIZE,
+            );
+        }
 
         Ok(())
     }
@@ -1890,6 +2020,8 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::TEXT);
         builder.add_section(output_section_id::CSTRING);
         builder.add_section(output_section_id::GCC_EXCEPT_TABLE);
+        builder.add_section(output_section_id::UNWIND_INFO);
+        builder.add_section(output_section_id::MACHO_EH_FRAME);
         builder.add_section(output_section_id::PLT_GOT);
         builder.add_section(output_section_id::DATA);
         builder.add_section(output_section_id::INIT_ARRAY);
@@ -2041,6 +2173,12 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         min_alignment: alignment::USIZE,
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::UNWIND_INFO.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__unwind_info")),
+        section_flags: macho::S_REGULAR.to_flags(),
+        min_alignment: Alignment { exponent: 2 },
+        ..DEFAULT_DEFS
+    };
     defs[output_section_id::CODE_SIGNATURE.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"CODE_SIGNATURE")),
         min_alignment: Alignment {
@@ -2120,6 +2258,12 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
     defs[output_section_id::FINI_ARRAY.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"__mod_term_func")),
         section_flags: macho::S_MOD_TERM_FUNC_POINTERS.to_flags(),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::MACHO_EH_FRAME.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__eh_frame")),
+        section_flags: macho::S_REGULAR.to_flags().with(macho::S_ATTR_LIVE_SUPPORT),
+        min_alignment: Alignment { exponent: 3 },
         ..DEFAULT_DEFS
     };
     defs[output_section_id::COMMON.as_usize()] = BuiltInSectionDetails {
@@ -2239,17 +2383,15 @@ const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
     // build `__TEXT,__unwind_info` and emits no `__compact_unwind`. We can't build
     // `__unwind_info` yet (`warn_if_unwind_info_needed` says so when it matters), but copying
     // the raw input through would be wrong whether or not we could.
-    SectionRule::exact(b"__compact_unwind", SectionRuleOutcome::Discard),
-    // ld64 keeps `__eh_frame`, and we can't yet. A CIE reaches its personality routine through an
-    // indirection slot rather than directly, because the unwinder dereferences what it finds there
-    // - so `ARM64_RELOC_POINTER_TO_GOT` against a personality needs a real `__got` entry even when
-    // the routine is defined in this image. We only give `__got` entries to dylib imports (see
-    // `Indirection::for_symbol`), because `Resolution::raw_value` is reused to hold the slot
-    // address and a locally defined symbol needs its own address there as well. Emitting the
-    // section before that's separated would produce an `__eh_frame` whose personality pointers
-    // are wrong, which is worse than not emitting one: `warn_if_unwind_info_needed` already
-    // says unwinding won't work.
-    SectionRule::exact(b"__eh_frame", SectionRuleOutcome::Discard),
+    // Not copied through: `SectionRuleOutcome::EhFrame` hands the section to
+    // `load_exception_frame_data`, which is what we want for two reasons. Its relocations point
+    // into `__text`, so copying it as an ordinary section would try to rebase pointers inside a
+    // read-only segment; and the output we want from it isn't the input bytes at all, but the
+    // `__unwind_info` table we build from them.
+    SectionRule::exact(b"__compact_unwind", SectionRuleOutcome::EhFrame),
+    // A root, like the initialiser lists: nothing in the image refers to `__eh_frame`, because the
+    // `__unwind_info` entries that need it reach in by offset rather than by symbol.
+    SectionRule::exact_section_keep(b"__eh_frame", crate::output_section_id::MACHO_EH_FRAME),
     // Debug info stays in the object files for `dsymutil` to collect into a .dSYM bundle; a linked
     // Mach-O image carries none of it. `__bitcode` and `__cmdline` are likewise only there to feed
     // LTO - `__bitcode` alone is 5 MiB in Rust's libstd.

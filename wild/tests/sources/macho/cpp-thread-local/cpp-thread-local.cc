@@ -1,7 +1,5 @@
 //#Config:default
 //#LinkerDriver:clang++
-//#DiffIgnore:section.__unwind_info
-//#ExpectWarningWild:no __unwind_info
 
 // A thread-local with a non-trivial constructor, which needs three things a plain `_Thread_local
 // int` doesn't.

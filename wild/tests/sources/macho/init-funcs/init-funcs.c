@@ -1,6 +1,5 @@
 //#Config:default
 //#LinkerDriver:clang
-//#DiffIgnore:section.__unwind_info
 //#DiffIgnore:section.__init_offsets
 //#DiffIgnore:section.__mod_init_func
 

@@ -19,6 +19,9 @@ use crate::layout::Section;
 use crate::layout::SymbolCopyInfo;
 use crate::macho::BuildVersionCommand;
 use crate::macho::CHAINED_FIXUP_PAGE_START_SIZE;
+use crate::macho::COMPACT_UNWIND_ENTRY_SIZE;
+use crate::macho::COMPACT_UNWIND_LSDA_OFFSET;
+use crate::macho::COMPACT_UNWIND_PERSONALITY_OFFSET;
 use crate::macho::CS_BLOB_HEADERS_SIZE;
 use crate::macho::CS_BLOCK_SIZE;
 use crate::macho::CS_BLOCK_SIZE_EXP;
@@ -47,6 +50,19 @@ use crate::macho::SegmentCommand;
 use crate::macho::SegmentSectionsInfo;
 use crate::macho::SegmentType;
 use crate::macho::SymtabCommand;
+use crate::macho::UNWIND_ARM64_DWARF_SECTION_OFFSET;
+use crate::macho::UNWIND_ARM64_MODE_DWARF;
+use crate::macho::UNWIND_ARM64_MODE_MASK;
+use crate::macho::UNWIND_INFO_ENTRY_SIZE;
+use crate::macho::UNWIND_INFO_HEADER_SIZE;
+use crate::macho::UNWIND_INFO_INDEX_ENTRY_SIZE;
+use crate::macho::UNWIND_INFO_LSDA_ENTRY_SIZE;
+use crate::macho::UNWIND_INFO_MAX_PERSONALITIES;
+use crate::macho::UNWIND_INFO_PAGE_CAPACITY;
+use crate::macho::UNWIND_INFO_PAGE_HEADER_SIZE;
+use crate::macho::UNWIND_PERSONALITY_SHIFT;
+use crate::macho::UNWIND_SECOND_LEVEL_REGULAR;
+use crate::macho::UNWIND_SECTION_VERSION;
 use crate::macho::UuidCommand;
 use crate::macho::code_signature_identifier;
 use crate::macho::code_signature_padded_identifier_size;
@@ -83,6 +99,7 @@ use crate::symbol_db::SymbolId;
 use crate::timing_phase;
 use crate::value_flags::ValueFlags;
 use crate::verbose_timing_phase;
+use hashbrown::HashMap;
 use itertools::Itertools;
 use linker_utils::elf::RelocationKind;
 use linker_utils::elf::RelocationSize;
@@ -140,7 +157,6 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     layout: &MachOLayout<'data>,
 ) -> Result {
     timing_phase!("Write data to file");
-    warn_if_unwind_info_needed(layout);
 
     let (mut section_buffers, mut padding) =
         split_output_into_sections(layout, &mut sized_output.out);
@@ -200,6 +216,10 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
         layout,
         section_buffers.get_mut(output_section_id::INDIRECT_SYMTAB),
     )?;
+    write_unwind_info(
+        layout,
+        section_buffers.get_mut(output_section_id::UNWIND_INFO),
+    )?;
     drop(section_buffers);
 
     write_chained_fixups(layout, sized_output, fixup_sites)?;
@@ -209,28 +229,6 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     write_code_signature_hashes(layout, sized_output)?;
 
     Ok(())
-}
-
-/// Warns when the output contains exception-handling tables but no `__TEXT,__unwind_info`.
-///
-/// We don't synthesise `__unwind_info` from the `__LD,__compact_unwind` sections in the input yet.
-/// For most code that only costs you backtraces, but as soon as something throws, libunwind has no
-/// way to find the personality routine or the landing pads and the process calls `terminate`. The
-/// presence of `__gcc_except_tab` is what distinguishes "unwinding would be nice" from "this binary
-/// is going to abort", so only warn for the latter - otherwise every single link would warn, since
-/// clang emits `__compact_unwind` even for trivial C.
-fn warn_if_unwind_info_needed(layout: &MachOLayout<'_>) {
-    let except_tab = layout
-        .section_layouts
-        .get(output_section_id::GCC_EXCEPT_TABLE);
-
-    if except_tab.mem_size > 0 {
-        layout.args().warning(
-            "emitting a binary with exception-handling tables but no __unwind_info: \
-             wild cannot build __unwind_info from __compact_unwind yet, so throwing an \
-             exception will call terminate",
-        );
-    }
 }
 
 /// Fails the link when the output contains thread-local variables.
@@ -1108,6 +1106,376 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         })?;
 
     Ok(())
+}
+
+/// Writes `__TEXT,__unwind_info`, the table libunwind searches to find out how to unwind out of a
+/// function.
+///
+/// The input describes each function separately, in whatever order the objects happened to be in.
+/// The output is a two-level index sorted by address: a first level naming the page each range of
+/// functions is on, and a second level holding the functions themselves. Anything that needs more
+/// than the compact encoding can express - a personality routine, a landing pad - is named
+/// indirectly, through arrays the entries hold indices into.
+fn write_unwind_info(layout: &MachOLayout<'_>, out: &mut [u8]) -> Result {
+    if out.is_empty() {
+        return Ok(());
+    }
+
+    let entries = collect_unwind_entries(layout)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let image_base = layout
+        .section_layouts
+        .get(output_section_id::FILE_HEADER)
+        .mem_offset;
+
+    // An entry names its personality by a two-bit index, so there is room for three across the
+    // whole image. In practice a program has one per language runtime it links against.
+    let mut personalities: Vec<u64> = Vec::new();
+    for entry in &entries {
+        if let Some(address) = entry.personality_got_address
+            && !personalities.contains(&address)
+        {
+            ensure!(
+                (personalities.len() as u64) < UNWIND_INFO_MAX_PERSONALITIES,
+                "More than {UNWIND_INFO_MAX_PERSONALITIES} personality routines, which is more \
+                 than a compact unwind encoding can name"
+            );
+            personalities.push(address);
+        }
+    }
+
+    let pages = (entries.len() as u64).div_ceil(UNWIND_INFO_PAGE_CAPACITY);
+    let lsda_count = entries.iter().filter(|e| e.lsda_address.is_some()).count() as u64;
+
+    // Laid out in the order the header's offsets have to name: the personalities, then the index
+    // over the pages, then the landing pads, then the pages themselves.
+    let personality_offset = UNWIND_INFO_HEADER_SIZE;
+    let index_offset = personality_offset + personalities.len() as u64 * size_of::<u32>() as u64;
+    // One index entry per page, plus a sentinel that marks where the last function ends.
+    let lsda_offset = index_offset + (pages + 1) * UNWIND_INFO_INDEX_ENTRY_SIZE;
+    let first_page_offset = lsda_offset + lsda_count * UNWIND_INFO_LSDA_ENTRY_SIZE;
+
+    let mut writer = UnwindInfoWriter { out, offset: 0 };
+
+    // Header. We emit no common encodings: they only save space for the compressed page format,
+    // and we use the regular one, where every entry carries its own encoding anyway.
+    writer.u32(UNWIND_SECTION_VERSION)?;
+    writer.u32(index_offset as u32)?; // Common encodings, of which there are none, so this is
+    writer.u32(0)?; // just where they would have started.
+    writer.u32(personality_offset as u32)?;
+    writer.u32(personalities.len() as u32)?;
+    writer.u32(index_offset as u32)?;
+    writer.u32((pages + 1) as u32)?;
+
+    for personality in &personalities {
+        writer.u32(image_relative(*personality, image_base)?)?;
+    }
+
+    // First level: one entry per page, then the sentinel.
+    let mut page_offset = first_page_offset;
+    let mut lsda_cursor = lsda_offset;
+
+    for page in entries.chunks(UNWIND_INFO_PAGE_CAPACITY as usize) {
+        writer.u32(image_relative(page[0].function_address, image_base)?)?;
+        writer.u32(page_offset as u32)?;
+        writer.u32(lsda_cursor as u32)?;
+
+        page_offset += UNWIND_INFO_PAGE_HEADER_SIZE + page.len() as u64 * UNWIND_INFO_ENTRY_SIZE;
+        lsda_cursor += page.iter().filter(|e| e.lsda_address.is_some()).count() as u64
+            * UNWIND_INFO_LSDA_ENTRY_SIZE;
+    }
+
+    // The sentinel's address is one past the last function, so that a search for an address beyond
+    // everything we know about lands here and finds no page.
+    let last = entries.last().expect("entries is not empty");
+    writer.u32(image_relative(
+        last.function_address + u64::from(last.function_length),
+        image_base,
+    )?)?;
+    writer.u32(0)?;
+    writer.u32(lsda_cursor as u32)?;
+
+    // The landing pads, in the same order as the functions that have them.
+    for entry in &entries {
+        if let Some(lsda) = entry.lsda_address {
+            writer.u32(image_relative(entry.function_address, image_base)?)?;
+            writer.u32(image_relative(lsda, image_base)?)?;
+        }
+    }
+
+    // Second level: the functions themselves, one page at a time.
+    for page in entries.chunks(UNWIND_INFO_PAGE_CAPACITY as usize) {
+        writer.u32(UNWIND_SECOND_LEVEL_REGULAR)?;
+        writer.u16(UNWIND_INFO_PAGE_HEADER_SIZE as u16)?;
+        writer.u16(page.len() as u16)?;
+
+        for entry in page {
+            let personality_index = entry
+                .personality_got_address
+                .and_then(|address| personalities.iter().position(|p| *p == address))
+                // The index is stored one-based, so that zero can mean "no personality".
+                .map_or(0, |index| index as u32 + 1);
+
+            writer.u32(image_relative(entry.function_address, image_base)?)?;
+            writer.u32(entry.encoding | (personality_index << UNWIND_PERSONALITY_SHIFT))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns an address as an offset from the mach header, which is how `__unwind_info` names
+/// everything - it has 32 bits per reference and the image can be loaded anywhere.
+fn image_relative(address: u64, image_base: u64) -> Result<u32> {
+    let offset = address
+        .checked_sub(image_base)
+        .with_context(|| format!("Address 0x{address:x} is before the image base"))?;
+
+    u32::try_from(offset)
+        .map_err(|_| error!("Address 0x{address:x} is more than 4GiB past the image base"))
+}
+
+/// Appends to `__unwind_info`, keeping track of how far in we are.
+struct UnwindInfoWriter<'out> {
+    out: &'out mut [u8],
+    offset: usize,
+}
+
+impl UnwindInfoWriter<'_> {
+    fn u32(&mut self, value: u32) -> Result {
+        self.write(&value.to_le_bytes())
+    }
+
+    fn u16(&mut self, value: u16) -> Result {
+        self.write(&value.to_le_bytes())
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result {
+        let end = self.offset + bytes.len();
+        let slot = self
+            .out
+            .get_mut(self.offset..end)
+            .ok_or_else(|| error!("Insufficient allocation for __unwind_info"))?;
+        slot.copy_from_slice(bytes);
+        self.offset = end;
+        Ok(())
+    }
+}
+
+/// One function's unwind information, gathered from an input `__LD,__compact_unwind` entry.
+struct UnwindEntry {
+    function_address: u64,
+    function_length: u32,
+    encoding: u32,
+    /// Address of the GOT slot holding the personality routine, if the function has one. The table
+    /// names personalities indirectly, which is why the slot rather than the routine is what
+    /// matters here.
+    personality_got_address: Option<u64>,
+    lsda_address: Option<u64>,
+}
+
+/// Reads every input `__LD,__compact_unwind` section and returns one entry per function, ordered by
+/// address, which is the order `__unwind_info` has to be searchable in.
+fn collect_unwind_entries(layout: &MachOLayout<'_>) -> Result<Vec<UnwindEntry>> {
+    let mut entries = Vec::new();
+
+    for group in &layout.group_layouts {
+        for file in &group.files {
+            let FileLayout::Object(object) = file else {
+                continue;
+            };
+
+            for slot in &object.sections {
+                let SectionSlot::FrameData(section_index) = slot else {
+                    continue;
+                };
+
+                read_compact_unwind_section(object, *section_index, layout, &mut entries)
+                    .with_context(|| format!("Failed to read __compact_unwind from {object}"))?;
+            }
+        }
+    }
+
+    entries.sort_unstable_by_key(|entry| entry.function_address);
+
+    Ok(entries)
+}
+
+fn read_compact_unwind_section(
+    object: &ObjectLayout<'_, MachO>,
+    section_index: object::SectionIndex,
+    layout: &MachOLayout<'_>,
+    entries: &mut Vec<UnwindEntry>,
+) -> Result {
+    let section = object.object.section(section_index)?;
+    let data = object.object.raw_section_data(section)?;
+
+    // An entry that can't be described compactly names a DWARF frame instead, by its offset within
+    // `__eh_frame`. That offset is into *this object's* `__eh_frame`, and the output has every
+    // object's concatenated, so it has to be shifted by wherever this object's copy landed.
+    let eh_frame_delta = eh_frame_output_delta(object, layout)?;
+
+    // A relocation names the target; the bytes it applies to hold the displacement from it. Both
+    // are needed, and which field of which entry they belong to follows from the offset, so the
+    // targets are gathered by offset first and the entries read from them afterwards.
+    let mut targets = HashMap::new();
+
+    for relocation in object
+        .object
+        .relocations(section_index, &object.relocations)?
+        .relocations
+    {
+        let info = relocation.info(LE);
+        let offset = info.r_address as usize;
+
+        let stored = data
+            .get(offset..offset + size_of::<u64>())
+            .map_or(0, |bytes| {
+                u64::from_le_bytes(bytes.try_into().expect("slice is 8 bytes"))
+            });
+
+        let Some(address) = resolve_compact_unwind_target(object, layout, info, stored)? else {
+            continue;
+        };
+
+        targets.insert(offset as u64, address);
+    }
+
+    for (index, entry) in data
+        .chunks_exact(COMPACT_UNWIND_ENTRY_SIZE as usize)
+        .enumerate()
+    {
+        let base = index as u64 * COMPACT_UNWIND_ENTRY_SIZE;
+
+        // A function with no relocation naming it isn't one we're emitting - the entry describes
+        // something that didn't make it into the output.
+        let Some(&function_address) = targets.get(&base) else {
+            continue;
+        };
+
+        let function_length = u32::from_le_bytes(entry[8..12].try_into()?);
+        let mut encoding = u32::from_le_bytes(entry[12..16].try_into()?);
+
+        if encoding & UNWIND_ARM64_MODE_MASK == UNWIND_ARM64_MODE_DWARF {
+            let input_offset = encoding & UNWIND_ARM64_DWARF_SECTION_OFFSET;
+            let output_offset = input_offset
+                .checked_add(eh_frame_delta)
+                .filter(|offset| *offset <= UNWIND_ARM64_DWARF_SECTION_OFFSET)
+                .context("__eh_frame is too large for a DWARF unwind entry to reach into")?;
+
+            encoding = (encoding & !UNWIND_ARM64_DWARF_SECTION_OFFSET) | output_offset;
+        }
+
+        let personality_got_address = targets
+            .get(&(base + COMPACT_UNWIND_PERSONALITY_OFFSET))
+            .copied();
+        let lsda_address = targets.get(&(base + COMPACT_UNWIND_LSDA_OFFSET)).copied();
+
+        entries.push(UnwindEntry {
+            function_address,
+            function_length,
+            encoding,
+            personality_got_address,
+            lsda_address,
+        });
+    }
+
+    Ok(())
+}
+
+/// Returns how far this object's `__eh_frame` sits into the output section of the same name.
+///
+/// Zero if it has none, in which case nothing will ask.
+fn eh_frame_output_delta(
+    object: &ObjectLayout<'_, MachO>,
+    layout: &MachOLayout<'_>,
+) -> Result<u32> {
+    let Some(index) = (0..object.object.num_sections()).find(|&index| {
+        object
+            .object
+            .section_name(object::SectionIndex(index))
+            .is_ok_and(|name| name == b"__eh_frame")
+    }) else {
+        return Ok(0);
+    };
+
+    let Some(address) = object
+        .section_resolutions
+        .get(index)
+        .and_then(|resolution| resolution.address())
+    else {
+        return Ok(0);
+    };
+
+    let section_start = layout
+        .section_layouts
+        .get(output_section_id::MACHO_EH_FRAME)
+        .mem_offset;
+
+    u32::try_from(address.saturating_sub(section_start))
+        .map_err(|_| error!("__eh_frame is more than 4GiB long"))
+}
+
+/// Returns where a `__compact_unwind` relocation points, or `None` if its target wasn't emitted.
+///
+/// `stored` is what the relocation's own storage holds, which means different things depending on
+/// what the relocation names - see below.
+fn resolve_compact_unwind_target(
+    object: &ObjectLayout<'_, MachO>,
+    layout: &MachOLayout<'_>,
+    relocation: RelocationInfo,
+    stored: u64,
+) -> Result<Option<u64>> {
+    if relocation.r_extern {
+        // Naming a symbol, so the stored value is a displacement from it.
+        let local_symbol_id = object
+            .symbol_id_range
+            .input_to_id(SymbolIndex(relocation.r_symbolnum as usize));
+
+        let Some(resolution) = layout.merged_symbol_resolution(local_symbol_id) else {
+            return Ok(None);
+        };
+
+        // A personality is named by where its address is kept rather than by the address itself,
+        // so for those the slot is the answer. `load_exception_frame_data` is what made sure the
+        // slot exists.
+        let address = resolution
+            .format_specific
+            .got_address
+            .map_or(resolution.raw_value, |got_address| got_address.get());
+
+        return Ok(Some(address.wrapping_add(stored)));
+    }
+
+    // Naming a section instead, numbered from one. Here the stored value is not a displacement but
+    // the target's address in the object's own addressing, so what carries over to the output is
+    // how far into the section it is - the object and the output place that section differently.
+    let section_index = (relocation.r_symbolnum as usize)
+        .checked_sub(1)
+        .context("Section number zero in a __compact_unwind relocation")?;
+
+    let Some(output_address) = object
+        .section_resolutions
+        .get(section_index)
+        .and_then(|resolution| resolution.address())
+    else {
+        return Ok(None);
+    };
+
+    let input_address = object
+        .object
+        .section(object::SectionIndex(section_index))?
+        .addr
+        .get(LE);
+
+    let offset_in_section = stored.checked_sub(input_address).with_context(|| {
+        format!("__compact_unwind names 0x{stored:x}, which is before the section it belongs to")
+    })?;
+
+    Ok(Some(output_address + offset_in_section))
 }
 
 fn write_section_raw<'out, 'data>(

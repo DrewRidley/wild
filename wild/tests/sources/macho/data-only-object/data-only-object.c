@@ -2,7 +2,6 @@
 //#LinkerDriver:clang
 //#Object:only-data.c
 //#ExpectSym:_main
-//#DiffIgnore:section.__unwind_info
 
 // An input object that contains only initialised data and no code at all. This
 // is completely ordinary in real links (generated tables, `const` blobs, Rust

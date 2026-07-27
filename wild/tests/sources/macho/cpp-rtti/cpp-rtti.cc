@@ -1,7 +1,5 @@
 //#Config:default
 //#LinkerDriver:clang++
-//#DiffIgnore:section.__unwind_info
-//#ExpectWarningWild:no __unwind_info
 
 // C++ with virtual functions and RTTI, which puts two things in initialised data that plain C
 // never produces.

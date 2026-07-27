@@ -114,6 +114,7 @@ pub(crate) const LOAD_COMMANDS: OutputSectionId = part_id::LOAD_COMMANDS.output_
 pub(crate) const CHAINED_FIXUP_TABLE: OutputSectionId =
     part_id::CHAINED_FIXUP_TABLE.output_section_id();
 pub(crate) const INDIRECT_SYMTAB: OutputSectionId = part_id::INDIRECT_SYMTAB.output_section_id();
+pub(crate) const UNWIND_INFO: OutputSectionId = part_id::UNWIND_INFO.output_section_id();
 pub(crate) const CODE_SIGNATURE: OutputSectionId = part_id::CODE_SIGNATURE.output_section_id();
 
 // Wasm specific sections.
@@ -156,8 +157,12 @@ pub(crate) const THREAD_VARS: OutputSectionId = OutputSectionId::regular(17);
 /// Mach-O `__DATA,__common`, holding common (tentative) definitions. Zerofill like BSS, but kept
 /// separate because ld64 keeps it separate.
 pub(crate) const COMMON: OutputSectionId = OutputSectionId::regular(18);
+/// Mach-O `__TEXT,__eh_frame`. Distinct from `EH_FRAME` above: that ID selects the frame-data
+/// handling, which on Mach-O we point at `__compact_unwind` instead. This one is copied through
+/// like any other section, because `__unwind_info` entries reach into it by offset.
+pub(crate) const MACHO_EH_FRAME: OutputSectionId = OutputSectionId::regular(19);
 
-pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 19;
+pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 20;
 
 #[derive(Debug)]
 pub(crate) struct OutputSections<'data, P: Platform> {

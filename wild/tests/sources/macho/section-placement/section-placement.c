@@ -1,7 +1,6 @@
 //#Config:default
 //#LinkerDriver:clang
 //#Object:placement-data.s
-//#DiffIgnore:section.__unwind_info
 
 // Input sections that wild has no built-in output section for. Every one of these used to abort
 // the link: layout would let each object reserve bytes for the section, but nothing gave the

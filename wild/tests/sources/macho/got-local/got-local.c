@@ -1,7 +1,6 @@
 //#Config:default
 //#LinkerDriver:clang
 //#Object:got-local-data.s
-//#DiffIgnore:section.__unwind_info
 
 // A reference that stores where a symbol's GOT slot is, rather than reading through it, for a
 // symbol defined in this image.

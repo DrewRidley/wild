@@ -3,7 +3,6 @@
 //#Object:data1.c
 //#Object:data2.c
 //#ExpectSym:_main
-//#DiffIgnore:section.__unwind_info
 
 // Pointers in initialised data spread across three input objects, including
 // pointers that cross object boundaries in both directions. Each object

@@ -1,7 +1,6 @@
 //#Object:runtime.c
 //#ExpectSym:_main
 //#TestUpdateInPlace:true
-//#DiffIgnore:section.__unwind_info
 
 // Regression test for LC_MAIN's `entryoff` being set to the start of __text rather than to the
 // address of the entry symbol. `decoy` is defined before `main`, so it gets laid out first in

@@ -1,6 +1,4 @@
 //#Config:default
-//#ExpectWarningWild:no __unwind_info
-//#DiffIgnore:section.__unwind_info
 //#DiffIgnore:section.__eh_frame
 //#DiffIgnore:section.__const
 

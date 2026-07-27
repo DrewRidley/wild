@@ -1,7 +1,6 @@
 //#Config:default
 //#LinkerDriver:clang
 //#ExpectSym:_main
-//#DiffIgnore:section.__unwind_info
 
 // Indirect calls through function pointers held in initialised data. Like data
 // pointers these require a load-time rebase, but the failure mode is worse: an

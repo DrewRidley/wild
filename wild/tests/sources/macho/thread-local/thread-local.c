@@ -2,7 +2,6 @@
 // Linked through the compiler driver so that libSystem, which provides __tlv_bootstrap and
 // pthreads, is on the link line - otherwise the link fails earlier on those undefined symbols.
 //#LinkerDriver:clang
-//#DiffIgnore:section.__unwind_info
 
 // A thread-local on Mach-O is reached through a `tlv_descriptor` in `__DATA,__thread_vars` holding
 // a thunk, a key and the variable's offset within the thread-local block. The linker fills in the

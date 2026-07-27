@@ -27,7 +27,6 @@
 
 //#AbstractConfig:default
 //#LinkerDriver:clang
-//#DiffIgnore:section.__unwind_info
 // Detection requires something to diff against. Apple's `ld` ships with the command line tools,
 // so it's the reference that is actually present on a developer's machine; `ld64.lld`, the
 // default Mach-O reference, usually isn't installed. Naming it explicitly also keeps the

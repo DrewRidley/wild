@@ -1,7 +1,4 @@
 //#LinkerDriver:clang++
-//#DiffIgnore:section.__unwind_info
-// Remove this once wild builds __unwind_info from __compact_unwind.
-//#ExpectWarningWild:no __unwind_info
 
 #include <iostream>
 
