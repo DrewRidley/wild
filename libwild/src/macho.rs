@@ -787,6 +787,7 @@ fn mapped_segment_type(section_id: crate::output_section_id::OutputSectionId) ->
         output_section_id::TEXT
         | output_section_id::CSTRING
         | output_section_id::CONST
+        | output_section_id::GCC_EXCEPT_TABLE
         | output_section_id::PLT_GOT => SegmentType::TextSections,
         output_section_id::DATA => SegmentType::DataSections,
         output_section_id::GOT => SegmentType::DataConstSections,
@@ -1704,6 +1705,7 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::TEXT);
         builder.add_section(output_section_id::CSTRING);
         builder.add_section(output_section_id::CONST);
+        builder.add_section(output_section_id::GCC_EXCEPT_TABLE);
         builder.add_section(output_section_id::PLT_GOT);
         builder.add_section(output_section_id::DATA);
         builder.add_section(output_section_id::GOT);
@@ -1865,6 +1867,11 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         section_flags: macho::S_REGULAR.to_flags(),
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::GCC_EXCEPT_TABLE.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__gcc_except_tab")),
+        section_flags: macho::S_REGULAR.to_flags(),
+        ..DEFAULT_DEFS
+    };
     defs[output_section_id::DATA.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"__data")),
         section_flags: macho::S_REGULAR.to_flags(),
@@ -1945,6 +1952,10 @@ const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
     SectionRule::exact_section_keep(b"__text", crate::output_section_id::TEXT),
     SectionRule::exact_section_keep(b"__cstring", crate::output_section_id::CSTRING),
     SectionRule::exact_section_keep(b"__const", crate::output_section_id::CONST),
+    SectionRule::exact_section_keep(
+        b"__gcc_except_tab",
+        crate::output_section_id::GCC_EXCEPT_TABLE,
+    ),
     SectionRule::exact_section_keep(b"__data", crate::output_section_id::DATA),
     // SectionRule::exact_section_keep(b"__compact_unwind", crate::output_section_id::EH_FRAME),
 ];

@@ -172,6 +172,17 @@ impl crate::platform::Arch for MachOAArch64 {
                     1,
                 )
             }
+            object::macho::ARM64_RELOC_POINTER_TO_GOT => {
+                // Stores the address of the symbol's GOT entry rather than the symbol itself.
+                // When PC-relative it's the usual 4-byte delta from the place, which is what
+                // `__gcc_except_tab` uses to reach typeinfo that lives in another image.
+                let kind = if rel.r_pcrel {
+                    RelocationKind::GotRelative
+                } else {
+                    RelocationKind::Got
+                };
+                (kind, rel_size, None, AllowedRange::no_check(), 1)
+            }
             _ => bail!("Unknown relocation: {}", rel.r_type),
         };
         Ok(RelocationKindInfo {

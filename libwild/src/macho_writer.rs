@@ -135,6 +135,8 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     layout: &MachOLayout<'data>,
 ) -> Result {
     timing_phase!("Write data to file");
+    warn_if_unwind_info_needed(layout);
+
     let (mut section_buffers, mut padding) =
         split_output_into_sections(layout, &mut sized_output.out);
     padding.fill_zero();
@@ -192,6 +194,28 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     write_code_signature_hashes(layout, sized_output)?;
 
     Ok(())
+}
+
+/// Warns when the output contains exception-handling tables but no `__TEXT,__unwind_info`.
+///
+/// We don't synthesise `__unwind_info` from the `__LD,__compact_unwind` sections in the input yet.
+/// For most code that only costs you backtraces, but as soon as something throws, libunwind has no
+/// way to find the personality routine or the landing pads and the process calls `terminate`. The
+/// presence of `__gcc_except_tab` is what distinguishes "unwinding would be nice" from "this binary
+/// is going to abort", so only warn for the latter - otherwise every single link would warn, since
+/// clang emits `__compact_unwind` even for trivial C.
+fn warn_if_unwind_info_needed(layout: &MachOLayout<'_>) {
+    let except_tab = layout
+        .section_layouts
+        .get(output_section_id::GCC_EXCEPT_TABLE);
+
+    if except_tab.mem_size > 0 {
+        layout.args().warning(
+            "emitting a binary with exception-handling tables but no __unwind_info: \
+             wild cannot build __unwind_info from __compact_unwind yet, so throwing an \
+             exception will call terminate",
+        );
+    }
 }
 
 fn write_file<'data, A: Arch<Platform = MachO>>(
