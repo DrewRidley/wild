@@ -238,6 +238,71 @@ pub(crate) struct FinaliseSizesExt {
     imported_symbols: Vec<SymbolId>,
 }
 
+/// One `__LD,__compact_unwind` entry, held against the function it describes rather than counted
+/// where it was found.
+///
+/// An entry only earns its place in `__unwind_info` if that function is still in the output, and
+/// what it points at - a personality routine, a language-specific data area - is only worth keeping
+/// for the same reason. Reaching them from here rather than from the section means the unwind data
+/// follows the code instead of anchoring it.
+#[derive(Debug)]
+pub(crate) struct UnwindEntry {
+    /// Where this entry's relocations sit in `ObjectLayoutStateExt::unwind_relocations`.
+    relocations: Range<u32>,
+
+    /// The `__compact_unwind` section the entry was read from, needed to reach those relocations
+    /// again once the function turns out to be live.
+    compact_unwind_section_index: object::SectionIndex,
+
+    /// The entry before this one for the same function, if it has more than one.
+    previous_frame_for_section: Option<platform::FrameIndex>,
+}
+
+/// Returns the section holding the function a `__compact_unwind` entry describes.
+///
+/// The answer is an atom rather than one of the object's own sections, because atoms are what the
+/// output places and what dead-stripping drops - which is the whole point of asking.
+fn compact_unwind_target_section(
+    object: &crate::layout::ObjectLayoutState<'_, MachO>,
+    info: object::macho::RelocationInfo,
+    data: &[u8],
+) -> Result<Option<object::SectionIndex>> {
+    if info.r_extern {
+        // Naming a symbol, so the section is whichever one defines it.
+        let symbol_index = SymbolIndex(info.r_symbolnum as usize);
+        let symbol = object.object.symbol(symbol_index)?;
+
+        return object.object.symbol_section(symbol, symbol_index);
+    }
+
+    // Naming a section instead, numbered from one, with the function's address in the object's own
+    // addressing stored in the entry.
+    let section_index = (info.r_symbolnum as usize)
+        .checked_sub(1)
+        .context("Section number zero in a __compact_unwind relocation")?;
+
+    let offset = info.r_address as usize;
+    let Some(stored) = data
+        .get(offset..offset + size_of::<u64>())
+        .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("just sized")))
+    else {
+        return Ok(None);
+    };
+
+    Ok(object
+        .object
+        .atom_for_address(object::SectionIndex(section_index), stored))
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ObjectLayoutStateExt {
+    unwind_entries: Vec<UnwindEntry>,
+
+    /// Relocation indices grouped by entry. The relocations of one entry need not be adjacent in
+    /// the section's own list, so they are gathered here and each entry keeps a range into it.
+    unwind_relocations: Vec<u32>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PreludeLayoutExt {
     pub(crate) imported_library_file_ids: Vec<FileId>,
@@ -1366,7 +1431,7 @@ impl platform::Platform for MachO {
     type LayoutResourcesExt<'data> = ();
     type PreludeLayoutStateExt = PreludeLayoutExt;
     type PreludeLayoutExt = PreludeLayoutExt;
-    type ObjectLayoutStateExt<'data> = ();
+    type ObjectLayoutStateExt<'data> = ObjectLayoutStateExt;
     type RawSymbolName<'data> = RawSymbolName<'data>;
     type VersionNames<'data> = ();
     type VerneedTable<'data> = VerneedTable<'data>;
@@ -1766,59 +1831,147 @@ impl platform::Platform for MachO {
         let section = object.object.section(eh_frame_section_index)?;
         let data = object.object.raw_section_data(section)?;
 
-        let entry_count = data.len() as u64 / COMPACT_UNWIND_ENTRY_SIZE;
-        common.allocate(
-            part_id::UNWIND_INFO,
-            entry_count * UNWIND_INFO_BYTES_PER_ENTRY,
-        );
-
         let relocations = object
             .object
             .relocations(eh_frame_section_index, &object.relocations)?
             .relocations;
 
-        for relocation in relocations {
-            let info = relocation.info(LE);
+        // Gather each entry's relocations by which entry they land in. They are usually written in
+        // order, but nothing requires it, so they are bucketed rather than sliced.
+        let entry_count = (data.len() as u64 / COMPACT_UNWIND_ENTRY_SIZE) as usize;
+        let mut by_entry: Vec<Vec<u32>> = vec![Vec::new(); entry_count];
 
-            process_relocation::<A>(
-                object,
-                relocation,
-                eh_frame_section_index,
-                resources,
-                queue,
-                scope,
-            )?;
+        for (index, relocation) in relocations.iter().enumerate() {
+            let entry = u64::from(relocation.info(LE).r_address) / COMPACT_UNWIND_ENTRY_SIZE;
 
-            // The personality is reached through a slot rather than directly, because the entry
-            // stores where the routine's address is rather than the address itself - so it needs a
-            // GOT entry even when the routine is defined right here, which is how Rust's is.
-            if info.r_extern
-                && u64::from(info.r_address) % COMPACT_UNWIND_ENTRY_SIZE
-                    == COMPACT_UNWIND_PERSONALITY_OFFSET
-            {
-                let local_symbol_id = object
-                    .symbol_id_range
-                    .input_to_id(SymbolIndex(info.r_symbolnum as usize));
-                let symbol_id = resources.symbol_db.definition(local_symbol_id);
-
-                resources
-                    .per_symbol_flags
-                    .get_atomic(symbol_id)
-                    .fetch_or(ValueFlags::GOT_ENTRY_REQUIRED);
+            if let Some(bucket) = by_entry.get_mut(entry as usize) {
+                bucket.push(index as u32);
             }
         }
+
+        for (entry_index, bucket) in by_entry.into_iter().enumerate() {
+            let entry_offset = entry_index as u64 * COMPACT_UNWIND_ENTRY_SIZE;
+
+            // The function is named by the relocation at the start of the entry. Without one there
+            // is nothing to hang the entry on, so it can never be reached and is dropped.
+            let Some(target_section_index) = bucket
+                .iter()
+                .map(|&index| relocations[index as usize].info(LE))
+                .find(|info| u64::from(info.r_address) == entry_offset)
+                .and_then(|info| compact_unwind_target_section(object, info, data).transpose())
+                .transpose()?
+            else {
+                continue;
+            };
+
+            let Some(unloaded) = object.sections[target_section_index.0].unloaded_mut() else {
+                // Already loaded, or not a section that can hold code. Either way there is no
+                // pending-load slot to hang this on.
+                continue;
+            };
+
+            let frame_index =
+                platform::FrameIndex::from_usize(object.format_specific.unwind_entries.len());
+            let previous_frame_for_section = unloaded.last_frame_index.replace(frame_index);
+
+            let start = object.format_specific.unwind_relocations.len() as u32;
+            object.format_specific.unwind_relocations.extend(bucket);
+            let end = object.format_specific.unwind_relocations.len() as u32;
+
+            object.format_specific.unwind_entries.push(UnwindEntry {
+                relocations: start..end,
+                compact_unwind_section_index: eh_frame_section_index,
+                previous_frame_for_section,
+            });
+        }
+
+        // Nothing is allocated or followed here: both wait until the function is known to be live,
+        // which `non_empty_section_loaded` is told about.
+        let _ = (common, resources, queue, scope);
 
         Ok(())
     }
 
+    /// Pays for the unwind entries of a function that is staying in the output.
+    ///
+    /// This is what keeps `__unwind_info` in step with dead-stripping: the table is sized from the
+    /// functions that survive rather than from every entry that was read. Following an entry's
+    /// relocations here rather than when it was read is what lets a language-specific data area be
+    /// dropped along with the function it describes.
     fn non_empty_section_loaded<'data, 'scope, A: platform::Arch<Platform = Self>>(
-        _object: &mut crate::layout::ObjectLayoutState<'data, Self>,
-        _common: &mut crate::layout::CommonGroupState<'data, Self>,
-        _queue: &mut crate::layout::LocalWorkQueue,
-        _unloaded: crate::resolution::UnloadedSection,
-        _resources: &'scope crate::layout::GraphResources<'data, 'scope, Self>,
-        _scope: &rayon::Scope<'scope>,
+        object: &mut crate::layout::ObjectLayoutState<'data, Self>,
+        common: &mut crate::layout::CommonGroupState<'data, Self>,
+        queue: &mut crate::layout::LocalWorkQueue,
+        unloaded: crate::resolution::UnloadedSection,
+        resources: &'scope crate::layout::GraphResources<'data, 'scope, Self>,
+        scope: &rayon::Scope<'scope>,
     ) -> crate::error::Result {
+        let mut next_frame_index = unloaded.last_frame_index;
+
+        while let Some(frame_index) = next_frame_index {
+            let entry = &object.format_specific.unwind_entries[frame_index.as_usize()];
+            next_frame_index = entry.previous_frame_for_section;
+
+            let compact_unwind_section_index = entry.compact_unwind_section_index;
+            let relocation_indices = object.format_specific.unwind_relocations
+                [entry.relocations.start as usize..entry.relocations.end as usize]
+                .to_vec();
+
+            common.allocate(part_id::UNWIND_INFO, UNWIND_INFO_BYTES_PER_ENTRY);
+
+            let relocations = object
+                .object
+                .relocations(compact_unwind_section_index, &object.relocations)?
+                .relocations;
+
+            let data = object
+                .object
+                .raw_section_data(object.object.section(compact_unwind_section_index)?)?;
+
+            for index in relocation_indices {
+                let relocation = &relocations[index as usize];
+                let info = relocation.info(LE);
+
+                process_relocation::<A>(
+                    object,
+                    relocation,
+                    compact_unwind_section_index,
+                    resources,
+                    queue,
+                    scope,
+                )?;
+
+                // A landing pad has no symbol on it, so its entry names it by section and offset,
+                // and `process_relocation` - which follows symbols - passes it by. Asking for the
+                // section directly is what keeps the table it lives in, now that the table is no
+                // longer kept unconditionally.
+                if !info.r_extern
+                    && let Some(target) = compact_unwind_target_section(object, info, data)?
+                {
+                    queue.send_section_request::<A>(object.file_id, target, resources, scope);
+                }
+
+                // The personality is reached through a slot rather than directly, because the entry
+                // stores where the routine's address is rather than the address itself - so it
+                // needs a GOT entry even when the routine is defined right here, which is how
+                // Rust's is.
+                if info.r_extern
+                    && u64::from(info.r_address) % COMPACT_UNWIND_ENTRY_SIZE
+                        == COMPACT_UNWIND_PERSONALITY_OFFSET
+                {
+                    let local_symbol_id = object
+                        .symbol_id_range
+                        .input_to_id(SymbolIndex(info.r_symbolnum as usize));
+                    let symbol_id = resources.symbol_db.definition(local_symbol_id);
+
+                    resources
+                        .per_symbol_flags
+                        .get_atomic(symbol_id)
+                        .fetch_or(ValueFlags::GOT_ENTRY_REQUIRED);
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -2705,7 +2858,7 @@ const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
     SectionRule::prefix_section(b"__objc_meth", crate::output_section_id::CSTRING),
     SectionRule::exact_section(b"__objc_classname", crate::output_section_id::CSTRING),
     SectionRule::exact_section(b"__const", crate::output_section_id::CONST),
-    SectionRule::exact_section_keep(
+    SectionRule::exact_section(
         b"__gcc_except_tab",
         crate::output_section_id::GCC_EXCEPT_TABLE,
     ),
@@ -2717,10 +2870,9 @@ const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
     // definition and would be dropped: dyld finds the initialiser lists from the section type, and
     // `__unwind_info` reaches into `__eh_frame` by offset rather than through a symbol.
     //
-    // `__gcc_except_tab` is a root for a narrower reason: the only thing naming a landing pad is a
-    // `__compact_unwind` entry, and those name it with a section-relative relocation, which the
-    // reachability walk doesn't follow. Keeping it whole is larger than ld64's output but correct;
-    // making it droppable needs the walk to follow those relocations first.
+    // `__gcc_except_tab` is not among them. The only thing naming a landing pad is a
+    // `__compact_unwind` entry, and those are now followed once the function they describe turns
+    // out to be live, so a table is kept exactly when something can still reach it.
     SectionRule::exact_section_keep(b"__mod_init_func", crate::output_section_id::INIT_ARRAY),
     SectionRule::exact_section_keep(b"__mod_term_func", crate::output_section_id::FINI_ARRAY),
     SectionRule::exact_section(b"__common", crate::output_section_id::COMMON),

@@ -2608,6 +2608,28 @@ impl LocalWorkQueue {
         );
     }
 
+    /// Requests that a section be loaded, for a reference that names the section itself rather than
+    /// a symbol in it.
+    ///
+    /// Mach-O reaches a landing pad this way: a `__compact_unwind` entry names its
+    /// language-specific data area by section and offset, there being no symbol there to name.
+    /// Without this the table would be dropped as unreachable and unwinding would run off the
+    /// end of it.
+    pub(crate) fn send_section_request<'data, 'scope, A: Arch>(
+        &mut self,
+        file_id: FileId,
+        section_index: SectionIndex,
+        resources: &'scope GraphResources<'data, '_, A::Platform>,
+        scope: &Scope<'scope>,
+    ) {
+        self.send_work::<A>(
+            resources,
+            file_id,
+            WorkItem::LoadSection(SectionLoadRequest::new(file_id, section_index)),
+            scope,
+        );
+    }
+
     pub(crate) fn send_copy_relocation_request<'data, 'scope, A: Arch>(
         &mut self,
         symbol_id: SymbolId,
