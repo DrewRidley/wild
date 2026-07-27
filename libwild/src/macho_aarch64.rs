@@ -172,6 +172,31 @@ impl crate::platform::Arch for MachOAArch64 {
                     1,
                 )
             }
+            // A thread-local reference names the variable's `tlv_descriptor` in `__thread_vars`
+            // rather than the variable itself. The addressing sequence is the same shape as a GOT
+            // load, and because the descriptor is always defined in this image, it relaxes the
+            // same way - see `relax_got_load`.
+            object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21 => {
+                debug_assert_eq!(rel_kind, RelocationKind::Relative);
+                debug_assert_eq!(rel_size, RelocationSize::ByteSize(4));
+                (
+                    RelocationKind::GotRelative,
+                    RelocationSize::bit_mask_aarch64(12, 33, AArch64Instruction::Adr),
+                    Some(PageMask::SymbolPlusAddendAndPosition(PAGE_MASK_4KB)),
+                    AllowedRange::from_bit_size(33, Sign::Signed),
+                    1,
+                )
+            }
+            object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => {
+                debug_assert_eq!(rel_size, RelocationSize::ByteSize(4));
+                (
+                    RelocationKind::Got,
+                    RelocationSize::bit_mask_aarch64(0, 12, AArch64Instruction::MachOLow12),
+                    None,
+                    AllowedRange::no_check(),
+                    1,
+                )
+            }
             object::macho::ARM64_RELOC_POINTER_TO_GOT => {
                 // Stores the address of the symbol's GOT entry rather than the symbol itself.
                 // When PC-relative it's the usual 4-byte delta from the place, which is what
@@ -203,12 +228,14 @@ impl crate::platform::Arch for MachOAArch64 {
         match rel.r_type {
             // The ADRP half needs no rewrite: it forms a page address either way, and the
             // relocation value it is given is now the symbol's page rather than the GOT slot's.
-            object::macho::ARM64_RELOC_GOT_LOAD_PAGE21 => Ok(()),
+            object::macho::ARM64_RELOC_GOT_LOAD_PAGE21
+            | object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21 => Ok(()),
 
             // `ldr xD, [xN, #imm]` becomes `add xD, xN, #imm`. Rn/Rd are kept; the immediate is
             // filled in afterwards by `AArch64Instruction::MachOLow12`, which derives its scaling
             // from the opcode, so the opcode has to be rewritten first.
-            object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => {
+            object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+            | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => {
                 let bytes: [u8; 4] = instruction
                     .get(..4)
                     .and_then(|b| b.try_into().ok())
@@ -217,8 +244,8 @@ impl crate::platform::Arch for MachOAArch64 {
 
                 ensure!(
                     value & LDR_UIMM_MASK == LDR_UIMM_64,
-                    "Expected a 64-bit LDR (immediate) for ARM64_RELOC_GOT_LOAD_PAGEOFF12, \
-                     found instruction 0x{value:08x}"
+                    "Expected a 64-bit LDR (immediate) for {}, found instruction 0x{value:08x}",
+                    Self::rel_type_to_string(rel),
                 );
 
                 let relaxed = ADD_IMM_64 | (value & !LDR_UIMM_MASK);

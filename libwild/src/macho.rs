@@ -789,7 +789,10 @@ fn mapped_segment_type(section_id: crate::output_section_id::OutputSectionId) ->
         | output_section_id::CONST
         | output_section_id::GCC_EXCEPT_TABLE
         | output_section_id::PLT_GOT => SegmentType::TextSections,
-        output_section_id::DATA => SegmentType::DataSections,
+        output_section_id::DATA
+        | output_section_id::THREAD_VARS
+        | output_section_id::TDATA
+        | output_section_id::TBSS => SegmentType::DataSections,
         output_section_id::GOT => SegmentType::DataConstSections,
         output_section_id::CHAINED_FIXUP_TABLE
         | output_section_id::SYMTAB_GLOBAL
@@ -1708,6 +1711,10 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::GCC_EXCEPT_TABLE);
         builder.add_section(output_section_id::PLT_GOT);
         builder.add_section(output_section_id::DATA);
+        // ld64 puts the descriptors ahead of the thread-local data they point at.
+        builder.add_section(output_section_id::THREAD_VARS);
+        builder.add_section(output_section_id::TDATA);
+        builder.add_section(output_section_id::TBSS);
         builder.add_section(output_section_id::GOT);
         // The rest (e.g. symbol table, string table).
         builder.add_section(output_section_id::STRTAB);
@@ -1877,6 +1884,21 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         section_flags: macho::S_REGULAR.to_flags(),
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::THREAD_VARS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__thread_vars")),
+        section_flags: macho::S_THREAD_LOCAL_VARIABLES.to_flags(),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::TDATA.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__thread_data")),
+        section_flags: macho::S_THREAD_LOCAL_REGULAR.to_flags(),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::TBSS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__thread_bss")),
+        section_flags: macho::S_THREAD_LOCAL_ZEROFILL.to_flags(),
+        ..DEFAULT_DEFS
+    };
 
     defs
 };
@@ -1957,6 +1979,9 @@ const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
         crate::output_section_id::GCC_EXCEPT_TABLE,
     ),
     SectionRule::exact_section_keep(b"__data", crate::output_section_id::DATA),
+    SectionRule::exact_section_keep(b"__thread_vars", crate::output_section_id::THREAD_VARS),
+    SectionRule::exact_section_keep(b"__thread_data", crate::output_section_id::TDATA),
+    SectionRule::exact_section_keep(b"__thread_bss", crate::output_section_id::TBSS),
     // SectionRule::exact_section_keep(b"__compact_unwind", crate::output_section_id::EH_FRAME),
 ];
 

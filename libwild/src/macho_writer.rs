@@ -136,6 +136,7 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
 ) -> Result {
     timing_phase!("Write data to file");
     warn_if_unwind_info_needed(layout);
+    reject_incomplete_thread_locals(layout)?;
 
     let (mut section_buffers, mut padding) =
         split_output_into_sections(layout, &mut sized_output.out);
@@ -216,6 +217,29 @@ fn warn_if_unwind_info_needed(layout: &MachOLayout<'_>) {
              exception will call terminate",
         );
     }
+}
+
+/// Fails the link when the output contains thread-local variables.
+///
+/// The addressing side of thread-local storage works: `__thread_vars`, `__thread_data` and
+/// `__thread_bss` are laid out into `__DATA`, and the TLVP relocation pair relaxes to a direct
+/// reference to the descriptor exactly as ld64 does. What is missing is the descriptor contents.
+/// Each `tlv_descriptor` needs its first word bound to `__tlv_bootstrap` in libSystem, and its
+/// third word holding the variable's offset within the thread-local block rather than an address -
+/// we currently emit a rebase for both, so the binary builds and then takes SIGBUS on first use.
+///
+/// Refusing to write the file keeps that from looking like a working link. Remove this once the
+/// descriptors are filled in properly.
+fn reject_incomplete_thread_locals(layout: &MachOLayout<'_>) -> Result {
+    let thread_vars = layout.section_layouts.get(output_section_id::THREAD_VARS);
+
+    ensure!(
+        thread_vars.mem_size == 0,
+        "thread-local variables are not supported yet: the __thread_vars descriptors would need \
+         binding to __tlv_bootstrap and a thread-block offset, and wild does not emit either yet"
+    );
+
+    Ok(())
 }
 
 fn write_file<'data, A: Arch<Platform = MachO>>(

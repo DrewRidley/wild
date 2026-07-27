@@ -149,8 +149,11 @@ pub(crate) const DATA_REL_RO: OutputSectionId = OutputSectionId::regular(14);
 // Mach-O specific sections
 pub(crate) const CSTRING: OutputSectionId = OutputSectionId::regular(15);
 pub(crate) const CONST: OutputSectionId = OutputSectionId::regular(16);
+/// Mach-O `__DATA,__thread_vars`, which holds one `tlv_descriptor` per thread-local variable.
+/// The thread-local data itself lives in TDATA / TBSS, as it does for ELF.
+pub(crate) const THREAD_VARS: OutputSectionId = OutputSectionId::regular(17);
 
-pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 17;
+pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 18;
 
 #[derive(Debug)]
 pub(crate) struct OutputSections<'data, P: Platform> {
