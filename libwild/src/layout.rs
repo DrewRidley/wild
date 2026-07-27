@@ -4181,14 +4181,21 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
             .context("Cannot parse .riscv.attributes section")?;
         }
 
-        let export_all_dynamic = resources.symbol_db.output_kind == OutputKind::SharedObject
-            && (!self.input.has_archive_semantics()
-                || resources
-                    .symbol_db
-                    .args
-                    .should_export_dynamic(self.input.lib_name()))
-            || resources.symbol_db.output_kind.needs_dynsym()
-                && resources.symbol_db.args.should_export_all_dynamic_symbols();
+        // A list of symbols to export is a statement about what the output offers, and on formats
+        // where it narrows rather than adds, saying "export everything" over the top of it would
+        // hand out exactly what the list was written to withhold.
+        let restricted_by_export_list = resources.symbol_db.export_list.is_some()
+            && resources.symbol_db.args.export_list_restricts_exports();
+
+        let export_all_dynamic = !restricted_by_export_list
+            && (resources.symbol_db.output_kind == OutputKind::SharedObject
+                && (!self.input.has_archive_semantics()
+                    || resources
+                        .symbol_db
+                        .args
+                        .should_export_dynamic(self.input.lib_name()))
+                || resources.symbol_db.output_kind.needs_dynsym()
+                    && resources.symbol_db.args.should_export_all_dynamic_symbols());
         if export_all_dynamic
             || resources.symbol_db.output_kind.needs_dynsym()
                 && resources.symbol_db.export_list.is_some()

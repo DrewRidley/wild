@@ -1399,6 +1399,16 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
         &[]
     }
 
+    /// Whether a list of symbols to export narrows what a shared object offers, rather than only
+    /// adding to what an executable offers.
+    ///
+    /// On ELF a shared object exports everything and a version script is what takes things away, so
+    /// the list only ever adds. Mach-O has no version scripts: `-exported_symbols_list` is the way
+    /// to narrow a dylib, and a dylib that ignored it would offer everything it defines.
+    fn export_list_restricts_exports(&self) -> bool {
+        false
+    }
+
     fn force_export_symbol_names(&self) -> &[String] {
         &[]
     }

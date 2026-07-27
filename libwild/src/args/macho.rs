@@ -41,6 +41,12 @@ pub struct MachOArgs {
     /// will accept. Both default to 0.0.0, as ld64's do.
     pub(crate) current_version: Option<SemanticVersion>,
     pub(crate) compatibility_version: Option<SemanticVersion>,
+    /// Symbols to resolve as though something had referenced them, from `-u`.
+    pub(crate) undefined: Vec<String>,
+    /// Symbols to export whatever else says otherwise, from `-exported_symbol`.
+    pub(crate) exported_symbols: Vec<String>,
+    /// Whether every archive member is to be loaded, referenced or not.
+    pub(crate) all_load: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +85,99 @@ const SILENTLY_IGNORED_FLAGS: &[&str] = &[
     // Mach-O appears to always demangle symbols.
     "demangle",
     "dynamic",
+    // Diagnostics. They ask ld64 to say more about what it did; saying nothing extra is a fair
+    // answer and changes nothing about the output.
+    "v",
+    "t",
+    "w",
+    "why_load",
+    "whyload",
+    "warn_unused_dylibs",
+    "warn_compact_unwind",
+    "no_warn_duplicate_libraries",
+    // ld64's default since Xcode 4, and ours: a `-L` directory is searched before the system ones.
+    "search_paths_first",
+    // Reserve room in the header so `install_name_tool` can lengthen paths later. It costs padding
+    // and buys nothing at link time; a later retrofit may find less slack than it wanted, which is
+    // that tool's error to report rather than ours to pre-empt.
+    "headerpad_max_install_names",
+    // Strip debug symbols, and strip local symbols. We emit no debug map at all, so the first is
+    // already true, and keeping locals only makes the symbol table larger than asked - never
+    // wrong, and never something the loader reads.
+    "S",
+    "x",
+    // Marks the image as safe to use from an app extension. ld64 sets a header bit and checks the
+    // APIs used against a list; we do neither, and the bit is advisory.
+    "application_extension",
+    "no_application_extension",
+    // We emit `LC_UUID` with no meaningful content, so being asked not to identify the build
+    // uniquely is already satisfied.
+    "no_uuid",
+    // Asking for what we already do: every image we produce is position-independent.
+    "pie",
+];
+
+/// Flags that take a value and that we can disregard along with it, for the reasons above.
+const SILENTLY_IGNORED_FLAGS_WITH_PARAM: &[&str] = &[
+    // The name the whole (possibly multi-architecture) output will end up under. ld64 uses it only
+    // to guess an install name for a dylib that wasn't given one; we require `-install_name`.
+    "final_output",
+    // Where to leave the object files LTO produces. We don't run LTO.
+    "object_path_lto",
+    // An explicit header padding size - see `headerpad_max_install_names`.
+    "headerpad",
+    // What to do about a symbol defined more than once. Deprecated in ld64, and our answer is
+    // fixed: the first definition wins.
+    "multiply_defined",
+    "multiply_defined_unused",
+];
+
+/// Flags we recognise but can't honour, and why. Saying so beats "unrecognized option": the
+/// difference between a flag we've never heard of and one whose meaning we can't deliver is the
+/// difference between a typo and a missing feature.
+const UNSUPPORTED_FLAGS: &[(&str, &str)] = &[
+    ("static", "we only produce dynamically linked images"),
+    ("no_pie", "we only produce position-independent images"),
+    (
+        "no_fixup_chains",
+        "we only produce chained fixups, not the older rebase and bind opcodes",
+    ),
+    ("bundle", "we only produce executables and dylibs"),
+    ("bundle_loader", "we only produce executables and dylibs"),
+    (
+        "ObjC",
+        "we don't yet load archive members for the Objective-C metadata they define, and \
+         quietly leaving them out would break categories at run time rather than at link time",
+    ),
+    (
+        "undefined",
+        "we always treat an unresolved symbol as an error",
+    ),
+    ("map", "we don't write a link map"),
+    ("order_file", "we don't order functions by a supplied list"),
+    ("sectcreate", "we don't add sections from a file"),
+    ("filelist", "we don't read input filenames from a file"),
+    (
+        "unexported_symbols_list",
+        "we don't yet hide symbols by list; use -exported_symbols_list to say what to keep",
+    ),
+    (
+        "weak_framework",
+        "we don't yet record a framework as weakly referenced, and recording it strongly would \
+         make a missing one fatal at startup",
+    ),
+    (
+        "weak_library",
+        "we don't yet record a library as weakly referenced",
+    ),
+    (
+        "reexport_library",
+        "we don't pass on what a dependency exports as though it were ours",
+    ),
+    ("sub_library", "we don't record sub-library relationships"),
+    ("stack_size", "we don't set a non-default stack size"),
+    ("image_base", "we don't set a non-default base address"),
+    ("segprot", "we don't override segment protections"),
 ];
 
 const IGNORED_FLAGS: &[&str] = &[];
@@ -110,6 +209,9 @@ impl Default for MachOArgs {
             framework_search_path: Vec::new(),
             current_version: None,
             compatibility_version: None,
+            undefined: Vec::new(),
+            exported_symbols: Vec::new(),
+            all_load: false,
         }
     }
 }
@@ -152,6 +254,18 @@ impl platform::Args for MachOArgs {
 
     fn framework_search_path(&self) -> &[Box<std::path::Path>] {
         &self.framework_search_path
+    }
+
+    fn force_undefined_symbol_names(&self) -> &[String] {
+        &self.undefined
+    }
+
+    fn force_export_symbol_names(&self) -> &[String] {
+        &self.exported_symbols
+    }
+
+    fn export_list_restricts_exports(&self) -> bool {
+        true
     }
 
     fn common(&self) -> &crate::args::CommonArgs {
@@ -227,8 +341,29 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
     }
 
     if !args.common.unrecognized_options.is_empty() {
-        let options_list = args.common.unrecognized_options.join(", ");
-        bail!("unrecognized option(s): {}", options_list);
+        let described = args
+            .common
+            .unrecognized_options
+            .iter()
+            .map(|option| {
+                let name = option.trim_start_matches('-');
+                match UNSUPPORTED_FLAGS.iter().find(|(flag, _)| *flag == name) {
+                    Some((_, reason)) => format!("{option} is not supported: {reason}"),
+                    None => format!("unrecognized option: {option}"),
+                }
+            })
+            .join("\n");
+
+        bail!("{described}");
+    }
+
+    // `-all_load` isn't positional the way `--whole-archive` is - it says every archive in the
+    // link is to be taken whole, wherever it was named - so it's applied once everything has been
+    // seen rather than to whatever followed it.
+    if args.all_load {
+        for input in &mut args.common.inputs {
+            input.modifiers.whole_archive = true;
+        }
     }
 
     Ok(())
@@ -437,6 +572,51 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
 
     parser
         .declare_with_param()
+        .short("u")
+        .help("Resolve this symbol as though something had referenced it")
+        .execute(|args, _modifier_stack, value| {
+            args.undefined.push(value.to_owned());
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("exported_symbol")
+        .help("Export this symbol")
+        .execute(|args, _modifier_stack, value| {
+            args.exported_symbols.push(value.to_owned());
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("all_load")
+        .help("Load every member of every archive, referenced or not")
+        .execute(|args, _modifier_stack| {
+            args.all_load = true;
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("force_load")
+        .help("Load every member of this archive, referenced or not")
+        .execute(|args, modifier_stack, value| {
+            args.common_mut().save_dir.handle_file(value);
+
+            let mut modifiers = *modifier_stack.last().unwrap();
+            modifiers.whole_archive = true;
+
+            args.common_mut().inputs.push(Input {
+                spec: InputSpec::File(Box::from(Path::new(value))),
+                search_first: None,
+                modifiers,
+            });
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
         .long("current_version")
         .help("The version this dylib declares itself to be")
         .execute(|args, _modifier_stack, value| {
@@ -493,6 +673,12 @@ fn add_silently_ignored_flags(parser: &mut ArgumentParser<MachOArgs>) {
         let mut declaration = parser.declare();
         declaration = declaration.long(flag);
         declaration.execute(|_args, _modifier_stack| Ok(()));
+    }
+
+    for flag in SILENTLY_IGNORED_FLAGS_WITH_PARAM {
+        let mut declaration = parser.declare_with_param();
+        declaration = declaration.long(flag);
+        declaration.execute(|_args, _modifier_stack, _value| Ok(()));
     }
 }
 
