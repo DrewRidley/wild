@@ -158,7 +158,7 @@ type SectionHeader = Section64<crate::macho::Endianness>;
 type SectionTable<'data> = &'data [Section64<crate::macho::Endianness>];
 type SymbolTable<'data> = object::read::macho::SymbolTable<'data, macho::MachHeader64<Endianness>>;
 type SymtabEntry = object::macho::Nlist64<Endianness>;
-type Relocation = object::macho::Relocation<Endianness>;
+pub(crate) type Relocation = object::macho::Relocation<Endianness>;
 
 pub(crate) type FileHeader = object::macho::MachHeader64<Endianness>;
 pub(crate) type SegmentCommand = object::macho::SegmentCommand64<Endianness>;
@@ -238,24 +238,41 @@ pub(crate) struct FinaliseSizesExt {
     imported_symbols: Vec<SymbolId>,
 }
 
-/// One `__LD,__compact_unwind` entry, held against the function it describes rather than counted
-/// where it was found.
+/// One piece of unwind data, held against the function it describes rather than counted where it
+/// was found.
 ///
-/// An entry only earns its place in `__unwind_info` if that function is still in the output, and
-/// what it points at - a personality routine, a language-specific data area - is only worth keeping
-/// for the same reason. Reaching them from here rather than from the section means the unwind data
-/// follows the code instead of anchoring it.
+/// Both kinds of unwind data an object can carry end up here: a `__LD,__compact_unwind` entry,
+/// which becomes a row of `__unwind_info`, and an `__eh_frame` FDE, which is copied through for the
+/// functions `__unwind_info` can't describe compactly. Neither earns its place unless the function
+/// is still in the output, and what it points at - a personality routine, a language-specific data
+/// area - is only worth keeping for the same reason. Reaching them from here rather than from the
+/// section means the unwind data follows the code instead of anchoring it.
 #[derive(Debug)]
-pub(crate) struct UnwindEntry {
-    /// Where this entry's relocations sit in `ObjectLayoutStateExt::unwind_relocations`.
+pub(crate) struct FrameEntry {
+    /// Where this entry's relocations sit in `ObjectLayoutStateExt::frame_relocations`.
     relocations: Range<u32>,
 
-    /// The `__compact_unwind` section the entry was read from, needed to reach those relocations
-    /// again once the function turns out to be live.
-    compact_unwind_section_index: object::SectionIndex,
+    /// The section the entry was read from, needed to reach those relocations again once the
+    /// function turns out to be live.
+    section_index: object::SectionIndex,
 
-    /// The entry before this one for the same function, if it has more than one.
+    /// The entry before this one for the same function. A function commonly has both a compact
+    /// entry and an FDE, and can have several of either.
     previous_frame_for_section: Option<platform::FrameIndex>,
+
+    kind: FrameKind,
+}
+
+#[derive(Debug)]
+enum FrameKind {
+    /// A 32-byte `__compact_unwind` entry, which costs a fixed-size row of `__unwind_info`.
+    CompactUnwind,
+
+    /// An `__eh_frame` FDE, which costs its own bytes because it is copied through verbatim.
+    Fde {
+        /// The whole record, length field included.
+        size: u32,
+    },
 }
 
 /// Returns the section holding the function a `__compact_unwind` entry describes.
@@ -294,13 +311,329 @@ fn compact_unwind_target_section(
         .atom_for_address(object::SectionIndex(section_index), stored))
 }
 
+/// The name Mach-O gives the DWARF call-frame-information section.
+pub(crate) const EH_FRAME_SECTION_NAME: &[u8] = b"__eh_frame";
+
+/// Where `__eh_frame` content is allocated. Records are copied whole and in input order, so a
+/// single part is all that's needed - the alignment is the section's, not any record's.
+pub(crate) const EH_FRAME_PART_ID: crate::part_id::PartId =
+    output_section_id::MACHO_EH_FRAME.part_id_with_alignment(alignment::USIZE);
+
+/// Where an FDE says which function it describes, as a distance from that field.
+pub(crate) const FDE_PC_BEGIN_OFFSET: u32 = 8;
+
+/// One record of an `__eh_frame` section.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EhFrameRecord {
+    pub(crate) offset: u32,
+
+    /// The whole record, its length field included.
+    pub(crate) size: u32,
+
+    /// Where this FDE's CIE starts, or `None` if the record is itself a CIE.
+    pub(crate) cie_offset: Option<u32>,
+}
+
+/// Splits an `__eh_frame` section into its records.
+///
+/// The format is self-describing - a length, then a field that is zero for a CIE and otherwise says
+/// how far back the FDE's CIE sits - so walking it needs no relocations and gives the same answer
+/// during layout and during writing, which is what lets the two agree on what is being emitted.
+pub(crate) fn eh_frame_records(data: &[u8]) -> Result<Vec<EhFrameRecord>> {
+    const PREFIX_LEN: usize = 2 * size_of::<u32>();
+
+    let mut records = Vec::new();
+    let mut offset = 0;
+
+    while offset + PREFIX_LEN <= data.len() {
+        let length = u32::from_le_bytes(data[offset..offset + 4].try_into()?);
+
+        // The end marker. Anything after it isn't a record; lld stops here and so do we.
+        if length == 0 {
+            break;
+        }
+
+        ensure!(
+            length != u32::MAX,
+            "__eh_frame record at {offset:#x} uses the 64-bit length form, which we don't support"
+        );
+
+        let size = size_of::<u32>() + length as usize;
+        let end = offset
+            .checked_add(size)
+            .context("__eh_frame record length overflows")?;
+
+        ensure!(
+            end <= data.len(),
+            "__eh_frame record at {offset:#x} runs past the end of the section"
+        );
+
+        let cie_id = u32::from_le_bytes(data[offset + 4..offset + 8].try_into()?);
+
+        // An FDE stores how far back its CIE is from the field holding that distance, which is why
+        // the same CIE is named by a different value in every FDE that extends it.
+        let cie_offset = if cie_id == 0 {
+            None
+        } else {
+            Some(
+                (offset as u32 + size_of::<u32>() as u32)
+                    .checked_sub(cie_id)
+                    .with_context(|| {
+                        format!("FDE at {offset:#x} names a CIE before the start of __eh_frame")
+                    })?,
+            )
+        };
+
+        records.push(EhFrameRecord {
+            offset: offset as u32,
+            size: size as u32,
+            cie_offset,
+        });
+
+        offset = end;
+    }
+
+    Ok(records)
+}
+
+/// Groups a frame section's relocations by the record they land in.
+///
+/// They are written in descending address order by clang and nothing requires any order at all, so
+/// they are bucketed rather than sliced.
+pub(crate) fn relocations_by_record(
+    records: &[EhFrameRecord],
+    relocations: &[Relocation],
+) -> Vec<Vec<u32>> {
+    let mut by_record: Vec<Vec<u32>> = vec![Vec::new(); records.len()];
+
+    for (index, relocation) in relocations.iter().enumerate() {
+        let address = relocation.info(LE).r_address;
+
+        let Some(record_index) = records
+            .partition_point(|record| record.offset <= address)
+            .checked_sub(1)
+        else {
+            continue;
+        };
+
+        let record = &records[record_index];
+
+        if address < record.offset + record.size {
+            by_record[record_index].push(index as u32);
+        }
+    }
+
+    by_record
+}
+
+/// Accounts for one input `__eh_frame` section.
+///
+/// The FDEs are hung off the functions they describe and cost nothing yet; the CIEs are recorded
+/// whole, since they are shared and small, and are paid for later if any FDE of this object turns
+/// out to be worth keeping.
+fn load_eh_frame<'data, 'scope, A: platform::Arch<Platform = MachO>>(
+    object: &mut crate::layout::ObjectLayoutState<'data, MachO>,
+    section_index: object::SectionIndex,
+    resources: &'scope crate::layout::GraphResources<'data, '_, MachO>,
+    queue: &mut crate::layout::LocalWorkQueue,
+    scope: &rayon::Scope<'scope>,
+) -> Result {
+    let section = object.object.section(section_index)?;
+    let data = object.object.raw_section_data(section)?;
+    let records = eh_frame_records(data)?;
+
+    let relocations = object
+        .object
+        .relocations(section_index, &object.relocations)?
+        .relocations;
+
+    let by_record = relocations_by_record(&records, relocations);
+
+    for (record, bucket) in records.iter().zip(by_record) {
+        let Some(_cie_offset) = record.cie_offset else {
+            object.format_specific.cie_bytes += u64::from(record.size);
+
+            // A CIE names its personality routine through the GOT. We keep every CIE of an object
+            // that contributes any FDE at all, so there is no later moment at which to ask this -
+            // and a personality that only a dropped CIE named costs one unused slot, not
+            // correctness.
+            for &index in &bucket {
+                process_relocation::<A>(
+                    object,
+                    &relocations[index as usize],
+                    section_index,
+                    resources,
+                    queue,
+                    scope,
+                )?;
+            }
+
+            continue;
+        };
+
+        let pc_begin = record.offset + FDE_PC_BEGIN_OFFSET;
+
+        let info = bucket
+            .iter()
+            .map(|&index| relocations[index as usize].info(LE))
+            .find(|info| {
+                info.r_address == pc_begin && info.r_type == object::macho::ARM64_RELOC_UNSIGNED
+            })
+            .with_context(|| {
+                format!(
+                    "FDE at {:#x} of `{}` has no relocation naming the function it describes",
+                    record.offset,
+                    object.object.section_display_name(section_index)
+                )
+            })?;
+
+        // Unlike a `__compact_unwind` entry, an FDE stores a distance rather than an address, so
+        // there is nothing to look the function up by if the relocation doesn't name it outright.
+        ensure!(
+            info.r_extern,
+            "FDE at {:#x} of `{}` names its function by section rather than by symbol",
+            record.offset,
+            object.object.section_display_name(section_index)
+        );
+
+        let symbol_index = SymbolIndex(info.r_symbolnum as usize);
+        let symbol = object.object.symbol(symbol_index)?;
+
+        let Some(target_section_index) = object.object.symbol_section(symbol, symbol_index)? else {
+            continue;
+        };
+
+        let Some(unloaded) = object.sections[target_section_index.0].unloaded_mut() else {
+            // Already loaded, or not a section that can hold code. Either way there is no
+            // pending-load slot to hang this on.
+            continue;
+        };
+
+        let frame_index =
+            platform::FrameIndex::from_usize(object.format_specific.frame_entries.len());
+        let previous_frame_for_section = unloaded.last_frame_index.replace(frame_index);
+
+        // The anchor the pc-begin and landing-pad fields are measured from is a symbol in this very
+        // section. Following it would ask for `__eh_frame` to be loaded as though it were ordinary
+        // data, which is exactly the anchoring this is here to remove, and it tells us nothing: the
+        // writer resolves those fields from where the record lands.
+        let start = object.format_specific.frame_relocations.len() as u32;
+
+        for index in bucket {
+            let info = relocations[index as usize].info(LE);
+
+            if info.r_extern {
+                let symbol_index = SymbolIndex(info.r_symbolnum as usize);
+                let symbol = object.object.symbol(symbol_index)?;
+
+                if object.object.symbol_section(symbol, symbol_index)? == Some(section_index) {
+                    continue;
+                }
+            }
+
+            object.format_specific.frame_relocations.push(index);
+        }
+
+        let end = object.format_specific.frame_relocations.len() as u32;
+
+        object.format_specific.frame_entries.push(FrameEntry {
+            relocations: start..end,
+            section_index,
+            previous_frame_for_section,
+            kind: FrameKind::Fde { size: record.size },
+        });
+    }
+
+    Ok(())
+}
+
+/// Accounts for one input `__LD,__compact_unwind` section.
+///
+/// Each entry describes one function and becomes one row of the `__unwind_info` table we build in
+/// its place. Nothing is read here beyond which function that is.
+fn load_compact_unwind(
+    object: &mut crate::layout::ObjectLayoutState<'_, MachO>,
+    section_index: object::SectionIndex,
+) -> Result {
+    let section = object.object.section(section_index)?;
+    let data = object.object.raw_section_data(section)?;
+
+    let relocations = object
+        .object
+        .relocations(section_index, &object.relocations)?
+        .relocations;
+
+    // Gather each entry's relocations by which entry they land in. They are usually written in
+    // order, but nothing requires it, so they are bucketed rather than sliced.
+    let entry_count = (data.len() as u64 / COMPACT_UNWIND_ENTRY_SIZE) as usize;
+    let mut by_entry: Vec<Vec<u32>> = vec![Vec::new(); entry_count];
+
+    for (index, relocation) in relocations.iter().enumerate() {
+        let entry = u64::from(relocation.info(LE).r_address) / COMPACT_UNWIND_ENTRY_SIZE;
+
+        if let Some(bucket) = by_entry.get_mut(entry as usize) {
+            bucket.push(index as u32);
+        }
+    }
+
+    for (entry_index, bucket) in by_entry.into_iter().enumerate() {
+        let entry_offset = entry_index as u64 * COMPACT_UNWIND_ENTRY_SIZE;
+
+        // The function is named by the relocation at the start of the entry. Without one there
+        // is nothing to hang the entry on, so it can never be reached and is dropped.
+        let Some(target_section_index) = bucket
+            .iter()
+            .map(|&index| relocations[index as usize].info(LE))
+            .find(|info| u64::from(info.r_address) == entry_offset)
+            .and_then(|info| compact_unwind_target_section(object, info, data).transpose())
+            .transpose()?
+        else {
+            continue;
+        };
+
+        let Some(unloaded) = object.sections[target_section_index.0].unloaded_mut() else {
+            // Already loaded, or not a section that can hold code. Either way there is no
+            // pending-load slot to hang this on.
+            continue;
+        };
+
+        let frame_index =
+            platform::FrameIndex::from_usize(object.format_specific.frame_entries.len());
+        let previous_frame_for_section = unloaded.last_frame_index.replace(frame_index);
+
+        let start = object.format_specific.frame_relocations.len() as u32;
+        object.format_specific.frame_relocations.extend(bucket);
+        let end = object.format_specific.frame_relocations.len() as u32;
+
+        object.format_specific.frame_entries.push(FrameEntry {
+            relocations: start..end,
+            section_index,
+            previous_frame_for_section,
+            kind: FrameKind::CompactUnwind,
+        });
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ObjectLayoutStateExt {
-    unwind_entries: Vec<UnwindEntry>,
+    /// Indexed by `platform::FrameIndex`, and threaded into per-function chains through
+    /// `UnloadedSection::last_frame_index`.
+    frame_entries: Vec<FrameEntry>,
 
     /// Relocation indices grouped by entry. The relocations of one entry need not be adjacent in
     /// the section's own list, so they are gathered here and each entry keeps a range into it.
-    unwind_relocations: Vec<u32>,
+    frame_relocations: Vec<u32>,
+
+    /// How many bytes this object's CIEs come to. An FDE is useless without the CIE it names, and
+    /// a CIE is a few dozen bytes shared by all of them, so they are not worth dead-stripping
+    /// individually - but an object none of whose FDEs survived contributes none of them either.
+    cie_bytes: u64,
+
+    /// How many bytes of `__eh_frame` this object contributes: its surviving FDEs, plus its CIEs
+    /// once at least one FDE has earned them.
+    eh_frame_size: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1527,16 +1860,15 @@ impl platform::Platform for MachO {
     ) -> Self::GroupLayoutExt {
     }
 
-    /// The address a `__compact_unwind` section would have been given, had we emitted one.
+    /// Where this object's contribution to `__eh_frame` starts.
     ///
-    /// We don't: the entries are read during layout and become `__unwind_info`, so the input
-    /// section has no place in the output and nothing resolves against its address. ELF needs this
-    /// because it copies `.eh_frame` through and its frames refer to each other by offset within
-    /// it.
+    /// The anchor symbol an FDE measures its function from is defined in `__eh_frame` itself, so it
+    /// resolves against this. `__compact_unwind` is also frame data and gets the same answer, which
+    /// costs nothing: it is consumed rather than emitted, so nothing resolves against it.
     fn frame_data_base_address(
-        _memory_offsets: &crate::output_section_part_map::OutputSectionPartMap<u64>,
+        memory_offsets: &crate::output_section_part_map::OutputSectionPartMap<u64>,
     ) -> u64 {
-        0
+        *memory_offsets.get(EH_FRAME_PART_ID)
     }
 
     fn activate_dynamic<'data>(
@@ -1560,15 +1892,24 @@ impl platform::Platform for MachO {
     }
 
     fn finalise_object_sizes<'data>(
-        _object: &mut crate::layout::ObjectLayoutState<'data, Self>,
-        _common: &mut crate::layout::CommonGroupState<'data, Self>,
+        object: &mut crate::layout::ObjectLayoutState<'data, Self>,
+        common: &mut crate::layout::CommonGroupState<'data, Self>,
     ) {
+        // An FDE is useless without the CIE it extends, so the object's CIEs come along as soon as
+        // any of its FDEs has survived - and an object all of whose functions were stripped
+        // contributes nothing at all, not even the CIEs none of them can now name.
+        if object.format_specific.eh_frame_size > 0 {
+            object.format_specific.eh_frame_size += object.format_specific.cie_bytes;
+        }
+
+        common.allocate(EH_FRAME_PART_ID, object.format_specific.eh_frame_size);
     }
 
     fn finalise_object_layout<'data>(
-        _object: &crate::layout::ObjectLayoutState<'data, Self>,
-        _memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
+        object: &crate::layout::ObjectLayoutState<'data, Self>,
+        memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
     ) {
+        memory_offsets.increment(EH_FRAME_PART_ID, object.format_specific.eh_frame_size);
     }
 
     fn finalise_layout_dynamic<'data>(
@@ -1613,10 +1954,13 @@ impl platform::Platform for MachO {
     }
 
     fn compute_object_addresses<'data>(
-        _object: &crate::layout::ObjectLayoutState<'data, Self>,
-        _memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
+        object: &crate::layout::ObjectLayoutState<'data, Self>,
+        memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
     ) {
-        todo!()
+        // `__eh_frame` isn't copied section by section like the rest, so the loop that walks an
+        // object's loaded sections steps over it. Its bytes still have to be counted here or every
+        // object after this one would be told it starts where this one does.
+        memory_offsets.increment(EH_FRAME_PART_ID, object.format_specific.eh_frame_size);
     }
 
     fn layout_resources_ext<'data>(
@@ -1826,88 +2170,31 @@ impl platform::Platform for MachO {
         Ok(layout_ext)
     }
 
-    /// Accounts for one input `__LD,__compact_unwind` section.
+    /// Accounts for one input section of unwind data.
     ///
-    /// Each entry describes one function, and becomes one entry of the `__unwind_info` table we
-    /// build in its place. Nothing is copied: what's reserved here is space in that table, and what
-    /// the relocations are walked for is the symbols they name - the personality routines in
-    /// particular, which the table reaches through the GOT and so need slots.
+    /// Two kinds reach here: `__LD,__compact_unwind`, which is consumed to build `__unwind_info`,
+    /// and `__eh_frame`, which is copied through. Neither is read for what it says about the
+    /// program - only for which function each record describes, so that the record can be hung off
+    /// that function and paid for if it survives.
     fn load_exception_frame_data<'data, 'scope, A: platform::Arch<Platform = Self>>(
         object: &mut crate::layout::ObjectLayoutState<'data, Self>,
-        common: &mut crate::layout::CommonGroupState<'data, Self>,
-        eh_frame_section_index: object::SectionIndex,
+        _common: &mut crate::layout::CommonGroupState<'data, Self>,
+        section_index: object::SectionIndex,
         resources: &'scope crate::layout::GraphResources<'data, '_, Self>,
         queue: &mut crate::layout::LocalWorkQueue,
         scope: &rayon::Scope<'scope>,
     ) -> crate::error::Result {
-        let section = object.object.section(eh_frame_section_index)?;
-        let data = object.object.raw_section_data(section)?;
-
-        let relocations = object
-            .object
-            .relocations(eh_frame_section_index, &object.relocations)?
-            .relocations;
-
-        // Gather each entry's relocations by which entry they land in. They are usually written in
-        // order, but nothing requires it, so they are bucketed rather than sliced.
-        let entry_count = (data.len() as u64 / COMPACT_UNWIND_ENTRY_SIZE) as usize;
-        let mut by_entry: Vec<Vec<u32>> = vec![Vec::new(); entry_count];
-
-        for (index, relocation) in relocations.iter().enumerate() {
-            let entry = u64::from(relocation.info(LE).r_address) / COMPACT_UNWIND_ENTRY_SIZE;
-
-            if let Some(bucket) = by_entry.get_mut(entry as usize) {
-                bucket.push(index as u32);
-            }
+        if object.object.section_name(section_index)? == EH_FRAME_SECTION_NAME {
+            return load_eh_frame::<A>(object, section_index, resources, queue, scope);
         }
 
-        for (entry_index, bucket) in by_entry.into_iter().enumerate() {
-            let entry_offset = entry_index as u64 * COMPACT_UNWIND_ENTRY_SIZE;
-
-            // The function is named by the relocation at the start of the entry. Without one there
-            // is nothing to hang the entry on, so it can never be reached and is dropped.
-            let Some(target_section_index) = bucket
-                .iter()
-                .map(|&index| relocations[index as usize].info(LE))
-                .find(|info| u64::from(info.r_address) == entry_offset)
-                .and_then(|info| compact_unwind_target_section(object, info, data).transpose())
-                .transpose()?
-            else {
-                continue;
-            };
-
-            let Some(unloaded) = object.sections[target_section_index.0].unloaded_mut() else {
-                // Already loaded, or not a section that can hold code. Either way there is no
-                // pending-load slot to hang this on.
-                continue;
-            };
-
-            let frame_index =
-                platform::FrameIndex::from_usize(object.format_specific.unwind_entries.len());
-            let previous_frame_for_section = unloaded.last_frame_index.replace(frame_index);
-
-            let start = object.format_specific.unwind_relocations.len() as u32;
-            object.format_specific.unwind_relocations.extend(bucket);
-            let end = object.format_specific.unwind_relocations.len() as u32;
-
-            object.format_specific.unwind_entries.push(UnwindEntry {
-                relocations: start..end,
-                compact_unwind_section_index: eh_frame_section_index,
-                previous_frame_for_section,
-            });
-        }
-
-        // Nothing is allocated or followed here: both wait until the function is known to be live,
-        // which `non_empty_section_loaded` is told about.
-        let _ = (common, resources, queue, scope);
-
-        Ok(())
+        load_compact_unwind(object, section_index)
     }
 
-    /// Pays for the unwind entries of a function that is staying in the output.
+    /// Pays for the unwind data of a function that is staying in the output.
     ///
-    /// This is what keeps `__unwind_info` in step with dead-stripping: the table is sized from the
-    /// functions that survive rather than from every entry that was read. Following an entry's
+    /// This is what keeps the unwind sections in step with dead-stripping: they are sized from the
+    /// functions that survive rather than from every record that was read. Following a record's
     /// relocations here rather than when it was read is what lets a language-specific data area be
     /// dropped along with the function it describes.
     fn non_empty_section_loaded<'data, 'scope, A: platform::Arch<Platform = Self>>(
@@ -1921,24 +2208,37 @@ impl platform::Platform for MachO {
         let mut next_frame_index = unloaded.last_frame_index;
 
         while let Some(frame_index) = next_frame_index {
-            let entry = &object.format_specific.unwind_entries[frame_index.as_usize()];
+            let entry = &object.format_specific.frame_entries[frame_index.as_usize()];
             next_frame_index = entry.previous_frame_for_section;
 
-            let compact_unwind_section_index = entry.compact_unwind_section_index;
-            let relocation_indices = object.format_specific.unwind_relocations
+            let frame_section_index = entry.section_index;
+            let is_compact = matches!(entry.kind, FrameKind::CompactUnwind);
+            let relocation_indices = object.format_specific.frame_relocations
                 [entry.relocations.start as usize..entry.relocations.end as usize]
                 .to_vec();
 
-            common.allocate(part_id::UNWIND_INFO, UNWIND_INFO_BYTES_PER_ENTRY);
+            match entry.kind {
+                // A row of the table, whatever the entry says.
+                FrameKind::CompactUnwind => {
+                    common.allocate(part_id::UNWIND_INFO, UNWIND_INFO_BYTES_PER_ENTRY);
+                }
+
+                // Copied through verbatim, so it costs exactly what it is. The bytes are only
+                // counted here; they're allocated in `finalise_object_sizes`, together with the
+                // CIEs that this record has now earned.
+                FrameKind::Fde { size, .. } => {
+                    object.format_specific.eh_frame_size += u64::from(size);
+                }
+            }
 
             let relocations = object
                 .object
-                .relocations(compact_unwind_section_index, &object.relocations)?
+                .relocations(frame_section_index, &object.relocations)?
                 .relocations;
 
             let data = object
                 .object
-                .raw_section_data(object.object.section(compact_unwind_section_index)?)?;
+                .raw_section_data(object.object.section(frame_section_index)?)?;
 
             for index in relocation_indices {
                 let relocation = &relocations[index as usize];
@@ -1947,16 +2247,21 @@ impl platform::Platform for MachO {
                 process_relocation::<A>(
                     object,
                     relocation,
-                    compact_unwind_section_index,
+                    frame_section_index,
                     resources,
                     queue,
                     scope,
                 )?;
 
+                if !is_compact {
+                    continue;
+                }
+
                 // A landing pad has no symbol on it, so its entry names it by section and offset,
                 // and `process_relocation` - which follows symbols - passes it by. Asking for the
                 // section directly is what keeps the table it lives in, now that the table is no
-                // longer kept unconditionally.
+                // longer kept unconditionally. An FDE reaches its landing pad through a symbol, so
+                // it needs none of this.
                 if !info.r_extern
                     && let Some(target) = compact_unwind_target_section(object, info, data)?
                 {
@@ -2879,12 +3184,11 @@ const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
     SectionRule::exact_section(b"__thread_data", crate::output_section_id::TDATA),
     SectionRule::exact_section(b"__thread_bss", crate::output_section_id::TBSS),
     // Roots. Nothing in the image refers to these, so without `keep` they are unreachable by
-    // definition and would be dropped: dyld finds the initialiser lists from the section type, and
-    // `__unwind_info` reaches into `__eh_frame` by offset rather than through a symbol.
+    // definition and would be dropped: dyld finds the initialiser lists from the section type.
     //
     // `__gcc_except_tab` is not among them. The only thing naming a landing pad is a
-    // `__compact_unwind` entry, and those are now followed once the function they describe turns
-    // out to be live, so a table is kept exactly when something can still reach it.
+    // `__compact_unwind` entry or an FDE, and those are now followed once the function they
+    // describe turns out to be live, so a table is kept exactly when something can still reach it.
     SectionRule::exact_section_keep(b"__mod_init_func", crate::output_section_id::INIT_ARRAY),
     SectionRule::exact_section_keep(b"__mod_term_func", crate::output_section_id::FINI_ARRAY),
     SectionRule::exact_section(b"__common", crate::output_section_id::COMMON),
@@ -2906,9 +3210,12 @@ const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
     // read-only segment; and the output we want from it isn't the input bytes at all, but the
     // `__unwind_info` table we build from them.
     SectionRule::exact(b"__compact_unwind", SectionRuleOutcome::EhFrame),
-    // A root, like the initialiser lists: nothing in the image refers to `__eh_frame`, because the
-    // `__unwind_info` entries that need it reach in by offset rather than by symbol.
-    SectionRule::exact_section_keep(b"__eh_frame", crate::output_section_id::MACHO_EH_FRAME),
+    // Frame data too, for the same reason and then some. Copying `__eh_frame` through as an
+    // ordinary section would make every FDE's reference to its function a reason to keep that
+    // function, which anchors the whole program: an FDE exists for anything that can be unwound
+    // through, so nothing would ever be stripped. Read as frame data, the arrow points the other
+    // way - a function that survives brings its FDE with it.
+    SectionRule::exact(b"__eh_frame", SectionRuleOutcome::EhFrame),
     // Debug info stays in the object files for `dsymutil` to collect into a .dSYM bundle; a linked
     // Mach-O image carries none of it. `__bitcode` and `__cmdline` are likewise only there to feed
     // LTO - `__bitcode` alone is 5 MiB in Rust's libstd.

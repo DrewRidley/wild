@@ -88,6 +88,10 @@ impl OffsetVerifier {
 
 fn should_ignore_alignment(part_id: PartId) -> bool {
     part_id.should_pack()
+        // Exception frames are copied whole and back to back, and their lengths only have to be a
+        // multiple of four, so what an object contributes rarely lands on the section's alignment.
+        // Both spellings of the section are like this.
+        || part_id.output_section_id() == crate::output_section_id::MACHO_EH_FRAME
         || [
             part_id::GNU_HASH,
             part_id::EH_FRAME,

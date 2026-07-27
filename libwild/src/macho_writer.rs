@@ -34,7 +34,11 @@ use crate::macho::DyldChainedFixupsCommand;
 use crate::macho::DylibCommand;
 use crate::macho::DylinkerCommand;
 use crate::macho::DysymtabCommand;
+use crate::macho::EH_FRAME_PART_ID;
+use crate::macho::EH_FRAME_SECTION_NAME;
+use crate::macho::EhFrameRecord;
 use crate::macho::EntryPointCommand;
+use crate::macho::FDE_PC_BEGIN_OFFSET;
 use crate::macho::FileHeader;
 use crate::macho::GOT_ENTRY_SIZE;
 use crate::macho::INDIRECT_SYMTAB_ENTRY_SIZE;
@@ -44,6 +48,7 @@ use crate::macho::MAX_SEGMENT_COUNT;
 use crate::macho::MachO;
 use crate::macho::PLT_ENTRY_SIZE;
 use crate::macho::PROGRAM_SEGMENT_DEFS;
+use crate::macho::Relocation as MachORelocation;
 use crate::macho::SEG_DATA_CONST;
 use crate::macho::SectionEntry;
 use crate::macho::SegmentCommand;
@@ -66,9 +71,11 @@ use crate::macho::UNWIND_SECTION_VERSION;
 use crate::macho::UuidCommand;
 use crate::macho::code_signature_identifier;
 use crate::macho::code_signature_padded_identifier_size;
+use crate::macho::eh_frame_records;
 use crate::macho::get_segment_sections;
 use crate::macho::is_no_bits_section_type;
 use crate::macho::load_dylib_command_size;
+use crate::macho::relocations_by_record;
 use crate::macho_object::CS_ADHOC;
 use crate::macho_object::CS_EXECSEG_MAIN_BINARY;
 use crate::macho_object::CS_HASHTYPE_SHA256;
@@ -921,6 +928,15 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
                     fixup_sites,
                 )?;
             }
+
+            // `__compact_unwind` is frame data too, but it's consumed rather than copied - it
+            // becomes `__unwind_info`, which is written once for the whole image.
+            SectionSlot::FrameData(section_index)
+                if object.object.section_name(*section_index)? == EH_FRAME_SECTION_NAME =>
+            {
+                write_eh_frame::<A>(object, *section_index, layout, buffers, fixup_sites)?;
+            }
+
             _ => (),
         }
     }
@@ -1531,6 +1547,10 @@ fn collect_unwind_entries(layout: &MachOLayout<'_>) -> Result<Vec<UnwindEntry>> 
                     continue;
                 };
 
+                if object.object.section_name(*section_index)? == EH_FRAME_SECTION_NAME {
+                    continue;
+                }
+
                 read_compact_unwind_section(object, *section_index, layout, &mut entries)
                     .with_context(|| format!("Failed to read __compact_unwind from {object}"))?;
             }
@@ -1555,14 +1575,19 @@ fn read_compact_unwind_section(
     let data = object.object.raw_section_data(section)?;
 
     // An entry that can't be described compactly names a DWARF frame instead, by its offset within
-    // `__eh_frame`. That offset is into *this object's* `__eh_frame`, and the output has every
-    // object's concatenated, so it has to be shifted by wherever this object's copy landed.
-    let eh_frame_delta = eh_frame_output_delta(object, layout)?;
+    // `__eh_frame`. That offset is into *this object's* `__eh_frame`, and the output holds only the
+    // frames whose functions survived, from every object at once - so the entry has to be told
+    // where its frame ended up rather than shifted by any one amount.
+    let eh_frame = eh_frame_output_offsets(object, layout)?;
 
     // A relocation names the target; the bytes it applies to hold the displacement from it. Both
     // are needed, and which field of which entry they belong to follows from the offset, so the
     // targets are gathered by offset first and the entries read from them afterwards.
     let mut targets = HashMap::new();
+
+    // Where the entry's function sits in this object, which is a different question from where it
+    // ends up and is only asked of the field at the start of an entry.
+    let mut input_functions = HashMap::new();
 
     for relocation in object
         .object
@@ -1577,6 +1602,20 @@ fn read_compact_unwind_section(
             .map_or(0, |bytes| {
                 u64::from_le_bytes(bytes.try_into().expect("slice is 8 bytes"))
             });
+
+        if u64::from(info.r_address) % COMPACT_UNWIND_ENTRY_SIZE == 0 {
+            let input_address = if info.r_extern {
+                object
+                    .object
+                    .symbol(SymbolIndex(info.r_symbolnum as usize))?
+                    .n_value
+                    .get(LE)
+            } else {
+                stored
+            };
+
+            input_functions.insert(offset as u64, input_address);
+        }
 
         let Some(address) = resolve_compact_unwind_target(object, layout, info, stored)? else {
             continue;
@@ -1600,14 +1639,35 @@ fn read_compact_unwind_section(
         let function_length = u32::from_le_bytes(entry[8..12].try_into()?);
         let mut encoding = u32::from_le_bytes(entry[12..16].try_into()?);
 
+        // The entry defers to DWARF, and the field that says which frame to read is the linker's to
+        // fill in: the assembler leaves it zero, because where the frame ends up isn't known until
+        // every object's `__eh_frame` has been merged. The two are paired by the function they
+        // describe, which is the only thing they agree on.
         if encoding & UNWIND_ARM64_MODE_MASK == UNWIND_ARM64_MODE_DWARF {
-            let input_offset = encoding & UNWIND_ARM64_DWARF_SECTION_OFFSET;
-            let output_offset = input_offset
-                .checked_add(eh_frame_delta)
-                .filter(|offset| *offset <= UNWIND_ARM64_DWARF_SECTION_OFFSET)
-                .context("__eh_frame is too large for a DWARF unwind entry to reach into")?;
+            let input_function = input_functions
+                .get(&base)
+                .copied()
+                .context("A __compact_unwind entry defers to DWARF but names no function")?;
 
-            encoding = (encoding & !UNWIND_ARM64_DWARF_SECTION_OFFSET) | output_offset;
+            // Both this entry and the frame it defers to are kept for the same reason - the
+            // function survived - so a missing frame means the two disagreed about that, and the
+            // entry would otherwise send the unwinder to whatever now sits at that offset.
+            let frame_offset = eh_frame
+                .as_ref()
+                .and_then(|eh_frame| eh_frame.fde_offset(input_function))
+                .with_context(|| {
+                    format!(
+                        "A __compact_unwind entry defers to the DWARF frame for the function at \
+                         {input_function:#x}, which isn't in the output"
+                    )
+                })?;
+
+            ensure!(
+                frame_offset <= UNWIND_ARM64_DWARF_SECTION_OFFSET,
+                "__eh_frame is too large for a DWARF unwind entry to reach into"
+            );
+
+            encoding = (encoding & !UNWIND_ARM64_DWARF_SECTION_OFFSET) | frame_offset;
         }
 
         let personality_got_address = targets
@@ -1627,37 +1687,394 @@ fn read_compact_unwind_section(
     Ok(())
 }
 
-/// Returns how far this object's `__eh_frame` sits into the output section of the same name.
+/// Which of an object's `__eh_frame` records are being emitted, and where each one lands.
 ///
-/// Zero if it has none, in which case nothing will ask.
-fn eh_frame_output_delta(
+/// Offsets are relative to the start of this object's block, which is where its records go as a
+/// run; `base` says how far that block sits into the output section.
+struct EhFramePlan {
+    base: u32,
+
+    /// The output offset of each record kept, by its input offset. Records that aren't being
+    /// emitted are absent.
+    output_offsets: HashMap<u32, u32>,
+
+    /// Where each emitted FDE landed, by the address its function has in this object. A
+    /// `__compact_unwind` entry that defers to DWARF names its function the same way, and that is
+    /// the only thing the two have in common - the entry carries no usable offset of its own.
+    fde_by_function: HashMap<u64, u32>,
+
+    /// What the object contributes, which is what layout was asked to allocate for it.
+    total: u32,
+}
+
+impl EhFramePlan {
+    /// Returns where the FDE for a function landed in the output section.
+    fn fde_offset(&self, function_input_address: u64) -> Option<u32> {
+        Some(self.base + self.fde_by_function.get(&function_input_address)?)
+    }
+}
+
+/// Decides what this object contributes to `__eh_frame`.
+///
+/// This is the writing half of the bargain layout struck: an FDE is emitted exactly when the
+/// function it describes is, which is the same question layout asked when it sized the section, and
+/// the CIEs come along if any FDE did. Both halves walk the records the same way and in the same
+/// order, so the two agree on the total without having to pass it between them.
+fn eh_frame_plan(
+    object: &ObjectLayout<'_, MachO>,
+    section_index: object::SectionIndex,
+    layout: &MachOLayout<'_>,
+) -> Result<EhFramePlan> {
+    let data = object
+        .object
+        .raw_section_data(object.object.section(section_index)?)?;
+
+    let records = eh_frame_records(data)?;
+
+    let relocations = object
+        .object
+        .relocations(section_index, &object.relocations)?
+        .relocations;
+
+    let by_record = relocations_by_record(&records, relocations);
+
+    let mut functions = vec![None; records.len()];
+    let mut any_fde = false;
+
+    for (index, (record, bucket)) in records.iter().zip(&by_record).enumerate() {
+        if record.cie_offset.is_none() {
+            continue;
+        }
+
+        functions[index] = live_fde_function(object, record, bucket, relocations)?;
+        any_fde |= functions[index].is_some();
+    }
+
+    let mut output_offsets = HashMap::new();
+    let mut fde_by_function = HashMap::new();
+    let mut total = 0;
+
+    for (index, record) in records.iter().enumerate() {
+        // A CIE is kept for the object rather than for any one FDE: they share it, it's small, and
+        // an FDE without the CIE it names is unreadable. An object that lost all its FDEs keeps
+        // none of them.
+        match functions[index] {
+            Some(function) => {
+                fde_by_function.insert(function, total);
+            }
+            None if record.cie_offset.is_none() && any_fde => {}
+            None => continue,
+        }
+
+        output_offsets.insert(record.offset, total);
+        total += record.size;
+    }
+
+    let base = if total == 0 {
+        0
+    } else {
+        let address = object
+            .section_resolutions
+            .get(section_index.0)
+            .and_then(|resolution| resolution.address())
+            .context("__eh_frame content to emit, but layout gave it no address")?;
+
+        let section_start = layout
+            .section_layouts
+            .get(output_section_id::MACHO_EH_FRAME)
+            .mem_offset;
+
+        u32::try_from(address.saturating_sub(section_start))
+            .map_err(|_| error!("__eh_frame is more than 4GiB long"))?
+    };
+
+    Ok(EhFramePlan {
+        base,
+        output_offsets,
+        fde_by_function,
+        total,
+    })
+}
+
+/// Returns this object's `__eh_frame` plan, or `None` if it has no such section.
+fn eh_frame_output_offsets(
     object: &ObjectLayout<'_, MachO>,
     layout: &MachOLayout<'_>,
-) -> Result<u32> {
-    let Some(index) = (0..object.object.num_sections()).find(|&index| {
-        object
-            .object
-            .section_name(object::SectionIndex(index))
-            .is_ok_and(|name| name == b"__eh_frame")
-    }) else {
-        return Ok(0);
-    };
+) -> Result<Option<EhFramePlan>> {
+    for slot in &object.sections {
+        let SectionSlot::FrameData(section_index) = slot else {
+            continue;
+        };
 
-    let Some(address) = object
-        .section_resolutions
-        .get(index)
-        .and_then(|resolution| resolution.address())
+        if object.object.section_name(*section_index)? == EH_FRAME_SECTION_NAME {
+            return Ok(Some(eh_frame_plan(object, *section_index, layout)?));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Returns the address the function an FDE describes has in this object, if it's in the output.
+///
+/// The address is in the object's own numbering rather than the image's, because it is only used to
+/// pair the FDE with the `__compact_unwind` entry for the same function, and that entry names it
+/// the same way. An empty section is the odd case: it can be loaded and still have no code in it,
+/// and layout only hangs unwind data off sections that turned out to be non-empty, so an FDE for
+/// one was never paid for.
+fn live_fde_function(
+    object: &ObjectLayout<'_, MachO>,
+    record: &EhFrameRecord,
+    bucket: &[u32],
+    relocations: &[MachORelocation],
+) -> Result<Option<u64>> {
+    let pc_begin = record.offset + FDE_PC_BEGIN_OFFSET;
+
+    let Some(info) = bucket
+        .iter()
+        .map(|&index| relocations[index as usize].info(LE))
+        .find(|info| {
+            info.r_address == pc_begin && info.r_type == object::macho::ARM64_RELOC_UNSIGNED
+        })
+        .filter(|info| info.r_extern)
     else {
-        return Ok(0);
+        return Ok(None);
     };
 
-    let section_start = layout
-        .section_layouts
-        .get(output_section_id::MACHO_EH_FRAME)
-        .mem_offset;
+    let symbol_index = SymbolIndex(info.r_symbolnum as usize);
+    let symbol = object.object.symbol(symbol_index)?;
 
-    u32::try_from(address.saturating_sub(section_start))
-        .map_err(|_| error!("__eh_frame is more than 4GiB long"))
+    let Some(function_section) = object.object.symbol_section(symbol, symbol_index)? else {
+        return Ok(None);
+    };
+
+    let is_live = object
+        .section_resolutions
+        .get(function_section.0)
+        .and_then(|resolution| resolution.address())
+        .is_some()
+        && object.object.section(function_section)?.size.get(LE) != 0;
+
+    Ok(is_live.then(|| symbol.n_value.get(LE)))
+}
+
+/// Applies the relocations of one `__eh_frame` record that has been copied into the output.
+///
+/// `record_out` is the record's own bytes in the output, so relocation addresses are rebased onto
+/// its start and everything is measured from where it now sits.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is a distinct piece of context"
+)]
+fn apply_eh_frame_relocations<'data, A: Arch<Platform = MachO>>(
+    object: &ObjectLayout<'data, MachO>,
+    layout: &MachOLayout<'data>,
+    record: &EhFrameRecord,
+    output_offset: u32,
+    base_address: u64,
+    section_index: object::SectionIndex,
+    bucket: &[u32],
+    relocations: &[MachORelocation],
+    record_out: &mut [u8],
+    fixup_sites: &mut Vec<FixupSite>,
+) -> Result {
+    let span = u64::from(record.offset)..u64::from(record.offset + record.size);
+    let record_address = base_address + u64::from(output_offset);
+
+    // How far the record moved. Every field an FDE stores as a distance from itself was written
+    // against the input position, so each one owes this much.
+    let moved = i64::from(record.offset) - i64::from(output_offset);
+
+    let mut index = 0;
+
+    while index < bucket.len() {
+        let Some(rel) = rebase_to_atom(relocations[bucket[index] as usize].info(LE), &span) else {
+            index += 1;
+            continue;
+        };
+
+        if rel.r_type == object::macho::ARM64_RELOC_SUBTRACTOR {
+            let minuend = bucket
+                .get(index + 1)
+                .and_then(|&next| rebase_to_atom(relocations[next as usize].info(LE), &span))
+                .filter(|next| {
+                    next.r_type == object::macho::ARM64_RELOC_UNSIGNED
+                        && next.r_address == rel.r_address
+                })
+                .with_context(|| {
+                    format!(
+                        "ARM64_RELOC_SUBTRACTOR at offset {:#x} of `{}` is not followed by a \
+                         matching ARM64_RELOC_UNSIGNED",
+                        rel.r_address,
+                        object.object.section_display_name(section_index)
+                    )
+                })?;
+
+            // Anything in `__eh_frame` measured from a symbol elsewhere would have to be corrected
+            // by however far that other section moved, which is not something the record knows.
+            // Nothing emits such a thing: the assembler anchors these to `__eh_frame` itself.
+            let subtractor_index = SymbolIndex(rel.r_symbolnum as usize);
+            let is_anchored_here = rel.r_extern
+                && object
+                    .object
+                    .symbol_section(object.object.symbol(subtractor_index)?, subtractor_index)?
+                    == Some(section_index);
+
+            ensure!(
+                is_anchored_here,
+                "ARM64_RELOC_SUBTRACTOR at offset {:#x} of `{}` is measured from outside \
+                 __eh_frame",
+                rel.r_address,
+                object.object.section_display_name(section_index)
+            );
+
+            shift_addend(record_out, minuend, moved)?;
+
+            apply_subtractor_pair(object, rel, minuend, layout, record_out)?;
+            index += 2;
+            continue;
+        }
+
+        ensure!(
+            rel.r_type != object::macho::ARM64_RELOC_ADDEND,
+            "ARM64_RELOC_ADDEND at offset {:#x} of `{}` is not something we expect in frame data",
+            rel.r_address,
+            object.object.section_display_name(section_index)
+        );
+
+        apply_relocation::<A>(
+            object,
+            record_address,
+            EH_FRAME_PART_ID,
+            rel,
+            0,
+            layout,
+            record_out,
+            fixup_sites,
+        )?;
+
+        index += 1;
+    }
+
+    Ok(())
+}
+
+/// Adds `delta` to the addend a relocation left in its slot.
+fn shift_addend(out: &mut [u8], relocation: RelocationInfo, delta: i64) -> Result {
+    if delta == 0 {
+        return Ok(());
+    }
+
+    let offset = relocation.r_address as usize;
+    let size = 1_usize << relocation.r_length;
+
+    let slot = out.get_mut(offset..offset + size).with_context(|| {
+        format!("Frame data addend at offset {offset:#x} is outside its record")
+    })?;
+
+    match size {
+        4 => {
+            let value = i32::from_le_bytes(slot.try_into()?)
+                .wrapping_add(i32::try_from(delta).context("Frame data moved more than 2GiB")?);
+            slot.copy_from_slice(&value.to_le_bytes());
+        }
+        8 => {
+            let value = i64::from_le_bytes(slot.try_into()?).wrapping_add(delta);
+            slot.copy_from_slice(&value.to_le_bytes());
+        }
+        other => bail!("Unsupported frame data relocation size: {other}"),
+    }
+
+    Ok(())
+}
+
+/// Copies this object's surviving `__eh_frame` records into the output.
+///
+/// The records go in input order, so what changes is only that some are missing: an FDE's back
+/// reference to its CIE has to be re-measured, and every field that was stored as a distance from
+/// where it sits has to be told where it sits now.
+fn write_eh_frame<'data, A: Arch<Platform = MachO>>(
+    object: &ObjectLayout<'data, MachO>,
+    section_index: object::SectionIndex,
+    layout: &MachOLayout<'data>,
+    buffers: &mut OutputSectionPartMap<&mut [u8]>,
+    fixup_sites: &mut Vec<FixupSite>,
+) -> Result {
+    let plan = eh_frame_plan(object, section_index, layout)?;
+
+    if plan.total == 0 {
+        return Ok(());
+    }
+
+    let data = object
+        .object
+        .raw_section_data(object.object.section(section_index)?)?;
+
+    let records = eh_frame_records(data)?;
+
+    let relocations = object
+        .object
+        .relocations(section_index, &object.relocations)?
+        .relocations;
+
+    let by_record = relocations_by_record(&records, relocations);
+
+    let base_address = object.section_resolutions[section_index.0]
+        .address()
+        .context("__eh_frame content to emit, but layout gave it no address")?;
+
+    let buffer = buffers.get_mut(EH_FRAME_PART_ID);
+
+    ensure!(
+        buffer.len() >= plan.total as usize,
+        "Insufficient space allocated to section `__eh_frame`. Tried to take {} bytes, but only \
+         {} remain",
+        plan.total,
+        buffer.len()
+    );
+
+    let out = buffer
+        .split_off_mut(..plan.total as usize)
+        .expect("just checked the length");
+
+    for (record, bucket) in records.iter().zip(&by_record) {
+        let Some(&output_offset) = plan.output_offsets.get(&record.offset) else {
+            continue;
+        };
+
+        let input = record.offset as usize..record.offset as usize + record.size as usize;
+        let record_out = &mut out[output_offset as usize..][..record.size as usize];
+        record_out.copy_from_slice(&data[input]);
+
+        // The distance back to the CIE is measured from the FDE, so dropping anything between the
+        // two changes it. The CIE itself is always emitted when any FDE is, so a missing one means
+        // the record walk disagreed with itself.
+        if let Some(cie_offset) = record.cie_offset {
+            let cie_output_offset = plan.output_offsets.get(&cie_offset).with_context(|| {
+                format!(
+                    "FDE at {:#x} names a CIE at {cie_offset:#x} that isn't being emitted",
+                    record.offset
+                )
+            })?;
+
+            let distance = output_offset + size_of::<u32>() as u32 - cie_output_offset;
+            record_out[4..8].copy_from_slice(&distance.to_le_bytes());
+        }
+
+        apply_eh_frame_relocations::<A>(
+            object,
+            layout,
+            record,
+            output_offset,
+            base_address,
+            section_index,
+            bucket,
+            relocations,
+            record_out,
+            fixup_sites,
+        )?;
+    }
+
+    Ok(())
 }
 
 /// Returns where a `__compact_unwind` relocation points, or `None` if its target wasn't emitted.
