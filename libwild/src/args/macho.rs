@@ -307,6 +307,15 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
             Ok(())
         });
 
+    // Accepted rather than rejected because rustc passes it on every link, so refusing it stops
+    // wild linking Rust at all. We don't remove unreachable code yet, so the output is correct but
+    // larger than ld64's - say so rather than let that look like a size regression.
+    parser
+        .declare()
+        .long("dead_strip")
+        .help("Remove unreachable code and data (not yet implemented)")
+        .execute(|args, _modifier_stack| args.warn_unsupported("-dead_strip"));
+
     // The option declaration cannot be moved to declare_common_args as other platforms
     // use `prefix("o")`.
     parser
