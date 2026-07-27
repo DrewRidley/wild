@@ -529,7 +529,14 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn is_tls(&self) -> bool {
-        todo!()
+        matches!(
+            self.section_type(LE),
+            macho::S_THREAD_LOCAL_REGULAR
+                | macho::S_THREAD_LOCAL_ZEROFILL
+                | macho::S_THREAD_LOCAL_VARIABLES
+                | macho::S_THREAD_LOCAL_VARIABLE_POINTERS
+                | macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS
+        )
     }
 
     fn is_merge_section(&self) -> bool {
@@ -538,7 +545,7 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn is_strings(&self) -> bool {
-        todo!()
+        self.section_type(LE) == macho::S_CSTRING_LITERALS
     }
 
     fn should_retain(&self) -> bool {
@@ -552,7 +559,10 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn is_group(&self) -> bool {
-        todo!()
+        // Mach-O has no equivalent of ELF section groups. Answering `false` rather than panicking
+        // matters because the duplicate-symbol diagnostic asks this to work out whether a repeated
+        // definition is a legitimate COMDAT merge or a genuine clash.
+        false
     }
 
     fn is_note(&self) -> bool {
@@ -560,11 +570,16 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn is_prog_bits(&self) -> bool {
-        todo!()
+        !self.is_no_bits()
     }
 
     fn is_no_bits(&self) -> bool {
-        todo!()
+        // The zerofill section types are the ones that occupy address space without occupying any
+        // space in the file, which is what ELF calls SHT_NOBITS.
+        matches!(
+            self.section_type(LE),
+            macho::S_ZEROFILL | macho::S_GB_ZEROFILL | macho::S_THREAD_LOCAL_ZEROFILL
+        )
     }
 }
 
