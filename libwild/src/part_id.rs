@@ -58,6 +58,7 @@ pub(crate) const LINK_EDIT_SEGMENT: PartId = PartId(34);
 pub(crate) const LOAD_COMMANDS: PartId = PartId(35);
 pub(crate) const CODE_SIGNATURE: PartId = PartId(36);
 pub(crate) const CHAINED_FIXUP_TABLE: PartId = PartId(37);
+pub(crate) const INDIRECT_SYMTAB: PartId = PartId(51);
 // Wasm specific sections. Each one corresponds to a single standard Wasm section.
 pub(crate) const WASM_TYPE: PartId = PartId(38);
 pub(crate) const WASM_IMPORT: PartId = PartId(39);
@@ -73,7 +74,7 @@ pub(crate) const WASM_CODE: PartId = PartId(48);
 pub(crate) const WASM_DATA: PartId = PartId(49);
 pub(crate) const WASM_NAME: PartId = PartId(50);
 
-pub(crate) const NUM_SINGLE_PART_SECTIONS: u32 = 51;
+pub(crate) const NUM_SINGLE_PART_SECTIONS: u32 = 52;
 
 #[cfg(test)]
 pub(crate) const NUM_BUILT_IN_PARTS: usize = NUM_SINGLE_PART_SECTIONS as usize

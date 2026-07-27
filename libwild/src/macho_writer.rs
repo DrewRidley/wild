@@ -30,9 +30,11 @@ use crate::macho::DYLINKER_PATH;
 use crate::macho::DyldChainedFixupsCommand;
 use crate::macho::DylibCommand;
 use crate::macho::DylinkerCommand;
+use crate::macho::DysymtabCommand;
 use crate::macho::EntryPointCommand;
 use crate::macho::FileHeader;
 use crate::macho::GOT_ENTRY_SIZE;
+use crate::macho::INDIRECT_SYMTAB_ENTRY_SIZE;
 use crate::macho::MACHO_COMMAND_ALIGNMENT;
 use crate::macho::MACHO_START_MEM_ADDRESS;
 use crate::macho::MAX_SEGMENT_COUNT;
@@ -88,6 +90,7 @@ use linker_utils::utils::slice_from_all_bytes_mut;
 use object::BigEndian;
 use object::Endianness;
 use object::SymbolIndex;
+use object::U32;
 use object::from_bytes_mut;
 use object::macho;
 use object::macho::CPU_SUBTYPE_ARM64_ALL;
@@ -95,6 +98,7 @@ use object::macho::CPU_TYPE_ARM64;
 use object::macho::LC_BUILD_VERSION;
 use object::macho::LC_CODE_SIGNATURE;
 use object::macho::LC_DYLD_CHAINED_FIXUPS;
+use object::macho::LC_DYSYMTAB;
 use object::macho::LC_LOAD_DYLIB;
 use object::macho::LC_LOAD_DYLINKER;
 use object::macho::LC_MAIN;
@@ -184,6 +188,10 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
     write_got_entries(layout, section_buffers.get_mut(output_section_id::GOT))?;
     write_plt_entries::<A>(layout, section_buffers.get_mut(output_section_id::PLT_GOT))?;
+    write_indirect_symtab(
+        layout,
+        section_buffers.get_mut(output_section_id::INDIRECT_SYMTAB),
+    )?;
     drop(section_buffers);
 
     let fixup_sites = fixup_sites
@@ -354,6 +362,8 @@ fn write_prelude<'data>(
 
     write_symtab_command(layout, take_mut(&mut load_command_buffer)?);
 
+    write_dysymtab_command(layout, take_mut(&mut load_command_buffer)?);
+
     write_code_signature_command(layout, take_mut(&mut load_command_buffer)?);
 
     ensure!(
@@ -489,6 +499,7 @@ fn split_segment_command_buffer(
 
 fn write_segment_commands(layout: &MachOLayout, load_commands: &mut &mut [u8]) -> Result {
     let load_cmd_err = |()| error!("Invalid LOAD_COMMANDS allocation");
+    let num_stub_slots = num_stub_slots(layout);
     let pagezero_segment = take_mut(load_commands)?;
     write_segment(
         SEG_PAGEZERO,
@@ -528,7 +539,12 @@ fn write_segment_commands(layout: &MachOLayout, load_commands: &mut &mut [u8]) -
         text_segment_sections.len(),
         SegmentFlags::default(),
     );
-    write_sections(SEG_TEXT, text_sections, &text_segment_sections)?;
+    write_sections(
+        SEG_TEXT,
+        num_stub_slots,
+        text_sections,
+        &text_segment_sections,
+    )?;
 
     if let Some(data_segment_info) = get_segment_sections(layout, SegmentType::DataSections) {
         let data_segment_sections = data_segment_info.segment_sections;
@@ -552,7 +568,12 @@ fn write_segment_commands(layout: &MachOLayout, load_commands: &mut &mut [u8]) -
             data_segment_sections.len(),
             SegmentFlags::default(),
         );
-        write_sections(SEG_DATA, data_sections, &data_segment_sections)?;
+        write_sections(
+            SEG_DATA,
+            num_stub_slots,
+            data_sections,
+            &data_segment_sections,
+        )?;
     }
 
     if let Some(data_const_segment_info) =
@@ -581,6 +602,7 @@ fn write_segment_commands(layout: &MachOLayout, load_commands: &mut &mut [u8]) -
         );
         write_sections(
             SEG_DATA_CONST,
+            num_stub_slots,
             data_const_sections,
             &data_const_segment_sections,
         )?;
@@ -641,6 +663,7 @@ fn write_segment(
 
 fn write_sections(
     seg_name: &str,
+    num_stub_slots: u32,
     sections: &mut [SectionEntry],
     segment_sections: &[(
         OutputRecordLayout,
@@ -674,14 +697,16 @@ fn write_sections(
         section.reloff.set(LE, 0);
         section.nreloc.set(LE, 0);
         section.flags.set(LE, *section_flags);
-        section.reserved1.set(LE, 0);
-        // TODO: find a better place
-        let reserved2 =
-            if section_flags.0 & macho::SECTION_TYPE == u32::from(macho::S_SYMBOL_STUBS.0) {
-                PLT_ENTRY_SIZE as u32
-            } else {
-                0
-            };
+
+        // For a section whose type says its contents are stubs or symbol pointers, `reserved1` is
+        // where that section's run starts in the indirect symbol table. `write_indirect_symtab`
+        // emits the runs in this order, so the two have to be changed together.
+        let (reserved1, reserved2) = match section_flags.typ() {
+            macho::S_SYMBOL_STUBS => (0, PLT_ENTRY_SIZE as u32),
+            macho::S_NON_LAZY_SYMBOL_POINTERS => (num_stub_slots, 0),
+            _ => (0, 0),
+        };
+        section.reserved1.set(LE, reserved1);
         section.reserved2.set(LE, reserved2);
         section.reserved3.set(LE, 0);
     }
@@ -1081,6 +1106,146 @@ fn write_symtab_command(layout: &MachOLayout, command: &mut SymtabCommand) {
     command.nsyms.set(LE, nsyms);
     command.stroff.set(LE, strtab.file_offset as u32);
     command.strsize.set(LE, strtab.file_size as u32);
+}
+
+/// Returns how many slots `__stubs` holds, which is also where `__got`'s run starts in the
+/// indirect symbol table, since the stubs are emitted first.
+fn num_stub_slots(layout: &MachOLayout) -> u32 {
+    (layout
+        .section_layouts
+        .get(output_section_id::PLT_GOT)
+        .file_size as u64
+        / PLT_ENTRY_SIZE) as u32
+}
+
+/// Returns the symbol table index of the undefined symbol for the import at `import_index`.
+///
+/// The undefined symbols are the last run of the table, written by the epilogue in import order,
+/// so an import's position in the list is its position in that run.
+fn undefined_symbol_index(layout: &MachOLayout, import_index: usize) -> u32 {
+    let entry_size = size_of::<SymtabEntry>();
+    let num_symbols = (layout
+        .section_layouts
+        .get(output_section_id::SYMTAB_LOCAL)
+        .file_size
+        + layout
+            .section_layouts
+            .get(output_section_id::SYMTAB_GLOBAL)
+            .file_size)
+        / entry_size;
+
+    (num_symbols - layout.format_specific.imported_symbols.len() + import_index) as u32
+}
+
+/// Writes the indirect symbol table: one symbol index per slot of `__stubs` and then of `__got`,
+/// naming the symbol whose address that slot holds.
+///
+/// A slot's position within its section is derived from its address rather than from the order of
+/// the import list, so this can't silently disagree with what `write_got_entries` and
+/// `write_plt_entries` actually put there.
+fn write_indirect_symtab(layout: &MachOLayout, out: &mut [u8]) -> Result {
+    let num_stubs = num_stub_slots(layout) as usize;
+    let stubs_base = layout
+        .section_layouts
+        .get(output_section_id::PLT_GOT)
+        .mem_offset;
+    let got_base = layout
+        .section_layouts
+        .get(output_section_id::GOT)
+        .mem_offset;
+
+    let entries: &mut [U32<Endianness>] = slice_from_all_bytes_mut(out);
+
+    for (import_index, imported_symbol) in
+        layout.format_specific.imported_symbols.iter().enumerate()
+    {
+        let symbol_index = undefined_symbol_index(layout, import_index);
+
+        let got_slot = imported_symbol
+            .got_address
+            .get()
+            .checked_sub(got_base)
+            .ok_or_else(|| error!("GOT entry address is before __got"))?
+            / GOT_ENTRY_SIZE;
+
+        let got_entry = entries
+            .get_mut(num_stubs + got_slot as usize)
+            .ok_or_else(|| error!("__got slot is outside the indirect symbol table"))?;
+        got_entry.set(LE, symbol_index);
+
+        if let Some(plt_address) = imported_symbol.plt_address {
+            let stub_slot = plt_address
+                .get()
+                .checked_sub(stubs_base)
+                .ok_or_else(|| error!("Stub address is before __stubs"))?
+                / PLT_ENTRY_SIZE;
+
+            let stub_entry = entries
+                .get_mut(stub_slot as usize)
+                .ok_or_else(|| error!("__stubs slot is outside the indirect symbol table"))?;
+            stub_entry.set(LE, symbol_index);
+        }
+    }
+
+    Ok(())
+}
+
+/// Describes how the symbol table is partitioned, and locates the indirect symbol table.
+///
+/// The three runs are contiguous by construction: locals and externals are separate output
+/// sections laid out in that order, and the undefined ones are written by the epilogue, which comes
+/// last. See `allocate_symtab`.
+fn write_dysymtab_command(layout: &MachOLayout, command: &mut DysymtabCommand) {
+    let entry_size = size_of::<SymtabEntry>();
+    let num_locals = layout
+        .section_layouts
+        .get(output_section_id::SYMTAB_LOCAL)
+        .file_size
+        / entry_size;
+    let num_globals = layout
+        .section_layouts
+        .get(output_section_id::SYMTAB_GLOBAL)
+        .file_size
+        / entry_size;
+
+    // The epilogue writes exactly one undefined symbol per import, at the end of the global part.
+    let num_undefined = layout.format_specific.imported_symbols.len();
+    let num_defined_globals = num_globals - num_undefined;
+
+    let indirect = layout
+        .section_layouts
+        .get(output_section_id::INDIRECT_SYMTAB);
+
+    command.cmd.set(LE, LC_DYSYMTAB);
+    command.cmdsize.set(LE, size_of::<DysymtabCommand>() as u32);
+
+    command.ilocalsym.set(LE, 0);
+    command.nlocalsym.set(LE, num_locals as u32);
+    command.iextdefsym.set(LE, num_locals as u32);
+    command.nextdefsym.set(LE, num_defined_globals as u32);
+    command
+        .iundefsym
+        .set(LE, (num_locals + num_defined_globals) as u32);
+    command.nundefsym.set(LE, num_undefined as u32);
+
+    command.indirectsymoff.set(LE, indirect.file_offset as u32);
+    command.nindirectsyms.set(
+        LE,
+        (indirect.file_size as u64 / INDIRECT_SYMTAB_ENTRY_SIZE) as u32,
+    );
+
+    // We emit no table of contents, module table, reference table or relocations - a linked image
+    // needs none of them, and ld64 leaves them empty here too.
+    command.tocoff.set(LE, 0);
+    command.ntoc.set(LE, 0);
+    command.modtaboff.set(LE, 0);
+    command.nmodtab.set(LE, 0);
+    command.extrefsymoff.set(LE, 0);
+    command.nextrefsyms.set(LE, 0);
+    command.extreloff.set(LE, 0);
+    command.nextrel.set(LE, 0);
+    command.locreloff.set(LE, 0);
+    command.nlocrel.set(LE, 0);
 }
 
 fn write_code_signature_command(layout: &MachOLayout, command: &mut CodeSignatureCommand) {

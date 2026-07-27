@@ -244,6 +244,7 @@ fn test_merge_parts() {
         output_section_id::LINK_EDIT_SEGMENT,
         output_section_id::LOAD_COMMANDS,
         output_section_id::CHAINED_FIXUP_TABLE,
+        output_section_id::INDIRECT_SYMTAB,
         output_section_id::CODE_SIGNATURE,
         // Wasm specific sections.
         output_section_id::WASM_TYPE,

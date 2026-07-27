@@ -97,6 +97,8 @@ pub(crate) const CHAINED_FIXUP_TABLE_BASE_SIZE: u64 = (size_of::<ChainedFixupsHe
 pub(crate) const CHAINED_FIXUP_IMPORT_SIZE: u64 = size_of::<u32>() as u64;
 pub(crate) const CHAINED_FIXUP_PAGE_START_SIZE: u64 = size_of::<u16>() as u64;
 pub(crate) const GOT_ENTRY_SIZE: u64 = 8;
+/// One `u32` symbol index per symbol-pointer or stub slot.
+pub(crate) const INDIRECT_SYMTAB_ENTRY_SIZE: u64 = size_of::<u32>() as u64;
 pub(crate) const PLT_ENTRY_SIZE: u64 = 12;
 
 pub(crate) const SEG_DATA_CONST: &str = "__DATA_CONST";
@@ -117,6 +119,7 @@ pub(crate) type CodeSignatureCommand = object::macho::LinkeditDataCommand<Endian
 pub(crate) type DyldChainedFixupsCommand = object::macho::LinkeditDataCommand<Endianness>;
 pub(crate) type ChainedFixupsHeader = DyldChainedFixupsHeader;
 pub(crate) type SymtabCommand = object::macho::SymtabCommand<Endianness>;
+pub(crate) type DysymtabCommand = object::macho::DysymtabCommand<Endianness>;
 pub(crate) type BuildVersionCommand = object::macho::BuildVersionCommand<Endianness>;
 pub(crate) type UuidCommand = object::macho::UuidCommand<Endianness>;
 
@@ -834,6 +837,7 @@ fn mapped_segment_type(section_id: crate::output_section_id::OutputSectionId) ->
         output_section_id::CHAINED_FIXUP_TABLE
         | output_section_id::SYMTAB_LOCAL
         | output_section_id::SYMTAB_GLOBAL
+        | output_section_id::INDIRECT_SYMTAB
         | output_section_id::STRTAB
         | output_section_id::CODE_SIGNATURE => SegmentType::LinkeditSections,
         _ => SegmentType::Unused,
@@ -1472,6 +1476,33 @@ impl platform::Platform for MachO {
             alignment::USIZE.align_up(page_start_count * CHAINED_FIXUP_PAGE_START_SIZE),
         );
 
+        // The indirect symbol table holds one symbol index for every slot of every section whose
+        // type says its contents are symbol pointers or stubs - `__got` and `__stubs` here. Like
+        // the page starts above, that's a function of those sections' sizes, so it can't be
+        // counted until they've been merged.
+        let mut indirect_entry_count = 0;
+
+        for (section_id, entry_size) in [
+            (output_section_id::GOT, GOT_ENTRY_SIZE),
+            (output_section_id::PLT_GOT, PLT_ENTRY_SIZE),
+        ] {
+            let mut section_size = 0;
+
+            for part_index in 0..current_sizes.num_parts() {
+                let part_id = PartId::from_usize(part_index);
+                if part_id.output_section_id() == section_id {
+                    section_size += *current_sizes.get(part_id);
+                }
+            }
+
+            indirect_entry_count += section_size / entry_size;
+        }
+
+        extra_sizes.increment(
+            part_id::INDIRECT_SYMTAB,
+            indirect_entry_count * INDIRECT_SYMTAB_ENTRY_SIZE,
+        );
+
         Ok(())
     }
 
@@ -1570,6 +1601,7 @@ impl platform::Platform for MachO {
 
         allocate_load_cmd(size_of::<DyldChainedFixupsCommand>());
         allocate_load_cmd(size_of::<SymtabCommand>());
+        allocate_load_cmd(size_of::<DysymtabCommand>());
         allocate_load_cmd(size_of::<CodeSignatureCommand>());
         allocate_load_cmd(size_of::<UuidCommand>());
         if args.platform_version.is_some() {
@@ -1785,6 +1817,7 @@ impl platform::Platform for MachO {
         // each run as a contiguous range.
         builder.add_section(output_section_id::SYMTAB_LOCAL);
         builder.add_section(output_section_id::SYMTAB_GLOBAL);
+        builder.add_section(output_section_id::INDIRECT_SYMTAB);
         builder.add_section(output_section_id::CODE_SIGNATURE);
 
         builder.build()
@@ -1894,6 +1927,11 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         min_alignment: alignment::USIZE,
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::INDIRECT_SYMTAB.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"INDIRECT_SYMTAB")),
+        min_alignment: alignment::SYMTAB_SHNDX_ENTRY,
+        ..DEFAULT_DEFS
+    };
     defs[output_section_id::SYMTAB_GLOBAL.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"SYMTAB")),
         min_alignment: alignment::USIZE,
@@ -1908,6 +1946,9 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
     };
     defs[output_section_id::GOT.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"__got")),
+        // Says the section is an array of symbol pointers, which is what makes `reserved1` mean an
+        // index into the indirect symbol table. Only correct because we now emit that table.
+        section_flags: macho::S_NON_LAZY_SYMBOL_POINTERS.to_flags(),
         ..DEFAULT_DEFS
     };
     defs[output_section_id::PLT_GOT.as_usize()] = BuiltInSectionDetails {
