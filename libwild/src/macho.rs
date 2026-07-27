@@ -1882,9 +1882,15 @@ impl platform::Platform for MachO {
                 .map(|definition| (definition.name, u64::MAX))
                 .collect_vec();
 
+            // Rounded up because what follows in `__LINKEDIT` expects to start on a pointer
+            // boundary, and because a trie is a byte stream that would otherwise leave it wherever
+            // its last node happened to end. The padding reads as a trie with nothing past its
+            // root, which is what the trailing space holds anyway.
+            let widest_len = crate::macho_export_trie::ExportTrie::build(&widest).len() as u64;
+
             mem_sizes.increment(
                 part_id::EXPORT_TRIE,
-                crate::macho_export_trie::ExportTrie::build(&widest).len() as u64,
+                widest_len.next_multiple_of(alignment::USIZE.value()),
             );
         }
 
