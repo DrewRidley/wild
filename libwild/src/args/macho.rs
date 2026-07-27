@@ -35,6 +35,12 @@ pub struct MachOArgs {
     pub(crate) exported_symbols_list: Option<Box<Path>>,
     /// Directories dyld searches for `@rpath`-relative dependencies, in the order given.
     pub(crate) rpaths: Vec<Box<str>>,
+    /// Where to look for frameworks, `-F` directories first and the system ones after.
+    pub(crate) framework_search_path: Vec<Box<Path>>,
+    /// The version this dylib declares itself to be, and the oldest one an image built against it
+    /// will accept. Both default to 0.0.0, as ld64's do.
+    pub(crate) current_version: Option<SemanticVersion>,
+    pub(crate) compatibility_version: Option<SemanticVersion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,9 +107,15 @@ impl Default for MachOArgs {
             install_name: None,
             exported_symbols_list: None,
             rpaths: Vec::new(),
+            framework_search_path: Vec::new(),
+            current_version: None,
+            compatibility_version: None,
         }
     }
 }
+
+/// Where frameworks live when no `-F` says otherwise, in the order ld64 tries them.
+const DEFAULT_FRAMEWORK_PATHS: &[&str] = &["/Library/Frameworks", "/System/Library/Frameworks"];
 
 impl MachOArgs {
     /// The output path as bytes, for the places Mach-O records a path in the file itself.
@@ -136,6 +148,10 @@ impl platform::Args for MachOArgs {
 
     fn lib_search_path(&self) -> &[Box<std::path::Path>] {
         &self.lib_search_path
+    }
+
+    fn framework_search_path(&self) -> &[Box<std::path::Path>] {
+        &self.framework_search_path
     }
 
     fn common(&self) -> &crate::args::CommonArgs {
@@ -260,6 +276,16 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
             let sysroot = std::fs::canonicalize(value).unwrap_or_else(|_| PathBuf::from(value));
             // TODO: handle properly
             args.lib_search_path = vec![sysroot.join("usr/lib").into_boxed_path()];
+
+            // The system framework directories move under the SDK along with the libraries. A `-F`
+            // given earlier keeps its place at the front: those are the caller's own directories
+            // and are searched before the system ones either way.
+            args.framework_search_path.extend(
+                DEFAULT_FRAMEWORK_PATHS
+                    .iter()
+                    .map(|path| sysroot.join(path.trim_start_matches('/')).into_boxed_path()),
+            );
+
             args.sysroot = Some(Box::from(sysroot.as_path()));
             Ok(())
         });
@@ -380,6 +406,58 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
 
     parser
         .declare_with_param()
+        .prefix("F")
+        .help("Add a directory to the framework search path")
+        .execute(|args, _modifier_stack, value| {
+            args.common_mut().save_dir.handle_file(value);
+            args.framework_search_path.push(Box::from(Path::new(value)));
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("framework")
+        .help("Link with a framework")
+        .execute(|args, modifier_stack, value| {
+            // ld64 accepts `-framework Foo,_debug` to pick a variant of the library inside the
+            // bundle. Nothing we can link against ships one, so the suffix is not accepted rather
+            // than silently ignored - quietly linking the wrong variant would be worse.
+            ensure!(
+                !value.contains(','),
+                "Framework suffixes are not supported: `{value}`"
+            );
+
+            args.common_mut().inputs.push(Input {
+                spec: InputSpec::Framework(Box::from(value)),
+                search_first: None,
+                modifiers: *modifier_stack.last().unwrap(),
+            });
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("current_version")
+        .help("The version this dylib declares itself to be")
+        .execute(|args, _modifier_stack, value| {
+            args.current_version =
+                Some(SemanticVersion::try_from(value).context("cannot parse -current_version")?);
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("compatibility_version")
+        .help("The oldest version of this dylib an image built against it will accept")
+        .execute(|args, _modifier_stack, value| {
+            args.compatibility_version = Some(
+                SemanticVersion::try_from(value).context("cannot parse -compatibility_version")?,
+            );
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
         .long("rpath")
         .help("Add a directory for dyld to resolve @rpath dependencies against")
         .execute(|args, _modifier_stack, value| {
@@ -467,11 +545,11 @@ mod tests {
         assert_eq!(args.sysroot, Some(Box::from(Path::new("/foo/bar"))));
         assert!(args.common.inputs.iter().any(|i| match &i.spec {
             InputSpec::File(f) => f.as_ref() == Path::new("main.o"),
-            InputSpec::Lib(_) | InputSpec::Search(_) => false,
+            InputSpec::Lib(_) | InputSpec::Search(_) | InputSpec::Framework(_) => false,
         }));
         assert!(args.common.inputs.iter().any(|i| match &i.spec {
             InputSpec::Lib(f) => f.as_ref() == "c++",
-            InputSpec::File(_) | InputSpec::Search(_) => false,
+            InputSpec::File(_) | InputSpec::Search(_) | InputSpec::Framework(_) => false,
         }));
         assert!(
             args.lib_search_path

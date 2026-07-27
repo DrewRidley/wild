@@ -1302,6 +1302,11 @@ impl PluginOutputs {
                     args.push_str(search);
                     args.push('\n');
                 }
+                crate::args::InputSpec::Framework(name) => {
+                    args.push_str("-framework\n");
+                    args.push_str(name);
+                    args.push('\n');
+                }
             }
         }
 

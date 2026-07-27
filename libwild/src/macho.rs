@@ -822,6 +822,13 @@ fn is_splittable_section_type(section_type: macho::SectionType) -> bool {
     )
 }
 
+/// What a dylib says about its own versioning, as `LC_ID_DYLIB` records it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DylibVersions {
+    pub(crate) compatibility: object::macho::Version,
+    pub(crate) current: object::macho::Version,
+}
+
 #[derive(Debug)]
 enum ObjectKind<'data> {
     Regular(RegularObject<'data>),
@@ -831,6 +838,11 @@ enum ObjectKind<'data> {
         /// library was at link time, while the install name is where it expects to be found at run
         /// time - commonly `@rpath/...`, which is the whole point of `-rpath`.
         install_name: Option<&'data [u8]>,
+
+        /// What the library says about itself: the version it is, and the oldest version an image
+        /// built against it will accept. dyld compares the two at load time, so they have to be
+        /// carried across rather than invented.
+        versions: Option<DylibVersions>,
     },
 }
 
@@ -857,6 +869,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         let mut symbols = None;
         let mut sections = None;
         let mut install_name = None;
+        let mut versions = None;
 
         while let Some(command) = commands.next()? {
             if let Some(symtab_command) = command.symtab()? {
@@ -865,6 +878,10 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
             } else if is_dynamic && command.cmd() == object::macho::LC_ID_DYLIB {
                 let dylib_command = command.data::<DylibCommand>()?;
                 install_name = Some(command.string(LE, dylib_command.dylib.name)?);
+                versions = Some(DylibVersions {
+                    compatibility: dylib_command.dylib.compatibility_version.get(LE),
+                    current: dylib_command.dylib.current_version.get(LE),
+                });
             } else if !is_dynamic
                 && let Some((segment_command, segment_data)) = command.segment_64()?
             {
@@ -877,7 +894,10 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         let symbols = symbols.ok_or("Missing symbol table")?;
 
         let kind = if is_dynamic {
-            ObjectKind::Dylib { install_name }
+            ObjectKind::Dylib {
+                install_name,
+                versions,
+            }
         } else {
             let sections = sections.ok_or("Missing segment command")?;
 
@@ -2946,6 +2966,50 @@ pub(crate) fn install_name<'data>(
     }
 }
 
+/// What a dependency says about its versions, for the `LC_LOAD_DYLIB` naming it.
+///
+/// dyld refuses to load a library older than the one an image was built against, so these have to
+/// come from the library rather than be made up. A library that says nothing gets 1.0, which is
+/// what the `.tbd` format specifies for an absent field and what a library that has never broken
+/// compatibility would carry anyway.
+pub(crate) fn dylib_versions(
+    file_id: FileId,
+    symbol_db: &crate::symbol_db::SymbolDb<'_, MachO>,
+) -> DylibVersions {
+    let default = object::macho::Version::new(1, 0, 0);
+
+    match symbol_db.file(file_id) {
+        SequencedInput::StubLibrary(stub) => DylibVersions {
+            compatibility: parse_dylib_version(stub.defined_symbols.compatibility_version)
+                .unwrap_or(default),
+            current: parse_dylib_version(stub.defined_symbols.current_version).unwrap_or(default),
+        },
+
+        SequencedInput::Object(obj) => {
+            obj.parsed.object.dylib_versions().unwrap_or(DylibVersions {
+                compatibility: default,
+                current: default,
+            })
+        }
+
+        _ => panic!("Internal error: Expected StubLibrary or Dynamic"),
+    }
+}
+
+/// Parses a `.tbd` version, which is written in decimal like `150` or `3423.1.2`.
+fn parse_dylib_version(text: &str) -> Option<object::macho::Version> {
+    if text.is_empty() {
+        return None;
+    }
+
+    let mut parts = text.split('.');
+    let major: u16 = parts.next()?.parse().ok()?;
+    let minor: u8 = parts.next().map_or(Ok(0), str::parse).ok()?;
+    let patch: u8 = parts.next().map_or(Ok(0), str::parse).ok()?;
+
+    Some(object::macho::Version::new(major, minor, patch))
+}
+
 fn create_dynamic_layout_ext<'data>(
     target_file_id: FileId,
     resources: &layout::FinaliseLayoutResources<'_, 'data, MachO>,
@@ -3508,7 +3572,15 @@ impl<'data> File<'data> {
     pub(crate) fn install_name(&self) -> Option<&'data [u8]> {
         match &self.kind {
             ObjectKind::Regular(_) => None,
-            ObjectKind::Dylib { install_name } => *install_name,
+            ObjectKind::Dylib { install_name, .. } => *install_name,
+        }
+    }
+
+    /// What a dylib records about its own versions, if it is a dylib.
+    pub(crate) fn dylib_versions(&self) -> Option<DylibVersions> {
+        match &self.kind {
+            ObjectKind::Regular(_) => None,
+            ObjectKind::Dylib { versions, .. } => *versions,
         }
     }
 

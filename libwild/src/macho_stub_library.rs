@@ -30,6 +30,8 @@ struct TextBasedDefinition<'a> {
     #[serde(default)]
     current_version: &'a str,
     #[serde(default)]
+    compatibility_version: &'a str,
+    #[serde(default)]
     parent_umbrella: Vec<ParentUmbrella<'a>>,
     #[serde(default)]
     reexported_libraries: Vec<ReexportedLibraries<'a>>,
@@ -83,6 +85,9 @@ pub(crate) struct DefinedStubLibrary<'a> {
     pub(crate) install_name: &'a str,
     /// Current version recorded for the library, if present.
     pub(crate) current_version: &'a str,
+    /// The oldest version of the library an image linked against this one will accept. Absent means
+    /// 1.0, which is what the format says and what a library that never broke compatibility gets.
+    pub(crate) compatibility_version: &'a str,
     /// Global symbols defined by the library or by any reexported child library.
     pub(crate) symbols: Vec<&'a str>,
     /// Weak symbols defined by the library or by any reexported child library.
@@ -116,6 +121,7 @@ pub fn parse_defined_library<'data>(input: &'data str) -> Result<DefinedStubLibr
     let mut defined_library = DefinedStubLibrary {
         install_name: main_library.install_name,
         current_version: main_library.current_version,
+        compatibility_version: main_library.compatibility_version,
         symbols: Vec::with_capacity(
             library_definitions
                 .iter()

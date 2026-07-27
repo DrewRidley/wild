@@ -1415,6 +1415,11 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
 
     fn lib_search_path(&self) -> &[Box<Path>];
 
+    /// Where to look for Mach-O frameworks. Empty on formats that have no such notion.
+    fn framework_search_path(&self) -> &[Box<Path>] {
+        &[]
+    }
+
     fn output(&self) -> &Arc<Path> {
         &self.common().output
     }

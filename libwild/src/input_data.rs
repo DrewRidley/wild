@@ -911,6 +911,29 @@ impl Input {
                 }
                 bail!("Couldn't find library `{lib_name}` on library search path");
             }
+            // A framework is a directory `Name.framework` holding, among other things, a library
+            // called `Name`. In an SDK that library is a `.tbd` stub describing what the real one
+            // exports; on the running system it's the dylib itself. Try the stub first, which is
+            // what a link against an SDK will find, and fall back to the library.
+            InputSpec::Framework(name) => {
+                for filename in [
+                    format!("{name}.framework/{name}.tbd"),
+                    format!("{name}.framework/{name}"),
+                ] {
+                    if let Some(path) = search_for_file(
+                        args.framework_search_path(),
+                        self.search_first.as_ref(),
+                        &filename,
+                    ) {
+                        return Ok(InputPath {
+                            absolute: std::path::absolute(&path)?,
+                            original: PathBuf::from(filename),
+                        });
+                    }
+                }
+
+                bail!("Couldn't find framework `{name}` on framework search path");
+            }
             InputSpec::Search(filename) => {
                 if let Some(path) = search_for_file(
                     args.lib_search_path(),

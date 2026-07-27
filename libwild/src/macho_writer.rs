@@ -455,8 +455,9 @@ fn write_prelude<'data>(
         let mut command_buffer = load_command_buffer.split_off_mut(..command_size).unwrap();
         let dylib_command = take_mut(&mut command_buffer)?;
         let path = crate::macho::install_name(file_id, &layout.symbol_db);
+        let versions = crate::macho::dylib_versions(file_id, &layout.symbol_db);
 
-        write_dylib_command(dylib_command, command_buffer, path);
+        write_dylib_command(dylib_command, command_buffer, path, versions);
     }
 
     for rpath in &layout.args().rpaths {
@@ -667,7 +668,23 @@ fn write_id_dylib_command(layout: &MachOLayout<'_>, buffer: &mut &mut [u8]) -> R
         .map_err(|_| error!("Invalid LC_ID_DYLIB allocation"))?
         .0;
 
-    write_dylib_command(command, path_buffer, name);
+    // Ours to declare rather than to copy, and zero unless we were told otherwise - which is what
+    // ld64 writes for a dylib built without `-compatibility_version` or `-current_version`.
+    let zero = object::macho::Version::new(0, 0, 0);
+    let versions = crate::macho::DylibVersions {
+        compatibility: layout
+            .args()
+            .compatibility_version
+            .as_ref()
+            .map_or(zero, |version| version.get()),
+        current: layout
+            .args()
+            .current_version
+            .as_ref()
+            .map_or(zero, |version| version.get()),
+    };
+
+    write_dylib_command(command, path_buffer, name, versions);
     // Same shape as a load command, differing only in which question it answers: this names the
     // library itself rather than one it depends on.
     command.cmd.set(LE, object::macho::LC_ID_DYLIB);
@@ -2317,7 +2334,12 @@ fn write_rpath_command(command: &mut RpathCommand, path_buffer: &mut [u8], path:
     path_buffer[path.len()..].zero();
 }
 
-fn write_dylib_command(command: &mut DylibCommand, path_buffer: &mut [u8], path: &[u8]) {
+fn write_dylib_command(
+    command: &mut DylibCommand,
+    path_buffer: &mut [u8],
+    path: &[u8],
+    versions: crate::macho::DylibVersions,
+) {
     command.cmd.set(LE, LC_LOAD_DYLIB);
     command
         .cmdsize
@@ -2329,15 +2351,15 @@ fn write_dylib_command(command: &mut DylibCommand, path_buffer: &mut [u8], path:
         .set(LE, size_of::<DylibCommand>() as u32);
     // TODO
     command.dylib.timestamp.set(LE, 2);
-    // TODO
-    command
-        .dylib
-        .current_version
-        .set(LE, macho::Version(1356 << 16));
+
+    // Taken from the library rather than invented: dyld refuses to load one older than the image
+    // was built against, so a made-up compatibility version either waves through a library that
+    // should have been rejected or rejects one that was fine.
+    command.dylib.current_version.set(LE, versions.current);
     command
         .dylib
         .compatibility_version
-        .set(LE, macho::Version(1 << 16));
+        .set(LE, versions.compatibility);
 
     path_buffer[0..path.len()].copy_from_slice(path);
     path_buffer[path.len()..].zero();
