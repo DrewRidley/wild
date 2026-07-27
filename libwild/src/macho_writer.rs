@@ -1255,6 +1255,20 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         && rel_info.size == RelocationSize::ByteSize(size_of::<u64>())
         && !flags.is_absolute()
     {
+        // Reported here rather than where the chain is threaded, because this is where there is
+        // still something to name: a chain can only step in multiples of its stride, so a slot off
+        // that grid can't be on one, and by then all that is left of it is an address.
+        ensure!(
+            place.is_multiple_of(CHAINED_PTR_NEXT_STRIDE),
+            "Slot at {place:#x} for {} in section `{}` of `{}` needs a fixup but isn't aligned to \
+             the {CHAINED_PTR_NEXT_STRIDE}-byte chain stride",
+            layout.symbol_debug(local_symbol_id),
+            layout
+                .output_sections
+                .display_name(section_part_id.output_section_id()),
+            object_layout.input,
+        );
+
         if flags.is_thread_local() {
             // The last word of a `tlv_descriptor` holds where the variable sits within the
             // thread-local block, not where the template copy of it sits in the image. dyld adds

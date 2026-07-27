@@ -1652,7 +1652,7 @@ impl platform::Platform for MachO {
     fn create_finalise_sizes_ext<'data, 'states, 'files, A: platform::Arch<Platform = Self>>(
         _args: &Self::Args,
         groups: &'files [layout::GroupState<'data, Self>],
-        _symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
+        symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
     ) -> crate::error::Result<Self::FinaliseSizesExt<'data>>
     where
         'data: 'files,
@@ -1682,6 +1682,16 @@ impl platform::Platform for MachO {
                 }
             }
         }
+
+        // One library reached by several names is still one library, and dyld rejects an image that
+        // loads the same install name twice. `-lSystem -lc -lm` is the ordinary way to arrive here:
+        // on macOS all three are libSystem, so the same stub is opened once per name.
+        //
+        // Keeping the first of each is what makes the ordinals that `create_dynamic_layout_ext`
+        // hands out contiguous, so that resolves by install name too rather than by file.
+        let mut seen_install_names = std::collections::HashSet::new();
+        imported_libraries
+            .retain(|&file_id| seen_install_names.insert(install_name(file_id, symbol_db)));
 
         Ok(FinaliseSizesExt {
             imported_libraries,
@@ -2439,11 +2449,16 @@ fn create_dynamic_layout_ext<'data>(
     target_file_id: FileId,
     resources: &layout::FinaliseLayoutResources<'_, 'data, MachO>,
 ) -> Result<Option<DynamicLayoutExt>> {
+    // By install name rather than by file, because the list holds one entry per name: a library
+    // opened under several names has one of its files in the list, and symbols from any of them
+    // bind against that entry.
+    let target_install_name = install_name(target_file_id, resources.symbol_db);
+
     let Some(index) = resources
         .format_specific
         .imported_libraries
         .iter()
-        .position(|file_id| *file_id == target_file_id)
+        .position(|&file_id| install_name(file_id, resources.symbol_db) == target_install_name)
     else {
         return Ok(None);
     };
@@ -2556,6 +2571,10 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
     defs[output_section_id::THREAD_VARS.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"__thread_vars")),
         section_flags: macho::S_THREAD_LOCAL_VARIABLES.to_flags(),
+        // The section holds `tlv_descriptor`s, which are three pointers each, but clang declares it
+        // with an alignment of 1 and leaves the floor to the linker. Without one the descriptors
+        // can land anywhere, and dyld can neither bind the first word nor read the rest.
+        min_alignment: alignment::USIZE,
         ..DEFAULT_DEFS
     };
     defs[output_section_id::TDATA.as_usize()] = BuiltInSectionDetails {
