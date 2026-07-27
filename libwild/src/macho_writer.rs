@@ -760,16 +760,149 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
         .address()
         .context("Attempted to apply relocations to a section that we didn't load")?;
 
-    for rel in object_layout.relocations(section_index)?.relocations {
+    let relocations = object_layout.relocations(section_index)?.relocations;
+    let mut index = 0;
+
+    while index < relocations.len() {
+        let rel = relocations[index].info(LE);
+
+        // A subtractor is only half a relocation: it's always immediately followed by an unsigned
+        // one at the same address, and together they mean "the distance between these two symbols".
+        // They have to be applied as a unit, both because neither value alone is what goes in the
+        // slot and because the result is a difference - it doesn't move when dyld slides the image,
+        // so it must not get the rebase that `apply_relocation` gives a lone pointer-sized
+        // absolute.
+        if rel.r_type == object::macho::ARM64_RELOC_SUBTRACTOR {
+            let minuend = relocations
+                .get(index + 1)
+                .map(|next| next.info(LE))
+                .filter(|next| {
+                    next.r_type == object::macho::ARM64_RELOC_UNSIGNED
+                        && next.r_address == rel.r_address
+                })
+                .with_context(|| {
+                    format!(
+                        "ARM64_RELOC_SUBTRACTOR at offset {:#x} of `{}` is not followed by a \
+                         matching ARM64_RELOC_UNSIGNED",
+                        rel.r_address,
+                        object_layout.object.section_display_name(section_index)
+                    )
+                })?;
+
+            apply_subtractor_pair(object_layout, rel, minuend, layout, out)?;
+            index += 2;
+            continue;
+        }
+
+        // Also not a relocation of its own: it carries an addend for the relocation that follows
+        // it, in the field that would otherwise name a symbol. The assembler uses it to reach an
+        // offset inside a section that has no symbol at that point, so the target is typically a
+        // section anchor plus a displacement.
+        let addend = if rel.r_type == object::macho::ARM64_RELOC_ADDEND {
+            let value = u64::from(rel.r_symbolnum);
+            index += 1;
+
+            let Some(next) = relocations.get(index).map(|next| next.info(LE)) else {
+                bail!(
+                    "ARM64_RELOC_ADDEND at offset {:#x} of `{}` is the last relocation",
+                    rel.r_address,
+                    object_layout.object.section_display_name(section_index)
+                );
+            };
+
+            ensure!(
+                next.r_address == rel.r_address,
+                "ARM64_RELOC_ADDEND at offset {:#x} of `{}` is not followed by a relocation at the \
+                 same address",
+                rel.r_address,
+                object_layout.object.section_display_name(section_index)
+            );
+
+            value
+        } else {
+            0
+        };
+
         apply_relocation::<A>(
             object_layout,
             section_address,
-            rel.info(LE),
+            relocations[index].info(LE),
+            addend,
             layout,
             out,
             fixup_sites,
         )?;
+        index += 1;
     }
+
+    Ok(())
+}
+
+/// Reads the addend that the compiler left in the storage the relocation applies to.
+///
+/// Signed, and narrower than a `u64` for the smaller forms, so it's sign-extended - a negative
+/// displacement is perfectly ordinary and must not come back as a huge positive one.
+fn read_implicit_addend(out: &[u8], offset: usize, size: usize) -> Result<u64> {
+    let slot = out
+        .get(offset..offset + size)
+        .with_context(|| format!("Relocation at offset {offset:#x} is outside its section"))?;
+
+    Ok(match size {
+        1 => i64::from(slot[0] as i8) as u64,
+        2 => i64::from(i16::from_le_bytes(slot.try_into()?)) as u64,
+        4 => i64::from(i32::from_le_bytes(slot.try_into()?)) as u64,
+        8 => u64::from_le_bytes(slot.try_into()?),
+        other => bail!("Unsupported relocation size: {other}"),
+    })
+}
+
+/// Applies an `ARM64_RELOC_SUBTRACTOR` / `ARM64_RELOC_UNSIGNED` pair, which stores the distance
+/// from one symbol to another.
+///
+/// `__eh_frame` is what needs this: an FDE records where its function starts as a delta from the
+/// field holding it, and the assembler expresses that as "this function, minus the anchor symbol at
+/// the start of the section", with the field's own offset within the section as the addend already
+/// sitting in the slot.
+fn apply_subtractor_pair(
+    object_layout: &ObjectLayout<'_, MachO>,
+    subtractor: RelocationInfo,
+    minuend: RelocationInfo,
+    layout: &MachOLayout<'_>,
+    out: &mut [u8],
+) -> Result {
+    let offset = minuend.r_address as usize;
+    let size = 1_usize << minuend.r_length;
+
+    let (subtractor_resolution, _, subtractor_symbol) =
+        get_resolution(subtractor, object_layout, layout)?;
+    let (minuend_resolution, _, minuend_symbol) = get_resolution(minuend, object_layout, layout)?;
+
+    let slot = out
+        .get_mut(offset..offset + size)
+        .with_context(|| format!("Subtractor pair at offset {offset:#x} is outside its section"))?;
+
+    // Whatever the assembler left in the slot is the addend, signed, and narrower than 8 bytes for
+    // the 4-byte form - so sign-extend it rather than zero-extend, or a negative addend (which is
+    // the normal case here, since it cancels the field's offset) comes out enormous.
+    let addend = match size {
+        4 => i64::from(i32::from_le_bytes(slot[..4].try_into()?)),
+        8 => i64::from_le_bytes(slot[..8].try_into()?),
+        other => bail!("Unsupported subtractor pair size: {other}"),
+    };
+
+    let value = minuend_resolution
+        .raw_value
+        .wrapping_sub(subtractor_resolution.raw_value)
+        .wrapping_add(addend as u64);
+
+    tracing::trace!(
+        minuend = %layout.symbol_db.symbol_name_for_display(minuend_symbol),
+        subtractor = %layout.symbol_db.symbol_name_for_display(subtractor_symbol),
+        value,
+        "subtractor pair applied"
+    );
+
+    slot.copy_from_slice(&value.to_le_bytes()[..size]);
 
     Ok(())
 }
@@ -779,6 +912,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     object_layout: &ObjectLayout<'data, MachO>,
     section_address: u64,
     rel: RelocationInfo,
+    addend: u64,
     layout: &MachOLayout<'data>,
     out: &mut [u8],
     fixup_sites: &mut Vec<FixupSite>,
@@ -794,8 +928,46 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     .entered();
 
     let rel_info = A::relocation_from_raw(rel)?;
-    let (resolution, _symbol_index, local_symbol_id) = get_resolution(rel, object_layout, layout)?;
+    let (mut resolution, _symbol_index, local_symbol_id) =
+        get_resolution(rel, object_layout, layout)?;
     let flags = layout.flags_for_symbol(local_symbol_id);
+
+    // Mach-O has no relocation field to put an addend in, the way ELF's `Rela` does. For a plain
+    // pointer-sized slot the addend is simply already sitting in the slot, so `&array[2]` reaches
+    // us as "the address of `array`" plus an 8 the compiler wrote into the storage - and dropping
+    // it silently produces a pointer to the wrong element. The addressing relocations can't do that
+    // (their storage holds an instruction), which is what `ARM64_RELOC_ADDEND` exists for.
+    let addend = if rel_info.kind == RelocationKind::Absolute
+        && let RelocationSize::ByteSize(size) = rel_info.size
+    {
+        addend.wrapping_add(read_implicit_addend(out, offset_in_section as usize, size)?)
+    } else {
+        addend
+    };
+
+    if addend != 0 {
+        // `raw_value` holds the address of the symbol's `__got` slot when it has one, and an addend
+        // is meant to displace the symbol, not the slot - so the two can't be combined.
+        ensure!(
+            !matches!(
+                rel_info.kind,
+                RelocationKind::Got | RelocationKind::GotRelative
+            ),
+            "Addend applied to an indirect relocation against {}",
+            layout.symbol_debug(local_symbol_id)
+        );
+
+        // A bind tells dyld which symbol to look up, and the chained-fixup encoding has only 8 bits
+        // to carry a displacement from it. Rather than silently truncate, say so - a displaced
+        // reference to an imported symbol is rare enough that guessing isn't worth it.
+        ensure!(
+            !flags.is_dynamic(),
+            "Addend of {addend:#x} applied to a reference to imported symbol {}",
+            layout.symbol_debug(local_symbol_id)
+        );
+
+        resolution.raw_value = resolution.raw_value.wrapping_add(addend);
+    }
 
     // Layout only gives a `__got` slot to symbols whose address isn't known until dyld binds them.
     // A GOT-style relocation against anything else has to be turned into a direct reference, which

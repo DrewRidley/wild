@@ -208,6 +208,18 @@ impl crate::platform::Arch for MachOAArch64 {
                 };
                 (kind, rel_size, None, AllowedRange::no_check(), 1)
             }
+            // Half of a pair: the following `ARM64_RELOC_UNSIGNED` at the same address names the
+            // other end, and the slot gets the distance between them. Layout only needs to know
+            // that the symbol is referenced by address and wants no indirection, which is what this
+            // kind says; the writer applies the two together (`apply_subtractor_pair`), so nothing
+            // ever asks this arm to produce a value on its own.
+            object::macho::ARM64_RELOC_SUBTRACTOR => (
+                RelocationKind::AbsoluteSubtraction,
+                rel_size,
+                None,
+                AllowedRange::no_check(),
+                1,
+            ),
             _ => bail!("Unknown relocation: {}", rel.r_type),
         };
         Ok(RelocationKindInfo {
