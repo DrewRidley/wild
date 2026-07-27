@@ -153,8 +153,11 @@ pub(crate) const CONST: OutputSectionId = OutputSectionId::regular(16);
 /// Mach-O `__DATA,__thread_vars`, which holds one `tlv_descriptor` per thread-local variable.
 /// The thread-local data itself lives in TDATA / TBSS, as it does for ELF.
 pub(crate) const THREAD_VARS: OutputSectionId = OutputSectionId::regular(17);
+/// Mach-O `__DATA,__common`, holding common (tentative) definitions. Zerofill like BSS, but kept
+/// separate because ld64 keeps it separate.
+pub(crate) const COMMON: OutputSectionId = OutputSectionId::regular(18);
 
-pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 18;
+pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 19;
 
 #[derive(Debug)]
 pub(crate) struct OutputSections<'data, P: Platform> {

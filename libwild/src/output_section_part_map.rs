@@ -226,8 +226,9 @@ fn test_merge_parts() {
         },
     );
 
-    // Subtract the Mach-O specific sections.
-    let num_regular_sections = output_sections.num_regular_sections() - 3;
+    // Subtract the Mach-O specific sections: `__cstring`, `__const`, `__thread_vars` and
+    // `__common`, none of which an ELF link places.
+    let num_regular_sections = output_sections.num_regular_sections() - 4;
     let mut num_sections_with_17 = 0;
 
     let mut sum_of_1s = output_sections.new_section_map::<u32>();
@@ -241,6 +242,7 @@ fn test_merge_parts() {
         output_section_id::CSTRING,
         output_section_id::CONST,
         output_section_id::THREAD_VARS,
+        output_section_id::COMMON,
         output_section_id::LINK_EDIT_SEGMENT,
         output_section_id::LOAD_COMMANDS,
         output_section_id::CHAINED_FIXUP_TABLE,

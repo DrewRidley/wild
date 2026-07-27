@@ -20,6 +20,7 @@ use crate::layout::SymbolCopyInfo;
 use crate::layout::SymbolResolutions;
 use crate::layout_rules::SectionKind;
 use crate::layout_rules::SectionRule;
+use crate::layout_rules::SectionRuleOutcome;
 use crate::macho_object::CodeSignatureBlobIndex;
 use crate::macho_object::CodeSignatureCodeDirectory;
 use crate::macho_object::CodeSignatureSuperBlob;
@@ -826,13 +827,21 @@ fn mapped_segment_type(section_id: crate::output_section_id::OutputSectionId) ->
         output_section_id::LOAD_COMMANDS => SegmentType::LoadCommands,
         output_section_id::TEXT
         | output_section_id::CSTRING
-        | output_section_id::CONST
         | output_section_id::GCC_EXCEPT_TABLE
         | output_section_id::PLT_GOT => SegmentType::TextSections,
+        // `__const` holds constants, but constants include pointers, and a pointer has to be
+        // rebased before it's read - which means living somewhere dyld can write to. ld64 sorts the
+        // input sections: the ones with relocations go to `__DATA_CONST,__const` and the rest stay
+        // in `__TEXT,__const`. We don't sort them yet, so they all go to the segment that can hold
+        // either. That costs a dirty page where ld64 would have kept the data shared, but the
+        // alternative is a pointer in a read-only segment, which simply doesn't work.
+        output_section_id::CONST => SegmentType::DataConstSections,
         output_section_id::DATA
         | output_section_id::THREAD_VARS
         | output_section_id::TDATA
-        | output_section_id::TBSS => SegmentType::DataSections,
+        | output_section_id::TBSS
+        | output_section_id::COMMON
+        | output_section_id::BSS => SegmentType::DataSections,
         output_section_id::GOT => SegmentType::DataConstSections,
         output_section_id::CHAINED_FIXUP_TABLE
         | output_section_id::SYMTAB_LOCAL
@@ -840,6 +849,17 @@ fn mapped_segment_type(section_id: crate::output_section_id::OutputSectionId) ->
         | output_section_id::INDIRECT_SYMTAB
         | output_section_id::STRTAB
         | output_section_id::CODE_SIGNATURE => SegmentType::LinkeditSections,
+
+        // A section we have no built-in ID for still has to land somewhere. Answering `Unused`
+        // would leave it out of the output order, and so out of the file layout, while each object
+        // would still have reserved bytes for it - which shows up as the output buffer running out
+        // partway through the write. `__DATA` is the safe home: it's writable, so nothing that ends
+        // up there can fault on a store, and it's the segment ld64 uses for sections it doesn't
+        // recognise either.
+        _ if section_id.as_usize() >= crate::output_section_id::NUM_BUILT_IN_SECTIONS => {
+            SegmentType::DataSections
+        }
+
         _ => SegmentType::Unused,
     }
 }
@@ -1795,7 +1815,7 @@ impl platform::Platform for MachO {
     }
 
     fn build_output_order_and_program_segments<'data>(
-        _custom: &crate::output_section_id::CustomSectionIds,
+        custom: &crate::output_section_id::CustomSectionIds,
         output_kind: OutputKind,
         output_sections: &crate::output_section_id::OutputSections<'data, Self>,
         secondary: &crate::output_section_map::OutputSectionMap<
@@ -1815,15 +1835,26 @@ impl platform::Platform for MachO {
         // Content of the sections (e.g. __text, __data).
         builder.add_section(output_section_id::TEXT);
         builder.add_section(output_section_id::CSTRING);
-        builder.add_section(output_section_id::CONST);
         builder.add_section(output_section_id::GCC_EXCEPT_TABLE);
         builder.add_section(output_section_id::PLT_GOT);
         builder.add_section(output_section_id::DATA);
         // ld64 puts the descriptors ahead of the thread-local data they point at.
         builder.add_section(output_section_id::THREAD_VARS);
         builder.add_section(output_section_id::TDATA);
+        // Sections we have no built-in ID for are mapped to `__DATA` by `mapped_segment_type`, so
+        // they have to be added here or the segment's section count and its contents disagree.
+        // They go before the zerofill sections below because they do have file content, and a
+        // zerofill section is only free of a file offset while nothing follows it in the segment.
+        //
+        // Mach-O attributes report neither `alloc` nor `writable`, so the generic classifier puts
+        // every custom section in the `nonalloc` bucket; there's nothing to read from the other
+        // buckets.
+        builder.add_sections(&custom.nonalloc);
         builder.add_section(output_section_id::TBSS);
+        builder.add_section(output_section_id::COMMON);
+        builder.add_section(output_section_id::BSS);
         builder.add_section(output_section_id::GOT);
+        builder.add_section(output_section_id::CONST);
         // The rest (e.g. symbol table, string table).
         builder.add_section(output_section_id::STRTAB);
         builder.add_section(output_section_id::CHAINED_FIXUP_TABLE);
@@ -2019,6 +2050,16 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         section_flags: macho::S_THREAD_LOCAL_ZEROFILL.to_flags(),
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::COMMON.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__common")),
+        section_flags: macho::S_ZEROFILL.to_flags(),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::BSS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__bss")),
+        section_flags: macho::S_ZEROFILL.to_flags(),
+        ..DEFAULT_DEFS
+    };
 
     defs
 };
@@ -2102,7 +2143,37 @@ const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
     SectionRule::exact_section_keep(b"__thread_vars", crate::output_section_id::THREAD_VARS),
     SectionRule::exact_section_keep(b"__thread_data", crate::output_section_id::TDATA),
     SectionRule::exact_section_keep(b"__thread_bss", crate::output_section_id::TBSS),
-    // SectionRule::exact_section_keep(b"__compact_unwind", crate::output_section_id::EH_FRAME),
+    SectionRule::exact_section_keep(b"__common", crate::output_section_id::COMMON),
+    SectionRule::exact_section_keep(b"__bss", crate::output_section_id::BSS),
+    // The literal pools are read-only constants that the assembler kept apart only so that the
+    // linker could deduplicate them by size. We don't deduplicate them yet, and ld64 doesn't carry
+    // the names through to the output either - it folds all three into `__TEXT,__const` - so
+    // sending them there costs no fidelity.
+    SectionRule::exact_section_keep(b"__literal4", crate::output_section_id::CONST),
+    SectionRule::exact_section_keep(b"__literal8", crate::output_section_id::CONST),
+    SectionRule::exact_section_keep(b"__literal16", crate::output_section_id::CONST),
+    // `__LD,__compact_unwind` is input to the linker, not output from it: ld64 consumes it to
+    // build `__TEXT,__unwind_info` and emits no `__compact_unwind`. We can't build
+    // `__unwind_info` yet (`warn_if_unwind_info_needed` says so when it matters), but copying
+    // the raw input through would be wrong whether or not we could.
+    SectionRule::exact(b"__compact_unwind", SectionRuleOutcome::Discard),
+    // ld64 keeps `__eh_frame`, and we can't yet. A CIE reaches its personality routine through an
+    // indirection slot rather than directly, because the unwinder dereferences what it finds there
+    // - so `ARM64_RELOC_POINTER_TO_GOT` against a personality needs a real `__got` entry even when
+    // the routine is defined in this image. We only give `__got` entries to dylib imports (see
+    // `Indirection::for_symbol`), because `Resolution::raw_value` is reused to hold the slot
+    // address and a locally defined symbol needs its own address there as well. Emitting the
+    // section before that's separated would produce an `__eh_frame` whose personality pointers
+    // are wrong, which is worse than not emitting one: `warn_if_unwind_info_needed` already
+    // says unwinding won't work.
+    SectionRule::exact(b"__eh_frame", SectionRuleOutcome::Discard),
+    // Debug info stays in the object files for `dsymutil` to collect into a .dSYM bundle; a linked
+    // Mach-O image carries none of it. `__bitcode` and `__cmdline` are likewise only there to feed
+    // LTO - `__bitcode` alone is 5 MiB in Rust's libstd.
+    SectionRule::prefix(b"__debug_", SectionRuleOutcome::Discard),
+    SectionRule::prefix(b"__apple_", SectionRuleOutcome::Discard),
+    SectionRule::exact(b"__bitcode", SectionRuleOutcome::Discard),
+    SectionRule::exact(b"__cmdline", SectionRuleOutcome::Discard),
 ];
 
 pub(crate) const PROGRAM_SEGMENT_DEFS: &[ProgramSegmentDef] = &[
