@@ -47,28 +47,36 @@ const LDR_UIMM_64: u32 = 0xf940_0000;
 /// `ADD <Xd|SP>, <Xn|SP>, #imm` - C6.2.5, sf=1, op=0, S=0, sh=0.
 const ADD_IMM_64: u32 = 0x9100_0000;
 
+/// The relaxations Mach-O performs are not reached through this trait, so there are none of these
+/// to have.
+///
+/// Rewriting a GOT load into an address computation is done by `relax_got_load`, decided per
+/// relocation as it is applied rather than chosen ahead of time from a table: Mach-O has no addend
+/// field, so what a relocation means depends on bytes that are only read at that point. Having no
+/// values at all is what makes the methods below dead rather than merely unused - there is no
+/// `self` to call them on.
 #[derive(Debug, Clone)]
-pub(crate) struct Relaxation {}
+pub(crate) enum Relaxation {}
 
 impl crate::platform::Relaxation for Relaxation {
     fn apply(&self, _section_bytes: &mut [u8], _offset_in_section: &mut u64, _addend: &mut i64) {
-        todo!()
+        match *self {}
     }
 
     fn rel_info(&self) -> linker_utils::elf::RelocationKindInfo {
-        todo!()
+        match *self {}
     }
 
     fn debug_kind(&self) -> impl std::fmt::Debug {
-        todo!()
+        match *self {}
     }
 
     fn next_modifier(&self) -> linker_utils::relaxation::RelocationModifier {
-        todo!()
+        match *self {}
     }
 
     fn is_mandatory(&self) -> bool {
-        todo!()
+        match *self {}
     }
 }
 
@@ -87,13 +95,17 @@ impl crate::platform::Arch for MachOAArch64 {
         }
     }
     fn arch_identifier() -> <Self::Platform as crate::platform::Platform>::ArchIdentifier {
-        todo!()
+        // ELF names its architecture in `e_machine`. A Mach-O header carries a cpu type and subtype
+        // instead, written directly, so there is nothing for this to identify.
     }
 
     fn get_dynamic_relocation_type(
         _relocation: linker_utils::elf::DynamicRelocationKind,
     ) -> object::macho::RelocationInfo {
-        todo!()
+        // Only the ELF writer asks this, to fill in a `.rela.dyn` entry. Mach-O states what dyld
+        // must do in the chained-fixup table, whose encoding shares nothing with a relocation - so
+        // there is no answer to give rather than an answer we have not written yet.
+        unreachable!("Mach-O expresses dynamic relocations as chained fixups")
     }
 
     fn write_plt_entry(
@@ -335,19 +347,29 @@ impl crate::platform::Arch for MachOAArch64 {
     }
 
     fn tp_offset_start(_layout: &crate::layout::Layout<Self::Platform>) -> u64 {
-        todo!()
+        // ELF addresses a thread-local by its offset from the thread pointer, so it needs to know
+        // where the block starts. Mach-O goes through a `tlv_descriptor` that dyld fills in, so
+        // there is no link-time base to offset from.
+        0
     }
 
     fn get_property_class(_property_type: u32) -> Option<crate::elf::PropertyClass> {
-        todo!()
+        // `.note.gnu.property` is an ELF section. Mach-O records the equivalent guarantees in the
+        // header flags and in `LC_BUILD_VERSION`, neither of which is a property note.
+        None
     }
 
     fn merge_eflags(_eflags: impl Iterator<Item = u32>) -> crate::error::Result<u32> {
-        todo!()
+        // `e_flags` is an ELF header field. A Mach-O header carries its cpu subtype instead, and
+        // that is decided when the header is written rather than merged from the inputs.
+        bail!("Mach-O objects have no e_flags to merge")
     }
 
     fn high_part_relocations() -> &'static [object::macho::RelocationInfo] {
-        todo!()
+        // A relocation pair that splits a value across two instructions is spelled with
+        // `ARM64_RELOC_ADDEND` or `ARM64_RELOC_SUBTRACTOR`, which modify the relocation that
+        // follows them rather than being listed as high parts of their own.
+        &[]
     }
 
     fn get_source_info<'data>(
@@ -369,7 +391,10 @@ impl crate::platform::Arch for MachOAArch64 {
         _non_zero_address: bool,
         _relax_deltas: Option<&linker_utils::relaxation::SectionRelaxDeltas>,
     ) -> Option<Self::Relaxation> {
-        todo!()
+        // There are no `Relaxation` values to return, so this is the only answer there is.
+        // `relax_got_load` is where Mach-O rewrites an instruction, at the point of applying the
+        // relocation rather than from a decision made here.
+        None
     }
 }
 

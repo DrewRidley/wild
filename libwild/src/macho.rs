@@ -710,7 +710,10 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     }
 
     fn symbol_versions(&self) -> &[<Self::Platform as platform::Platform>::SymbolVersionIndex] {
-        todo!()
+        // Symbol versioning is an ELF facility. A Mach-O library distinguishes its revisions by the
+        // compatibility and current versions in `LC_ID_DYLIB`, which apply to the library as a
+        // whole rather than to individual symbols.
+        &[]
     }
 
     fn dynamic_symbol_used(
@@ -785,9 +788,11 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
     fn section_data_cow(
         &self,
-        _section: &<Self::Platform as platform::Platform>::SectionHeader,
+        section: &<Self::Platform as platform::Platform>::SectionHeader,
     ) -> crate::error::Result<std::borrow::Cow<'data, [u8]>> {
-        todo!()
+        // Borrowed rather than owned: this exists so that ELF can hand back a decompressed copy of
+        // a `SHF_COMPRESSED` section, and Mach-O has no compressed sections to expand.
+        Ok(std::borrow::Cow::Borrowed(self.raw_section_data(section)?))
     }
 
     fn section_alignment(
@@ -882,7 +887,9 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     fn dynamic_tags(
         &self,
     ) -> crate::error::Result<&'data [<Self::Platform as platform::Platform>::DynamicEntry]> {
-        todo!()
+        // What ELF states in `.dynamic`, Mach-O states in load commands, each with its own
+        // structure rather than as tag/value pairs - so there is no list of these to return.
+        Ok(&[])
     }
 }
 
@@ -979,19 +986,23 @@ pub(crate) struct SectionType {}
 
 impl platform::SectionType for SectionType {
     fn is_rela(&self) -> bool {
-        todo!()
+        // Mach-O keeps a section's relocations beside it, named by the section header, rather than
+        // in a section of their own that has to be recognised by type.
+        false
     }
 
     fn is_rel(&self) -> bool {
-        todo!()
+        false
     }
 
     fn is_symtab(&self) -> bool {
-        todo!()
+        // The symbol and string tables are found through `LC_SYMTAB`, not by scanning sections for
+        // one of the right type.
+        false
     }
 
     fn is_strtab(&self) -> bool {
-        todo!()
+        false
     }
 }
 
@@ -1388,7 +1399,8 @@ pub(crate) struct VerneedTable<'data> {
 
 impl<'data> platform::VerneedTable<'data> for VerneedTable<'data> {
     fn version_name(&self, _local_symbol_index: object::SymbolIndex) -> Option<&'data [u8]> {
-        todo!()
+        // No symbol carries a version, so none has a version to name.
+        None
     }
 }
 
