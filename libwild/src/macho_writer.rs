@@ -138,6 +138,7 @@ use object::slice_from_bytes_mut;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use rayon::slice::ParallelSlice;
+use rayon::slice::ParallelSliceMut;
 use sha2::Digest;
 use sha2::Sha256;
 use std::ops::BitAnd;
@@ -1280,13 +1281,25 @@ struct UnwindEntry {
 /// Reads every input `__LD,__compact_unwind` section and returns one entry per function, ordered by
 /// address, which is the order `__unwind_info` has to be searchable in.
 fn collect_unwind_entries(layout: &MachOLayout<'_>) -> Result<Vec<UnwindEntry>> {
-    let mut entries = Vec::new();
+    verbose_timing_phase!("Collect unwind entries");
 
-    for group in &layout.group_layouts {
-        for file in &group.files {
-            let FileLayout::Object(object) = file else {
-                continue;
-            };
+    // Objects don't depend on each other here - each one's entries are read from its own bytes -
+    // so they're read in parallel and put in order afterwards. There is one entry per function in
+    // the program, so on a large link this is the bulk of the work.
+    let objects = layout
+        .group_layouts
+        .iter()
+        .flat_map(|group| &group.files)
+        .filter_map(|file| match file {
+            FileLayout::Object(object) => Some(object),
+            _ => None,
+        })
+        .collect_vec();
+
+    let per_object = objects
+        .into_par_iter()
+        .map(|object| -> Result<Vec<UnwindEntry>> {
+            let mut entries = Vec::new();
 
             for slot in &object.sections {
                 let SectionSlot::FrameData(section_index) = slot else {
@@ -1296,10 +1309,13 @@ fn collect_unwind_entries(layout: &MachOLayout<'_>) -> Result<Vec<UnwindEntry>> 
                 read_compact_unwind_section(object, *section_index, layout, &mut entries)
                     .with_context(|| format!("Failed to read __compact_unwind from {object}"))?;
             }
-        }
-    }
 
-    entries.sort_unstable_by_key(|entry| entry.function_address);
+            Ok(entries)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut entries: Vec<UnwindEntry> = per_object.into_iter().flatten().collect();
+    entries.par_sort_unstable_by_key(|entry| entry.function_address);
 
     Ok(entries)
 }
