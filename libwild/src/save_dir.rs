@@ -211,7 +211,15 @@ impl SaveDirState {
         let mut args = args.iter();
 
         while let Some(arg) = args.next() {
-            if let Some(args_path) = arg.strip_prefix("@") {
+            // Not every `@` starts a response file. Mach-O spells its relocatable path prefixes
+            // `@loader_path`, `@executable_path` and `@rpath`, and they arrive here as the values
+            // of `-rpath` and `-install_name` - which the argument parser consumes as parameters,
+            // so it never mistakes them, but this walks the arguments flat and would. Requiring the
+            // file to exist tells the two apart; a response file that genuinely isn't there still
+            // fails, just when the arguments are parsed rather than when they are saved.
+            if let Some(args_path) = arg.strip_prefix("@")
+                && Path::new(args_path).exists()
+            {
                 let args_from_file = crate::args::read_args_from_file(Path::new(args_path))?;
 
                 if is_rsp_file {

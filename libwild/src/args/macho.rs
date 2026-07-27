@@ -33,6 +33,8 @@ pub struct MachOArgs {
     pub(crate) install_name: Option<Box<str>>,
     /// A file naming the symbols to export, one per line, instead of exporting everything visible.
     pub(crate) exported_symbols_list: Option<Box<Path>>,
+    /// Directories dyld searches for `@rpath`-relative dependencies, in the order given.
+    pub(crate) rpaths: Vec<Box<str>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +100,7 @@ impl Default for MachOArgs {
             dylib: false,
             install_name: None,
             exported_symbols_list: None,
+            rpaths: Vec::new(),
         }
     }
 }
@@ -372,6 +375,19 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
         .help("Remove code and data that nothing reaches")
         .execute(|args, _modifier_stack| {
             args.dead_strip = true;
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("rpath")
+        .help("Add a directory for dyld to resolve @rpath dependencies against")
+        .execute(|args, _modifier_stack, value| {
+            // dyld tries the paths in the order they appear, so a repeat can't change the answer -
+            // the earlier one already decided it. ld64 warns and emits one; we quietly emit one.
+            if !args.rpaths.iter().any(|rpath| rpath.as_ref() == value) {
+                args.rpaths.push(Box::from(value));
+            }
             Ok(())
         });
 

@@ -166,6 +166,7 @@ pub(crate) type SectionEntry = object::macho::Section64<Endianness>;
 pub(crate) type EntryPointCommand = object::macho::EntryPointCommand<Endianness>;
 pub(crate) type DylinkerCommand = object::macho::DylinkerCommand<Endianness>;
 pub(crate) type DylibCommand = object::macho::DylibCommand<Endianness>;
+pub(crate) type RpathCommand = object::macho::RpathCommand<Endianness>;
 pub(crate) type CodeSignatureCommand = object::macho::LinkeditDataCommand<Endianness>;
 pub(crate) type DyldChainedFixupsCommand = object::macho::LinkeditDataCommand<Endianness>;
 pub(crate) type ChainedFixupsHeader = DyldChainedFixupsHeader;
@@ -212,6 +213,11 @@ pub(crate) fn own_install_name(args: &MachOArgs) -> &[u8] {
 
 pub(crate) fn load_dylib_command_size(path: &[u8]) -> usize {
     (size_of::<DylibCommand>() + path.len() + 1).next_multiple_of(MACHO_COMMAND_ALIGNMENT)
+}
+
+/// The size of the `LC_RPATH` command naming one search directory, terminator and padding included.
+pub(crate) fn rpath_command_size(path: &str) -> usize {
+    (size_of::<RpathCommand>() + path.len() + 1).next_multiple_of(MACHO_COMMAND_ALIGNMENT)
 }
 
 #[derive(Debug, Default)]
@@ -819,7 +825,13 @@ fn is_splittable_section_type(section_type: macho::SectionType) -> bool {
 #[derive(Debug)]
 enum ObjectKind<'data> {
     Regular(RegularObject<'data>),
-    Dylib,
+    Dylib {
+        /// The name the library calls itself, from its `LC_ID_DYLIB`. This, not the path we happened
+        /// to open it by, is what an image linking against it must record: the path is where the
+        /// library was at link time, while the install name is where it expects to be found at run
+        /// time - commonly `@rpath/...`, which is the whole point of `-rpath`.
+        install_name: Option<&'data [u8]>,
+    },
 }
 
 #[derive(derive_more::Debug)]
@@ -844,11 +856,15 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
         let mut symbols = None;
         let mut sections = None;
+        let mut install_name = None;
 
         while let Some(command) = commands.next()? {
             if let Some(symtab_command) = command.symtab()? {
                 ensure!(symbols.is_none(), "At most one symtab command expected");
                 symbols = Some(symtab_command.symbols::<macho::MachHeader64<_>, _>(LE, input)?);
+            } else if is_dynamic && command.cmd() == object::macho::LC_ID_DYLIB {
+                let dylib_command = command.data::<DylibCommand>()?;
+                install_name = Some(command.string(LE, dylib_command.dylib.name)?);
             } else if !is_dynamic
                 && let Some((segment_command, segment_data)) = command.segment_64()?
             {
@@ -861,7 +877,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         let symbols = symbols.ok_or("Missing symbol table")?;
 
         let kind = if is_dynamic {
-            ObjectKind::Dylib
+            ObjectKind::Dylib { install_name }
         } else {
             let sections = sections.ok_or("Missing segment command")?;
 
@@ -909,7 +925,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     }
 
     fn is_dynamic(&self) -> bool {
-        matches!(self.kind, ObjectKind::Dylib)
+        matches!(self.kind, ObjectKind::Dylib { .. })
     }
 
     fn num_symbols(&self) -> usize {
@@ -1175,7 +1191,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     ) -> Option<<Self::Platform as platform::Platform>::DynamicTagValues<'data>> {
         match self.kind {
             ObjectKind::Regular(_) => None,
-            ObjectKind::Dylib => Some(DynamicTagValues::default()),
+            ObjectKind::Dylib { .. } => Some(DynamicTagValues::default()),
         }
     }
 
@@ -2603,6 +2619,10 @@ impl platform::Platform for MachO {
             allocate_load_cmd(command_size);
         }
 
+        for rpath in &args.rpaths {
+            allocate_load_cmd(rpath_command_size(rpath));
+        }
+
         allocate_load_cmd(size_of::<DyldChainedFixupsCommand>());
         allocate_load_cmd(size_of::<SymtabCommand>());
         allocate_load_cmd(size_of::<DysymtabCommand>());
@@ -2908,7 +2928,18 @@ pub(crate) fn install_name<'data>(
 ) -> &'data [u8] {
     match symbol_db.file(file_id) {
         SequencedInput::StubLibrary(stub) => stub.defined_symbols.install_name.as_bytes(),
-        SequencedInput::Object(obj) => obj.parsed.input.lib_name(),
+
+        // What a library calls itself, not the path we opened it by. The two differ whenever a
+        // dylib is built to be found somewhere other than where it was when we linked against it,
+        // which is the normal case: `@rpath/libfoo.dylib` says "look along the rpath", and
+        // recording the build-time path instead produces an image that only runs from the
+        // directory it was linked in.
+        SequencedInput::Object(obj) => obj
+            .parsed
+            .object
+            .install_name()
+            .unwrap_or_else(|| obj.parsed.input.lib_name()),
+
         _ => {
             panic!("Internal error: Expected StubLibrary or Dynamic");
         }
@@ -3446,7 +3477,7 @@ impl<'data> File<'data> {
     fn sections(&self) -> &[SectionHeader] {
         match &self.kind {
             ObjectKind::Regular(regular) => &regular.atoms.sections,
-            ObjectKind::Dylib => &[],
+            ObjectKind::Dylib { .. } => &[],
         }
     }
 
@@ -3455,7 +3486,7 @@ impl<'data> File<'data> {
     fn file_sections(&self) -> &'data [SectionHeader] {
         match &self.kind {
             ObjectKind::Regular(regular) => regular.sections,
-            ObjectKind::Dylib => &[],
+            ObjectKind::Dylib { .. } => &[],
         }
     }
 
@@ -3473,10 +3504,18 @@ impl<'data> File<'data> {
             .atom_containing(section, address, self.file_sections())
     }
 
+    /// The name a dylib records for itself in `LC_ID_DYLIB`, if it is a dylib and says so.
+    pub(crate) fn install_name(&self) -> Option<&'data [u8]> {
+        match &self.kind {
+            ObjectKind::Regular(_) => None,
+            ObjectKind::Dylib { install_name } => *install_name,
+        }
+    }
+
     fn atoms(&self) -> Option<&Atoms> {
         match &self.kind {
             ObjectKind::Regular(regular) => Some(&regular.atoms),
-            ObjectKind::Dylib => None,
+            ObjectKind::Dylib { .. } => None,
         }
     }
 
