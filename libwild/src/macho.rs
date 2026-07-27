@@ -1361,6 +1361,11 @@ impl platform::Platform for MachO {
     // symbol happened to be first from resolution entirely.
     const HAS_NULL_SYMBOL_ENTRY: bool = false;
 
+    // Mach-O has no COMDAT groups, so nothing has already dropped the duplicate copies of an inline
+    // or template function - each object's copy is ordinary content, told apart only by which
+    // definition the symbol table settled on.
+    const COALESCES_LOSING_DEFINITIONS: bool = true;
+
     fn link_for_arch<'data>(
         linker: &'data crate::Linker,
         args: &'data Self::Args,

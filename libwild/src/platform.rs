@@ -842,6 +842,15 @@ pub(crate) trait Platform:
     /// should be excluded from name resolution. `true` for ELF (`STN_UNDEF`).
     const HAS_NULL_SYMBOL_ENTRY: bool = false;
 
+    /// Whether a definition that loses to another should have its content dropped even when we're
+    /// not removing unreachable code.
+    ///
+    /// ELF says no, because it has already happened: duplicate definitions of an inline function
+    /// arrive in COMDAT groups and the losing group is discarded when the group is read. Mach-O has
+    /// no groups - the duplicates are ordinary content that only the symbol table distinguishes -
+    /// so unless this is done, every copy of every template instantiation reaches the output.
+    const COALESCES_LOSING_DEFINITIONS: bool = false;
+
     /// Used when the linker needs to create a symtab entry from scratch rather than copying one
     /// from an input file.
     fn default_symtab_entry() -> Self::SymtabEntry;

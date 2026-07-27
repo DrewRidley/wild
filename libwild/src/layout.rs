@@ -4021,6 +4021,38 @@ fn new_dynamic_object_layout_state<'data, P: Platform>(
 }
 
 impl<'data, P: Platform> ObjectLayoutState<'data, P> {
+    /// Returns, for each section, whether every symbol it defines lost to a definition elsewhere.
+    ///
+    /// Such a section is a duplicate copy of something already being emitted, so its content is
+    /// dead however it was reached. A section defining no symbols at all is not one of these: it
+    /// has nothing to have lost with, and is reached section-relatively.
+    fn sections_defining_only_losers(&self, symbol_db: &SymbolDb<'data, P>) -> Result<Vec<bool>> {
+        let mut defines_any = vec![false; self.sections.len()];
+        let mut defines_winner = vec![false; self.sections.len()];
+
+        for (local_index, symbol) in self.object.enumerate_symbols() {
+            let Some(section_index) = self.object.symbol_section(symbol, local_index)? else {
+                continue;
+            };
+
+            let Some(defines_any) = defines_any.get_mut(section_index.0) else {
+                continue;
+            };
+            *defines_any = true;
+
+            let symbol_id = self.symbol_id_range.input_to_id(local_index);
+            if symbol_db.is_canonical(symbol_id) {
+                defines_winner[section_index.0] = true;
+            }
+        }
+
+        Ok(defines_any
+            .into_iter()
+            .zip(defines_winner)
+            .map(|(any, winner)| any && !winner)
+            .collect())
+    }
+
     #[inline(always)]
     fn activate<'scope, A: Arch<Platform = P>>(
         &mut self,
@@ -4034,6 +4066,19 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
         let mut riscv_attributes_section = None;
 
         let no_gc = !resources.symbol_db.args.should_gc_sections();
+
+        // With unreachable code being removed, a losing definition falls away on its own: nothing
+        // refers to it, so nothing loads it. With that turned off everything loads regardless, so
+        // on a format where the duplicates are ordinary content this is where they are dropped.
+        //
+        // A section is kept if any symbol it defines is the definition we settled on, and also if
+        // it defines none at all - content nothing names is reached by section-relative references
+        // rather than by symbol, and dropping it would take those with it.
+        let losing_sections = if no_gc && P::COALESCES_LOSING_DEFINITIONS {
+            Some(self.sections_defining_only_losers(resources.symbol_db)?)
+        } else {
+            None
+        };
 
         for (i, section) in self.sections.iter().enumerate() {
             match section {
@@ -4049,12 +4094,14 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
                 }
                 SectionSlot::Unloaded(sec) => {
                     if no_gc {
-                        queue
-                            .local_work
-                            .push(WorkItem::LoadSection(SectionLoadRequest::new(
-                                self.file_id,
-                                object::SectionIndex(i),
-                            )));
+                        if losing_sections.as_ref().is_none_or(|losers| !losers[i]) {
+                            queue
+                                .local_work
+                                .push(WorkItem::LoadSection(SectionLoadRequest::new(
+                                    self.file_id,
+                                    object::SectionIndex(i),
+                                )));
+                        }
                     } else if sec.start_stop_eligible {
                         let part_id = self.section_part_id(
                             object::SectionIndex(i),
