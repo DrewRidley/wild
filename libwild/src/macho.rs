@@ -64,6 +64,7 @@ use object::read::macho::Segment;
 use std::borrow::Cow;
 use std::num::NonZeroU8;
 use std::num::NonZeroU64;
+use std::ops::Range;
 
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct MachO;
@@ -252,6 +253,156 @@ pub(crate) struct File<'data> {
     kind: ObjectKind<'data>,
 }
 
+/// The pieces an input object is split into so that unreferenced ones can be dropped.
+///
+/// A Mach-O object puts every function in one `__text` rather than one section each, and marks the
+/// header `MH_SUBSECTIONS_VIA_SYMBOLS` to say that the sections may be cut at symbol boundaries.
+/// Splitting there is what lets the rest of the linker - which reasons about whole sections - drop
+/// an individual function, because after the split a function *is* a whole section.
+#[derive(Debug)]
+struct Atoms {
+    /// One synthesised section per atom, in address order within each parent.
+    sections: Vec<SectionHeader>,
+
+    /// Which real section each atom came from, so its relocations can be found.
+    parents: Vec<u32>,
+
+    /// The atoms belonging to each real section, as a range into the two vectors above.
+    by_parent: Vec<Range<u32>>,
+}
+
+impl Atoms {
+    /// Splits every section of `sections` at the addresses in `symbol_addresses`.
+    ///
+    /// `symbol_addresses` holds, for each real section, the addresses of the symbols defined in it.
+    /// It doesn't need to be sorted or free of duplicates.
+    fn split(
+        sections: &[SectionHeader],
+        symbol_addresses: &mut [Vec<u64>],
+        subsections_via_symbols: bool,
+    ) -> Self {
+        let mut atoms = Atoms {
+            sections: Vec::with_capacity(sections.len()),
+            parents: Vec::with_capacity(sections.len()),
+            by_parent: Vec::with_capacity(sections.len()),
+        };
+
+        for (index, section) in sections.iter().enumerate() {
+            let start = atoms.sections.len() as u32;
+            atoms.push_atoms_of(
+                section,
+                index as u32,
+                &mut symbol_addresses[index],
+                subsections_via_symbols,
+            );
+            atoms.by_parent.push(start..atoms.sections.len() as u32);
+        }
+
+        atoms
+    }
+
+    fn push_atoms_of(
+        &mut self,
+        section: &SectionHeader,
+        parent: u32,
+        addresses: &mut Vec<u64>,
+        subsections_via_symbols: bool,
+    ) {
+        let base = section.addr.get(LE);
+        let size = section.size.get(LE);
+
+        if !subsections_via_symbols || !is_splittable_section_type(section.section_type(LE)) {
+            self.push_atom(section, parent, 0, size);
+            return;
+        }
+
+        addresses.sort_unstable();
+        addresses.dedup();
+
+        // Anything before the first symbol has no name to be reached by, so it stays with the
+        // section rather than becoming droppable on its own.
+        let mut offset = 0;
+        let mut cuts = addresses
+            .iter()
+            .filter_map(|address| address.checked_sub(base))
+            .filter(|cut| *cut > 0 && *cut < size)
+            .peekable();
+
+        if cuts.peek().is_none() {
+            self.push_atom(section, parent, 0, size);
+            return;
+        }
+
+        for cut in cuts {
+            self.push_atom(section, parent, offset, cut - offset);
+            offset = cut;
+        }
+
+        self.push_atom(section, parent, offset, size - offset);
+    }
+
+    /// Returns the atom of `parent` that `address` falls in.
+    fn atom_containing(
+        &self,
+        parent: object::SectionIndex,
+        address: u64,
+        file_sections: &[SectionHeader],
+    ) -> Option<object::SectionIndex> {
+        let range = self.by_parent.get(parent.0)?.clone();
+        let candidates = &self.sections[range.start as usize..range.end as usize];
+
+        // Atoms of a section are contiguous and in address order, so the one we want is the last
+        // that starts at or before the address. A symbol exactly on a boundary belongs to the atom
+        // it opens, which is what `partition_point` gives.
+        let found = candidates.partition_point(|atom| atom.addr.get(LE) <= address);
+
+        if found == 0 {
+            // Before the first atom, which can only happen if the address is outside the section.
+            let _ = file_sections;
+            return None;
+        }
+
+        Some(object::SectionIndex(range.start as usize + found - 1))
+    }
+
+    fn push_atom(&mut self, section: &SectionHeader, parent: u32, offset: u64, size: u64) {
+        let mut atom = *section;
+        atom.addr.set(LE, section.addr.get(LE) + offset);
+        atom.size.set(LE, size);
+
+        // A zerofill section has no bytes in the file, so its `offset` names nothing and must stay
+        // as it is rather than being advanced past the end of the file.
+        if !is_no_bits_section_type(section.section_type(LE)) {
+            atom.offset.set(LE, section.offset.get(LE) + offset as u32);
+        }
+
+        // Only the first atom can rely on the section's alignment; the rest begin wherever a symbol
+        // did, so they can promise no more than the address itself provides.
+        if offset != 0 {
+            let from_address = offset.trailing_zeros().min(section.align.get(LE));
+            atom.align.set(LE, from_address);
+        }
+
+        self.sections.push(atom);
+        self.parents.push(parent);
+    }
+}
+
+/// Returns whether a section of this type may be cut at symbol boundaries.
+///
+/// The literal sections may not: their contents are deduplicated by the string merger, which owns
+/// how they're divided, and a symbol in one names a string rather than a region.
+fn is_splittable_section_type(section_type: macho::SectionType) -> bool {
+    !matches!(
+        section_type,
+        macho::S_CSTRING_LITERALS
+            | macho::S_4BYTE_LITERALS
+            | macho::S_8BYTE_LITERALS
+            | macho::S_16BYTE_LITERALS
+            | macho::S_LITERAL_POINTERS
+    )
+}
+
 #[derive(Debug)]
 enum ObjectKind<'data> {
     Regular(RegularObject<'data>),
@@ -260,8 +411,15 @@ enum ObjectKind<'data> {
 
 #[derive(derive_more::Debug)]
 struct RegularObject<'data> {
+    /// The sections as the object file records them. Kept because relocations and section
+    /// numbering are expressed against these, not against the atoms.
     #[debug(skip)]
     pub(crate) sections: SectionTable<'data>,
+
+    /// The same content divided into independently droppable pieces. This is what the rest of the
+    /// linker sees as "the sections of this object".
+    #[debug(skip)]
+    atoms: Atoms,
 }
 
 impl<'data> platform::ObjectFile<'data> for File<'data> {
@@ -287,17 +445,43 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
             }
         }
 
+        let symbols = symbols.ok_or("Missing symbol table")?;
+
         let kind = if is_dynamic {
             ObjectKind::Dylib
         } else {
+            let sections = sections.ok_or("Missing segment command")?;
+
+            // Where each section may be cut. A symbol marks the start of an independently
+            // droppable region, so gathering the defined symbols by section is what determines the
+            // atoms - see `Atoms::split`.
+            let mut addresses_by_section = vec![Vec::new(); sections.len()];
+            for symbol in symbols.iter() {
+                if symbol.n_type.typ() != N_SECT || symbol.n_sect == 0 {
+                    continue;
+                }
+                if let Some(addresses) =
+                    addresses_by_section.get_mut(usize::from(symbol.n_sect - 1))
+                {
+                    addresses.push(symbol.n_value.get(LE));
+                }
+            }
+
+            // The flag is the object saying its sections are safe to cut this way. Without it the
+            // compiler has made no such promise - data may be addressed across what looks like a
+            // symbol boundary - so each section stays whole.
+            let subsections_via_symbols =
+                header.flags(LE).0 & object::macho::MH_SUBSECTIONS_VIA_SYMBOLS.0 != 0;
+
             ObjectKind::Regular(RegularObject {
-                sections: sections.ok_or("Missing segment command")?,
+                atoms: Atoms::split(sections, &mut addresses_by_section, subsections_via_symbols),
+                sections,
             })
         };
 
         Ok(File {
             data: input,
-            symbols: symbols.ok_or("Missing symbol table")?,
+            symbols,
             flags: header.flags(LE),
             kind,
         })
@@ -405,12 +589,20 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         symbol: &<Self::Platform as platform::Platform>::SymtabEntry,
         _index: object::SymbolIndex,
     ) -> crate::error::Result<Option<object::SectionIndex>> {
-        if symbol.n_type.typ() == N_SECT && symbol.n_sect != 0 {
-            // The index is one-based, NO_SECT == 0, marks a missing section for the symbol.
-            Ok(Some(object::SectionIndex(usize::from(symbol.n_sect - 1))))
-        } else {
-            Ok(None)
+        if symbol.n_type.typ() != N_SECT || symbol.n_sect == 0 {
+            // NO_SECT is zero, so a section number of zero means the symbol has none.
+            return Ok(None);
         }
+
+        // The number is one-based and names a section of the file. What the linker wants is the
+        // atom that section was cut into at this symbol's address.
+        let parent = object::SectionIndex(usize::from(symbol.n_sect - 1));
+
+        let Some(atoms) = self.atoms() else {
+            return Ok(Some(parent));
+        };
+
+        Ok(atoms.atom_containing(parent, symbol.n_value.get(LE), self.file_sections()))
     }
 
     fn is_symbol_thread_local(
@@ -471,11 +663,9 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     }
 
     fn section_name(&self, index: object::SectionIndex) -> crate::error::Result<&'data [u8]> {
-        let section = self
-            .sections()
-            .get(index.0)
-            .ok_or(error!("section index out of range"))?;
-        Ok(section.name())
+        // An atom carries its parent's name, and the parent is borrowed from the file, so the name
+        // outlives us. The atom's own copy of the header does not.
+        Ok(self.atom_parent_section(index)?.name())
     }
 
     fn raw_section_data(
@@ -527,6 +717,12 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         Ok(2u64.pow(section.align(LE)))
     }
 
+    /// Returns the relocations of the section an atom was cut from.
+    ///
+    /// Not just the atom's own: relocations are recorded against the whole section and are not in
+    /// address order, so an atom's are not a contiguous run that could be handed back on its own.
+    /// Callers narrow them with `atom_span_in_parent`, and `r_address` stays relative to the parent
+    /// so that it still lines up with the list.
     fn relocations(
         &self,
         index: object::SectionIndex,
@@ -534,9 +730,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     ) -> crate::error::Result<<Self::Platform as platform::Platform>::RelocationList<'data>> {
         Ok(RelocationList {
             relocations: self
-                .sections()
-                .get(index.0)
-                .ok_or(error!("section index out of range"))?
+                .atom_parent_section(index)?
                 .relocations(LE, self.data)?,
         })
     }
@@ -1334,10 +1528,16 @@ impl platform::Platform for MachO {
         section_index: object::SectionIndex,
         scope: &rayon::Scope<'scope>,
     ) -> crate::error::Result {
-        // TODO
+        let span = state.object.atom_span_in_parent(section_index)?;
+
         for rel in state.relocations(section_index)?.relocations {
+            if !span.contains(&u64::from(rel.info(LE).r_address)) {
+                continue;
+            }
+
             process_relocation::<A>(state, rel, section_index, resources, queue, scope)?;
         }
+
         Ok(())
     }
 
@@ -2634,17 +2834,73 @@ fn is_dynamic_library(file: &SequencedInput<MachO>) -> bool {
 }
 
 impl<'data> File<'data> {
-    fn sections(&self) -> &'data [SectionHeader] {
-        self.kind.sections()
-    }
-}
-
-impl<'data> ObjectKind<'data> {
-    fn sections(&self) -> &'data [SectionHeader] {
-        match self {
-            ObjectKind::Regular(regular_object) => regular_object.sections,
+    /// The object's sections as the linker sees them: one per atom.
+    fn sections(&self) -> &[SectionHeader] {
+        match &self.kind {
+            ObjectKind::Regular(regular) => &regular.atoms.sections,
             ObjectKind::Dylib => &[],
         }
+    }
+
+    /// The sections as the file records them. Relocation offsets and the `n_sect` of a symbol are
+    /// both expressed against these.
+    fn file_sections(&self) -> &'data [SectionHeader] {
+        match &self.kind {
+            ObjectKind::Regular(regular) => regular.sections,
+            ObjectKind::Dylib => &[],
+        }
+    }
+
+    /// Returns the atom of real section `section` that `address` falls in, where `address` is in
+    /// the object's own addressing.
+    ///
+    /// A relocation that names a section rather than a symbol gives a real section number, but
+    /// everything downstream is indexed by atom, so the two have to be bridged.
+    pub(crate) fn atom_for_address(
+        &self,
+        section: object::SectionIndex,
+        address: u64,
+    ) -> Option<object::SectionIndex> {
+        self.atoms()?
+            .atom_containing(section, address, self.file_sections())
+    }
+
+    fn atoms(&self) -> Option<&Atoms> {
+        match &self.kind {
+            ObjectKind::Regular(regular) => Some(&regular.atoms),
+            ObjectKind::Dylib => None,
+        }
+    }
+
+    /// Returns where an atom sits within the section it was cut from, and how long it is. Used to
+    /// pick out the relocations that fall inside it, which are still recorded against the whole
+    /// section.
+    pub(crate) fn atom_span_in_parent(
+        &self,
+        index: object::SectionIndex,
+    ) -> crate::error::Result<Range<u64>> {
+        let atom = self.section(index)?;
+        let parent = self.atom_parent_section(index)?;
+        let offset = atom.addr.get(LE) - parent.addr.get(LE);
+        Ok(offset..offset + atom.size.get(LE))
+    }
+
+    /// Returns the real section an atom was cut from.
+    pub(crate) fn atom_parent_section(
+        &self,
+        index: object::SectionIndex,
+    ) -> crate::error::Result<&'data SectionHeader> {
+        let atoms = self
+            .atoms()
+            .ok_or_else(|| error!("Dylibs have no sections"))?;
+        let parent = *atoms
+            .parents
+            .get(index.0)
+            .ok_or_else(|| error!("Atom index out of range"))?;
+
+        self.file_sections()
+            .get(parent as usize)
+            .ok_or_else(|| error!("Atom names a section that doesn't exist"))
     }
 }
 

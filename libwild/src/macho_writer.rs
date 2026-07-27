@@ -808,6 +808,24 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
     Ok(())
 }
 
+/// Narrows a relocation to the atom being written, moving its address from being relative to the
+/// section it was recorded against to being relative to the atom.
+///
+/// Returns `None` for a relocation belonging to a different atom of the same section.
+fn rebase_to_atom(
+    mut relocation: RelocationInfo,
+    span: &std::ops::Range<u64>,
+) -> Option<RelocationInfo> {
+    let address = u64::from(relocation.r_address);
+
+    if !span.contains(&address) {
+        return None;
+    }
+
+    relocation.r_address = (address - span.start) as u32;
+    Some(relocation)
+}
+
 fn write_object_section<'data, A: Arch<Platform = MachO>>(
     object_layout: &ObjectLayout<'data, MachO>,
     layout: &MachOLayout<'data>,
@@ -825,11 +843,20 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     let section_part_id =
         object_layout.section_part_id(section_index, &layout.symbol_db.section_part_ids);
 
+    // Relocations are recorded against the whole section this atom was cut from, and their
+    // addresses are relative to it. Only the ones landing inside the atom apply here, and those
+    // need rebasing onto its start before they can name a byte of it.
+    let span = object_layout.object.atom_span_in_parent(section_index)?;
     let relocations = object_layout.relocations(section_index)?.relocations;
     let mut index = 0;
 
     while index < relocations.len() {
-        let rel = relocations[index].info(LE);
+        let rel = rebase_to_atom(relocations[index].info(LE), &span);
+
+        let Some(rel) = rel else {
+            index += 1;
+            continue;
+        };
 
         // A subtractor is only half a relocation: it's always immediately followed by an unsigned
         // one at the same address, and together they mean "the distance between these two symbols".
@@ -840,7 +867,7 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
         if rel.r_type == object::macho::ARM64_RELOC_SUBTRACTOR {
             let minuend = relocations
                 .get(index + 1)
-                .map(|next| next.info(LE))
+                .and_then(|next| rebase_to_atom(next.info(LE), &span))
                 .filter(|next| {
                     next.r_type == object::macho::ARM64_RELOC_UNSIGNED
                         && next.r_address == rel.r_address
@@ -863,11 +890,14 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
         // it, in the field that would otherwise name a symbol. The assembler uses it to reach an
         // offset inside a section that has no symbol at that point, so the target is typically a
         // section anchor plus a displacement.
-        let addend = if rel.r_type == object::macho::ARM64_RELOC_ADDEND {
+        let (addend, relocation) = if rel.r_type == object::macho::ARM64_RELOC_ADDEND {
             let value = u64::from(rel.r_symbolnum);
             index += 1;
 
-            let Some(next) = relocations.get(index).map(|next| next.info(LE)) else {
+            let Some(next) = relocations
+                .get(index)
+                .and_then(|next| rebase_to_atom(next.info(LE), &span))
+            else {
                 bail!(
                     "ARM64_RELOC_ADDEND at offset {:#x} of `{}` is the last relocation",
                     rel.r_address,
@@ -883,16 +913,18 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
                 object_layout.object.section_display_name(section_index)
             );
 
-            value
+            // The addend belongs to the relocation that follows it, and that is the one naming
+            // the byte to patch, so it's the one to apply.
+            (value, next)
         } else {
-            0
+            (0, rel)
         };
 
         apply_relocation::<A>(
             object_layout,
             section_address,
             section_part_id,
-            relocations[index].info(LE),
+            relocation,
             addend,
             layout,
             out,
@@ -1529,25 +1561,30 @@ fn resolve_compact_unwind_target(
         .checked_sub(1)
         .context("Section number zero in a __compact_unwind relocation")?;
 
+    // The number names a section of the file, but the output places atoms, so the answer is the
+    // atom holding that address - which is also what may have been dropped.
+    let Some(atom_index) = object
+        .object
+        .atom_for_address(object::SectionIndex(section_index), stored)
+    else {
+        return Ok(None);
+    };
+
     let Some(output_address) = object
         .section_resolutions
-        .get(section_index)
+        .get(atom_index.0)
         .and_then(|resolution| resolution.address())
     else {
         return Ok(None);
     };
 
-    let input_address = object
-        .object
-        .section(object::SectionIndex(section_index))?
-        .addr
-        .get(LE);
+    let atom_address = object.object.section(atom_index)?.addr.get(LE);
 
-    let offset_in_section = stored.checked_sub(input_address).with_context(|| {
-        format!("__compact_unwind names 0x{stored:x}, which is before the section it belongs to")
+    let offset_in_atom = stored.checked_sub(atom_address).with_context(|| {
+        format!("__compact_unwind names 0x{stored:x}, which is before the atom holding it")
     })?;
 
-    Ok(Some(output_address + offset_in_section))
+    Ok(Some(output_address + offset_in_atom))
 }
 
 fn write_section_raw<'out, 'data>(
