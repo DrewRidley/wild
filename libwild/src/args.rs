@@ -1354,6 +1354,18 @@ impl std::str::FromStr for CounterKind {
 }
 
 fn declare_common_args<T: platform::Args>(parser: &mut ArgumentParser<T>) {
+    // Whether to fork is about how the linker runs rather than about the format it emits, so every
+    // platform accepts this. Turning it off is what lets a profiler see the whole link: with the
+    // fork in place, the process that's measured is the parent, which does nothing but wait.
+    parser
+        .declare()
+        .long("no-fork")
+        .help("Do not fork while linking")
+        .execute(|args, _modifier_stack| {
+            args.common_mut().should_fork = false;
+            Ok(())
+        });
+
     parser
         .declare()
         .long("write-layout")
