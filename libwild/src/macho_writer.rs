@@ -957,16 +957,13 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
             layout.symbol_debug(local_symbol_id)
         );
 
-        // A bind tells dyld which symbol to look up, and the chained-fixup encoding has only 8 bits
-        // to carry a displacement from it. Rather than silently truncate, say so - a displaced
-        // reference to an imported symbol is rare enough that guessing isn't worth it.
-        ensure!(
-            !flags.is_dynamic(),
-            "Addend of {addend:#x} applied to a reference to imported symbol {}",
-            layout.symbol_debug(local_symbol_id)
-        );
-
-        resolution.raw_value = resolution.raw_value.wrapping_add(addend);
+        // An imported symbol's address isn't known until dyld binds it, so the displacement can't
+        // be folded into a value here - it has to travel to dyld in the bind itself, which is what
+        // the encoding's `addend` field is for. It's applied below, once we know the slot really is
+        // a bind; adding it to `raw_value` here would corrupt the ordinal.
+        if !flags.is_dynamic() {
+            resolution.raw_value = resolution.raw_value.wrapping_add(addend);
+        }
     }
 
     // Layout only gives a `__got` slot to symbols whose address isn't known until dyld binds them.
@@ -1022,7 +1019,21 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
             // ordinal the same way `write_got_entries` does for `__got`; the difference is only
             // where the slot lives. `__tlv_bootstrap`, which every `tlv_descriptor` starts with,
             // reaches us this way.
-            value = CHAINED_PTR_BIND | import_ordinal(layout, local_symbol_id)?;
+            // A displacement from an imported symbol travels in the bind's own addend field, since
+            // the address it displaces isn't known until dyld resolves it. C++ needs this: a class
+            // with a base stores `&vtable + 0x10` to skip the two words of header that precede the
+            // first virtual function.
+            ensure!(
+                addend <= CHAINED_PTR_BIND_MAX_ADDEND,
+                "Addend of {addend:#x} against imported symbol {} does not fit in the {} bits a \
+                 chained bind has for it",
+                layout.symbol_debug(local_symbol_id),
+                CHAINED_PTR_BIND_ADDEND_BITS,
+            );
+
+            value = CHAINED_PTR_BIND
+                | (addend << CHAINED_PTR_BIND_ADDEND_SHIFT)
+                | import_ordinal(layout, local_symbol_id)?;
             fixup_sites.push(FixupSite {
                 address: place,
                 is_bind: true,
@@ -1446,12 +1457,24 @@ const CHAINED_PTR_NEXT_STRIDE: u64 = 4;
 /// Width of the `target` field of a `DYLD_CHAINED_PTR_64_OFFSET` rebase.
 const CHAINED_PTR_64_TARGET_BITS: u32 = 36;
 
+/// Position of the top byte of a pointer, which a rebase stores in its own `high8` field directly
+/// above `target` rather than folding into the offset. That's what lets a tagged pointer
+/// round-trip.
+const CHAINED_PTR_64_HIGH8_SHIFT: u32 = 56;
+
 /// Width of the `name_offset` field of a `dyld_chained_import`.
 const CHAINED_IMPORT_NAME_OFFSET_BITS: u32 = 23;
 
 /// Set in a `DYLD_CHAINED_PTR_64` slot to say that dyld should bind it to an imported symbol
 /// rather than slide it as a rebase.
 const CHAINED_PTR_BIND: u64 = 1 << 63;
+
+/// The `addend` field of a `dyld_chained_ptr_64_bind`, which sits directly above the 24-bit import
+/// ordinal. It's how a reference to an imported symbol carries a displacement, since the address
+/// being displaced isn't known until dyld resolves the symbol.
+const CHAINED_PTR_BIND_ADDEND_SHIFT: u32 = 24;
+const CHAINED_PTR_BIND_ADDEND_BITS: u32 = 8;
+const CHAINED_PTR_BIND_MAX_ADDEND: u64 = (1 << CHAINED_PTR_BIND_ADDEND_BITS) - 1;
 
 /// Returns the address the thread-local template starts at, which is what offsets stored in a
 /// `tlv_descriptor` are measured from. `__thread_data` comes first and `__thread_bss` follows it,
@@ -1719,7 +1742,14 @@ fn write_fixup_chains(
                   next: 12 // 4-byte stride
                   bind: 1 // == 0
                 */
-                let target = existing.checked_sub(image_base).with_context(|| {
+                // The top byte is carried separately rather than as part of the offset, so that a
+                // pointer with tag bits in it survives. libc++ relies on this: `type_info::__name`
+                // has its top bit set to say the name isn't unique across images, so every C++
+                // program with RTTI has pointers here that aren't just addresses.
+                let high8 = existing >> CHAINED_PTR_64_HIGH8_SHIFT;
+                let address = existing & ((1 << CHAINED_PTR_64_HIGH8_SHIFT) - 1);
+
+                let target = address.checked_sub(image_base).with_context(|| {
                     format!(
                         "Rebase at address 0x{site_address:x} points at 0x{existing:x}, \
                          which is before the image base 0x{image_base:x}",
@@ -1734,7 +1764,7 @@ fn write_fixup_chains(
                     site.address
                 );
 
-                target | (next << CHAINED_PTR_NEXT_SHIFT)
+                target | (high8 << CHAINED_PTR_64_TARGET_BITS) | (next << CHAINED_PTR_NEXT_SHIFT)
             };
 
             slot.copy_from_slice(&value.to_le_bytes());

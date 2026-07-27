@@ -837,6 +837,8 @@ fn mapped_segment_type(section_id: crate::output_section_id::OutputSectionId) ->
         // alternative is a pointer in a read-only segment, which simply doesn't work.
         output_section_id::CONST => SegmentType::DataConstSections,
         output_section_id::DATA
+        | output_section_id::INIT_ARRAY
+        | output_section_id::FINI_ARRAY
         | output_section_id::THREAD_VARS
         | output_section_id::TDATA
         | output_section_id::TBSS
@@ -1847,6 +1849,8 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::GCC_EXCEPT_TABLE);
         builder.add_section(output_section_id::PLT_GOT);
         builder.add_section(output_section_id::DATA);
+        builder.add_section(output_section_id::INIT_ARRAY);
+        builder.add_section(output_section_id::FINI_ARRAY);
         // ld64 puts the descriptors ahead of the thread-local data they point at.
         builder.add_section(output_section_id::THREAD_VARS);
         builder.add_section(output_section_id::TDATA);
@@ -2059,6 +2063,19 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         section_flags: macho::S_THREAD_LOCAL_ZEROFILL.to_flags(),
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::INIT_ARRAY.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__mod_init_func")),
+        // The type is what makes dyld call these rather than just map them, so it has to survive
+        // into the output - a `S_REGULAR` section of the same name is just an array of pointers
+        // nobody reads.
+        section_flags: macho::S_MOD_INIT_FUNC_POINTERS.to_flags(),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::FINI_ARRAY.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__mod_term_func")),
+        section_flags: macho::S_MOD_TERM_FUNC_POINTERS.to_flags(),
+        ..DEFAULT_DEFS
+    };
     defs[output_section_id::COMMON.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"__common")),
         section_flags: macho::S_ZEROFILL.to_flags(),
@@ -2152,6 +2169,10 @@ const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
     SectionRule::exact_section_keep(b"__thread_vars", crate::output_section_id::THREAD_VARS),
     SectionRule::exact_section_keep(b"__thread_data", crate::output_section_id::TDATA),
     SectionRule::exact_section_keep(b"__thread_bss", crate::output_section_id::TBSS),
+    // Roots: nothing in the image refers to an initialiser list - dyld finds it from the section
+    // type - so without `keep` these are never loaded and the constructors silently never run.
+    SectionRule::exact_section_keep(b"__mod_init_func", crate::output_section_id::INIT_ARRAY),
+    SectionRule::exact_section_keep(b"__mod_term_func", crate::output_section_id::FINI_ARRAY),
     SectionRule::exact_section_keep(b"__common", crate::output_section_id::COMMON),
     SectionRule::exact_section_keep(b"__bss", crate::output_section_id::BSS),
     // The literal pools are read-only constants that the assembler kept apart only so that the
