@@ -238,10 +238,59 @@ fn write_file<'data, A: Arch<Platform = MachO>>(
             write_object::<A>(s, buffers, layout, symbol_writer, fixup_sites)?;
         }
         FileLayout::Prelude(s) => write_prelude(s, buffers, layout)?,
+        FileLayout::Epilogue(_) => write_epilogue(buffers, layout, symbol_writer)?,
         _ => {
             // TODO
         }
     }
+    Ok(())
+}
+
+/// Writes the undefined symbol for each import.
+///
+/// These have to come after every defined symbol, which they do because the epilogue is laid out
+/// last, and they have to be contiguous, because `LC_DYSYMTAB` names the run by a start index and a
+/// count rather than by marking the entries themselves.
+fn write_epilogue(
+    buffers: &mut OutputSectionPartMap<&mut [u8]>,
+    layout: &MachOLayout<'_>,
+    symbol_writer: &mut MachOSymbolTableWriter,
+) -> Result {
+    verbose_timing_phase!("Write epilogue");
+
+    for imported_symbol in &layout.format_specific.imported_symbols {
+        let name = layout
+            .symbol_db
+            .symbol_name(imported_symbol.symbol_id)?
+            .bytes();
+
+        let file_id = layout
+            .symbol_db
+            .file_id_for_symbol(imported_symbol.symbol_id);
+
+        let dynamic = match layout.file_layout(file_id) {
+            FileLayout::StubLibrary(file) => &file.format_specific,
+            FileLayout::Dynamic(file) => &file.format_specific,
+            _ => bail!(
+                "Imported symbol `{}` is not from a dylib",
+                String::from_utf8_lossy(name)
+            ),
+        };
+
+        // A two-level namespace binary records which dylib each undefined symbol is expected to
+        // come from, in the same 1-based numbering the chained-fixup imports use.
+        let desc = macho::SymbolDesc::from(macho::SymbolLibrary(dynamic.ordinal.get()));
+
+        symbol_writer.define_symbol(
+            buffers,
+            name,
+            0,
+            macho::SymbolFlags(macho::N_EXT.0).with_type(macho::N_UNDF),
+            desc,
+            0,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1010,14 +1059,17 @@ fn write_dyld_chained_fixups_command(layout: &MachOLayout, command: &mut DyldCha
 }
 
 fn write_symtab_command(layout: &MachOLayout, command: &mut SymtabCommand) {
-    let symtab = layout.section_layouts.get(output_section_id::SYMTAB_GLOBAL);
+    // The table is one run made of two adjacent output sections - locals then externals - so it
+    // starts where the locals do and covers both.
+    let locals = layout.section_layouts.get(output_section_id::SYMTAB_LOCAL);
+    let globals = layout.section_layouts.get(output_section_id::SYMTAB_GLOBAL);
     let strtab = layout.section_layouts.get(output_section_id::STRTAB);
 
     command.cmd.set(LE, LC_SYMTAB);
     command.cmdsize.set(LE, size_of::<SymtabCommand>() as u32);
-    command.symoff.set(LE, symtab.file_offset as u32);
+    command.symoff.set(LE, locals.file_offset as u32);
 
-    let mut nsyms = (symtab.file_size / size_of::<SymtabEntry>()) as u32;
+    let mut nsyms = ((locals.file_size + globals.file_size) / size_of::<SymtabEntry>()) as u32;
 
     // Malfunction: under-report the symbol count so that the last symbol in the table becomes
     // invisible to anything reading LC_SYMTAB. The symbol bytes are still present in __LINKEDIT,
@@ -1719,7 +1771,7 @@ impl MachOSymbolTableWriter {
         desc: object::macho::SymbolDesc,
         value: u64,
     ) -> Result {
-        let entry = self.write_entry(name, buffers)?;
+        let entry = self.write_entry(name, symbol_type, buffers)?;
         entry.n_sect = section;
         entry.n_type = symbol_type;
         entry.n_value.set(LE, value);
@@ -1731,15 +1783,25 @@ impl MachOSymbolTableWriter {
     fn write_entry<'out>(
         &mut self,
         name: &[u8],
+        symbol_type: object::macho::SymbolFlags,
         buffers: &'out mut OutputSectionPartMap<&mut [u8]>,
     ) -> Result<&'out mut SymtabEntry> {
+        // Local and external symbols go to separate parts so that each ends up as one contiguous
+        // run in the output even though objects are written independently. `LC_DYSYMTAB` can then
+        // name each run by index. See `allocate_symtab`, which counts them the same way.
+        let part = if symbol_type.contains(macho::N_EXT) {
+            part_id::SYMTAB_GLOBAL
+        } else {
+            part_id::SYMTAB_LOCAL
+        };
+
         let string_offset = self.write_str(name, buffers);
         let entry_bytes = buffers
-            .get_mut(part_id::SYMTAB_GLOBAL)
+            .get_mut(part)
             .split_off_mut(..size_of::<SymtabEntry>())
             .unwrap();
         let entry: &mut SymtabEntry = from_bytes_mut(entry_bytes)
-            .map_err(|_| error!("Invalid SYMTAB_GLOBAL entry allocation"))?
+            .map_err(|_| error!("Invalid symtab entry allocation"))?
             .0;
         entry.n_strx.set(LE, string_offset);
         Ok(entry)

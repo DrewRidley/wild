@@ -832,6 +832,7 @@ fn mapped_segment_type(section_id: crate::output_section_id::OutputSectionId) ->
         | output_section_id::TBSS => SegmentType::DataSections,
         output_section_id::GOT => SegmentType::DataConstSections,
         output_section_id::CHAINED_FIXUP_TABLE
+        | output_section_id::SYMTAB_LOCAL
         | output_section_id::SYMTAB_GLOBAL
         | output_section_id::STRTAB
         | output_section_id::CODE_SIGNATURE => SegmentType::LinkeditSections,
@@ -1422,6 +1423,19 @@ impl platform::Platform for MachO {
             part_id::CHAINED_FIXUP_TABLE,
             alignment::USIZE.align_up(fixup_table_size),
         );
+
+        // Every imported symbol also gets an undefined entry in the symbol table. Mach-O requires
+        // the undefined symbols to be contiguous and last, which they are because the epilogue is
+        // the last thing laid out, and `LC_DYSYMTAB` names that run by index.
+        let symtab_size = state.imported_symbols.len() as u64 * size_of::<SymtabEntry>() as u64;
+        let strings_size = state
+            .imported_symbols
+            .iter()
+            .map(|&s| symbol_db.symbol_name(s).unwrap().bytes().len() as u64 + 1)
+            .sum::<u64>();
+
+        mem_sizes.increment(part_id::SYMTAB_GLOBAL, symtab_size);
+        mem_sizes.increment(part_id::STRTAB, strings_size);
     }
 
     fn apply_late_size_adjustments_epilogue(
@@ -1618,6 +1632,12 @@ impl platform::Platform for MachO {
         symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
         per_symbol_flags: &crate::value_flags::AtomicPerSymbolFlags,
     ) -> Result {
+        // Mach-O requires the symbol table to be partitioned - all local symbols, then all
+        // externally defined ones, then all undefined ones - because `LC_DYSYMTAB` names each run
+        // by a start index and a count. Objects are laid out one after another, so keeping the two
+        // kinds in separate output sections is what makes the runs contiguous across objects
+        // rather than only within each one.
+        let mut num_locals = 0;
         let mut num_globals = 0;
         let mut strings_size = 0;
         for ((sym_index, sym), flags) in state
@@ -1635,11 +1655,16 @@ impl platform::Platform for MachO {
                 flags.get(),
                 &state.sections,
             ) {
-                num_globals += 1;
+                if platform::Symbol::is_local(sym) {
+                    num_locals += 1;
+                } else {
+                    num_globals += 1;
+                }
                 strings_size += info.name.len() + 1;
             }
         }
         let entry_size = size_of::<SymtabEntry>() as u64;
+        common.allocate(part_id::SYMTAB_LOCAL, num_locals * entry_size);
         common.allocate(part_id::SYMTAB_GLOBAL, num_globals * entry_size);
         common.allocate(part_id::STRTAB, strings_size as u64);
 
@@ -1756,6 +1781,9 @@ impl platform::Platform for MachO {
         // The rest (e.g. symbol table, string table).
         builder.add_section(output_section_id::STRTAB);
         builder.add_section(output_section_id::CHAINED_FIXUP_TABLE);
+        // The local symbols have to precede the external ones for `LC_DYSYMTAB` to be able to name
+        // each run as a contiguous range.
+        builder.add_section(output_section_id::SYMTAB_LOCAL);
         builder.add_section(output_section_id::SYMTAB_GLOBAL);
         builder.add_section(output_section_id::CODE_SIGNATURE);
 
