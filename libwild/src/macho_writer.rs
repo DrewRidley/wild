@@ -256,8 +256,21 @@ fn write_file<'data, A: Arch<Platform = MachO>>(
         }
         FileLayout::Prelude(s) => write_prelude(s, buffers, layout)?,
         FileLayout::Epilogue(_) => write_epilogue(buffers, layout, symbol_writer)?,
-        _ => {
-            // TODO
+
+        // Nothing of a dylib is copied into the image. What we take from one is the names of the
+        // symbols it supplies, and those are written by the epilogue as undefined entries.
+        FileLayout::Dynamic(_) | FileLayout::StubLibrary(_) => {}
+
+        // A file that was never loaded contributes nothing by definition.
+        FileLayout::NotLoaded => {}
+
+        // Linker-defined symbols resolve references but are not written to the symbol table, so
+        // there is nothing here either - `allocate_internal_symbol` reserves no space for them for
+        // the same reason.
+        FileLayout::SyntheticSymbols(_) => {}
+
+        FileLayout::LinkerScript(_) => {
+            bail!("Linker scripts are not supported for Mach-O")
         }
     }
     Ok(())

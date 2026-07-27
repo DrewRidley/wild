@@ -763,7 +763,9 @@ impl platform::Symbol for SymtabEntry {
     }
 
     fn size(&self) -> u64 {
-        // TODO
+        // An nlist entry records where a symbol starts but not how far it extends - the size is
+        // implied by where the next symbol begins. Nothing needs it yet; dead stripping will, since
+        // it is what bounds the region a symbol keeps alive.
         0
     }
 
@@ -776,12 +778,16 @@ impl platform::Symbol for SymtabEntry {
     }
 
     fn debug_string(&self) -> String {
-        // TODO
+        // Only used to add detail to diagnostics. An nlist entry has no field that would say more
+        // than the name and address the caller already prints.
         String::new()
     }
 
     fn is_tls(&self) -> bool {
-        // TODO: derive from section name
+        // Unanswerable from an nlist entry, which says nothing about thread-locality - the section
+        // the symbol is defined in does. `ObjectFile::is_symbol_thread_local` is the query that has
+        // the object to hand and so can answer it; this exists only for the platforms where the
+        // symbol alone is enough.
         false
     }
 
@@ -790,7 +796,10 @@ impl platform::Symbol for SymtabEntry {
     }
 
     fn is_func(&self) -> bool {
-        // TODO: derive from section name
+        // Only ever asked of symbols taken from a dylib, whose export list we read without parsing
+        // its sections - so there is nothing here that distinguishes code from data. What needs the
+        // distinction infers it instead from the relocation referring to the symbol: a branch means
+        // a function, and that is what decides whether it gets a stub.
         false
     }
 
