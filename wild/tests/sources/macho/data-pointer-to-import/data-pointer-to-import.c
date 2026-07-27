@@ -1,11 +1,8 @@
-// A global initialised to the address of a function in a dylib. The slot needs a bind, which needs
-// an import ordinal, but only symbols that get a __got or __stubs entry are recorded as imports -
-// and this one is never called directly, so it gets neither. Wild reports that instead of writing
-// the nonsense address it used to, which took SIGBUS the first time the pointer was used.
+// A global initialised to the address of a function in a dylib. The slot needs a bind rather than
+// a rebase: before binds were emitted for anything outside __got, it got a rebase of a nonsense
+// address and the binary took SIGBUS the first time the pointer was called.
 //#LinkerDriver:clang
-// ld64 and lld both link this fine, so there is nothing to compare against until wild can too.
-//#ReferenceLinkers:
-//#ExpectErrorWild:only referenced by a pointer in data
+//#DiffIgnore:section.__unwind_info
 
 #include <stdio.h>
 

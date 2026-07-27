@@ -1074,11 +1074,15 @@ fn thread_local_block_address(layout: &MachOLayout<'_>) -> u64 {
 /// Returns the position of a symbol in the import list, which is what a bind slot stores to say
 /// which symbol dyld should resolve it to.
 fn import_ordinal(layout: &MachOLayout<'_>, symbol_id: SymbolId) -> Result<u64> {
+    // The import list is keyed by the symbol's definition, which is the one in the dylib, whereas
+    // a relocation names the undefined symbol in the referencing object.
+    let definition = layout.symbol_db.definition(symbol_id);
+
     layout
         .format_specific
         .imported_symbols
         .iter()
-        .position(|imported| imported.symbol_id == symbol_id)
+        .position(|imported| imported.symbol_id == definition)
         .map(|ordinal| ordinal as u64)
         .ok_or_else(|| {
             // Only symbols that get a `__got` or `__stubs` entry are currently recorded as
