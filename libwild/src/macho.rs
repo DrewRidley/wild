@@ -1489,21 +1489,30 @@ impl platform::Platform for MachO {
         // the fixup table needs therefore depends on the sizes of the writable segments, which
         // aren't known until every group's sizes have been merged - later than
         // `finalise_sizes_epilogue` runs.
-        let mut page_start_count = 0;
+        // Both writable segments are described, so both have to be measured in full. Asking
+        // `mapped_segment_type` which segment each section belongs to keeps this in step with the
+        // layout: naming the sections directly meant that every section added to `__DATA` or
+        // `__DATA_CONST` afterwards went uncounted, and the table came up short by two bytes per
+        // uncounted page only once the link was big enough for those sections to span one.
+        let mut data_size = 0;
+        let mut data_const_size = 0;
 
-        for section_id in [output_section_id::DATA, output_section_id::GOT] {
-            let mut section_size = 0;
+        for part_index in 0..current_sizes.num_parts() {
+            let part_id = PartId::from_usize(part_index);
+            let size = *current_sizes.get(part_id);
 
-            for part_index in 0..current_sizes.num_parts() {
-                let part_id = PartId::from_usize(part_index);
-                if part_id.output_section_id() == section_id {
-                    section_size += *current_sizes.get(part_id);
-                }
+            match mapped_segment_type(part_id.output_section_id()) {
+                SegmentType::DataSections => data_size += size,
+                SegmentType::DataConstSections => data_const_size += size,
+                _ => {}
             }
-
-            // One extra page covers the segment being padded out to an alignment boundary.
-            page_start_count += section_size.div_ceil(MACHO_PAGE_ALIGNMENT.value()) + 1;
         }
+
+        // One extra page per segment covers it being padded out to an alignment boundary.
+        let page_start_count = [data_size, data_const_size]
+            .into_iter()
+            .map(|size| size.div_ceil(MACHO_PAGE_ALIGNMENT.value()) + 1)
+            .sum::<u64>();
 
         extra_sizes.increment(
             part_id::CHAINED_FIXUP_TABLE,
