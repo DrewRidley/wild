@@ -851,6 +851,18 @@ pub(crate) trait Platform:
     /// so unless this is done, every copy of every template instantiation reaches the output.
     const COALESCES_LOSING_DEFINITIONS: bool = false;
 
+    /// Whether exported symbols are numbered in a table that references can name them by.
+    ///
+    /// ELF has `.dynsym`, so each export gets an index and a relocation names it by that. Mach-O
+    /// has no such table - what an image exports is a trie over the names, searched by name - so
+    /// there is no index to hand out.
+    const HAS_DYNAMIC_SYMBOL_TABLE: bool = true;
+
+    /// Whether the file naming what to export lists one name per line rather than grouping them in
+    /// braces. ELF's version script does the latter, and can also say what is hidden; Mach-O's
+    /// `-exported_symbols_list` is the plain form.
+    const EXPORT_LIST_IS_PLAIN_LINES: bool = false;
+
     /// Used when the linker needs to create a symtab entry from scratch rather than copying one
     /// from an input file.
     fn default_symtab_entry() -> Self::SymtabEntry;

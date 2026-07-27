@@ -27,6 +27,12 @@ pub struct MachOArgs {
     pub(crate) plugin_path: Option<String>,
     pub(crate) dead_strip_dylibs: bool,
     pub(crate) dead_strip: bool,
+    /// Emit a dylib rather than an executable.
+    pub(crate) dylib: bool,
+    /// The name a dylib records for itself, which is what images linking against it will look for.
+    pub(crate) install_name: Option<Box<str>>,
+    /// A file naming the symbols to export, one per line, instead of exporting everything visible.
+    pub(crate) exported_symbols_list: Option<Box<Path>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +95,17 @@ impl Default for MachOArgs {
             plugin_path: None,
             dead_strip_dylibs: false,
             dead_strip: false,
+            dylib: false,
+            install_name: None,
+            exported_symbols_list: None,
         }
+    }
+}
+
+impl MachOArgs {
+    /// The output path as bytes, for the places Mach-O records a path in the file itself.
+    pub(crate) fn output_path_bytes(&self) -> &[u8] {
+        self.common.output.as_os_str().as_encoded_bytes()
     }
 }
 
@@ -142,7 +158,10 @@ impl platform::Args for MachOArgs {
     }
 
     fn should_export_dynamic(&self, _lib_name: &[u8]) -> bool {
-        todo!()
+        // Whether to pass on what a dependency exports as though it were ours. Mach-O spells that
+        // `-reexport_library`, which we don't accept, so nothing is re-exported: what we export is
+        // what we define.
+        false
     }
 
     fn loadable_segment_alignment(&self) -> crate::alignment::Alignment {
@@ -154,6 +173,10 @@ impl platform::Args for MachOArgs {
         true
     }
 
+    fn export_list_path(&self) -> Option<&Path> {
+        self.exported_symbols_list.as_deref()
+    }
+
     fn should_gc_sections(&self) -> bool {
         // Only when asked. ld64 keeps everything unless given -dead_strip, and dropping something
         // that was actually reachable produces a binary that links and then misbehaves, so this is
@@ -162,8 +185,7 @@ impl platform::Args for MachOArgs {
     }
 
     fn should_output_executable(&self) -> bool {
-        // TODO
-        true
+        !self.dylib
     }
 
     fn is_ignored_flag(&self, flag: &str) -> bool {
@@ -313,6 +335,34 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
         .long("dead_strip_dylibs")
         .execute(|args, _modifier_stack| {
             args.dead_strip_dylibs = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("dylib")
+        .help("Produce a dynamic library rather than an executable")
+        .execute(|args, _modifier_stack| {
+            args.dylib = true;
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("exported_symbols_list")
+        .help("Export only the symbols named in this file")
+        .execute(|args, _modifier_stack, value| {
+            args.exported_symbols_list = Some(Path::new(value).into());
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("install_name")
+        .long("dylib_install_name")
+        .help("The path a dylib records for itself")
+        .execute(|args, _modifier_stack, value| {
+            args.install_name = Some(value.into());
             Ok(())
         });
 

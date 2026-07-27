@@ -255,7 +255,9 @@ fn write_file<'data, A: Arch<Platform = MachO>>(
             write_object::<A>(s, buffers, layout, symbol_writer, fixup_sites)?;
         }
         FileLayout::Prelude(s) => write_prelude(s, buffers, layout)?,
-        FileLayout::Epilogue(_) => write_epilogue(buffers, layout, symbol_writer)?,
+        FileLayout::Epilogue(epilogue) => {
+            write_epilogue(epilogue, buffers, layout, symbol_writer)?;
+        }
 
         // Nothing of a dylib is copied into the image. What we take from one is the names of the
         // symbols it supplies, and those are written by the epilogue as undefined entries.
@@ -276,17 +278,66 @@ fn write_file<'data, A: Arch<Platform = MachO>>(
     Ok(())
 }
 
-/// Writes the undefined symbol for each import.
+/// Writes the table dyld searches to find what this image exports.
 ///
-/// These have to come after every defined symbol, which they do because the epilogue is laid out
-/// last, and they have to be contiguous, because `LC_DYSYMTAB` names the run by a start index and a
-/// count rather than by marking the entries themselves.
+/// The addresses are known now, so the trie is rebuilt with the real ones rather than the widest
+/// possible ones it was measured with. That can only make it smaller, so it fits the space
+/// reserved; whatever is left over stays zero, which reads as a trie with nothing beyond its root.
+fn write_export_trie(
+    epilogue: &crate::layout::EpilogueLayout<MachO>,
+    buffers: &mut OutputSectionPartMap<&mut [u8]>,
+    layout: &MachOLayout<'_>,
+) -> Result {
+    let exports = &epilogue.format_specific.exported_symbols;
+
+    if exports.is_empty() {
+        return Ok(());
+    }
+
+    let image_base = layout
+        .section_layouts
+        .get(output_section_id::FILE_HEADER)
+        .mem_offset;
+
+    let mut entries = Vec::with_capacity(exports.len());
+
+    for &symbol_id in exports {
+        let name = layout.symbol_db.symbol_name(symbol_id)?.bytes();
+
+        let Some(resolution) = layout.merged_symbol_resolution(symbol_id) else {
+            continue;
+        };
+
+        // What dyld stores is where the symbol sits in the image, not where it happened to be laid
+        // out, because the image can be loaded anywhere.
+        let address = resolution
+            .raw_value
+            .checked_sub(image_base)
+            .with_context(|| {
+                format!(
+                    "Exported symbol {} is before the image base",
+                    layout.symbol_db.symbol_name_for_display(symbol_id)
+                )
+            })?;
+
+        entries.push((name, address));
+    }
+
+    let trie = crate::macho_export_trie::ExportTrie::build(&entries);
+    let out = buffers.get_mut(part_id::EXPORT_TRIE);
+
+    trie.write(out)
+}
+
 fn write_epilogue(
+    epilogue: &crate::layout::EpilogueLayout<MachO>,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &MachOLayout<'_>,
     symbol_writer: &mut MachOSymbolTableWriter<'_>,
 ) -> Result {
     verbose_timing_phase!("Write epilogue");
+
+    write_export_trie(epilogue, buffers, layout)?;
 
     for imported_symbol in &layout.format_specific.imported_symbols {
         let name = layout
@@ -362,7 +413,15 @@ fn write_prelude<'data>(
     let mut load_command_buffer = slice_from_all_bytes_mut(buffers.get_mut(part_id::LOAD_COMMANDS));
     write_segment_commands(layout, &mut load_command_buffer)?;
 
-    write_entry_point_command(layout, take_mut(&mut load_command_buffer)?)?;
+    if layout.args().dylib {
+        // A dylib has no single address to enter at - callers arrive through its exports - so
+        // instead of an entry point it records the name it will be found by, and where the table
+        // of those exports is.
+        write_id_dylib_command(layout, &mut load_command_buffer)?;
+        write_exports_trie_command(layout, take_mut(&mut load_command_buffer)?);
+    } else {
+        write_entry_point_command(layout, take_mut(&mut load_command_buffer)?)?;
+    }
 
     write_uuid_command(take_mut(&mut load_command_buffer)?);
 
@@ -510,14 +569,32 @@ fn populate_file_header(
     header.magic.set(BigEndian, MH_CIGAM_64);
     header.cputype.set(LE, CPU_TYPE_ARM64);
     header.cpusubtype.set(LE, CPU_SUBTYPE_ARM64_ALL.into());
-    header.filetype.set(LE, MH_EXECUTE);
+    header.filetype.set(
+        LE,
+        if layout.args().dylib {
+            macho::MH_DYLIB
+        } else {
+            MH_EXECUTE
+        },
+    );
     header
         .ncmds
         .set(LE, prelude.format_specific.load_command_count as u32);
     header
         .sizeofcmds
         .set(LE, load_commands_info.segment_size.file_size as u32);
-    let mut flags = macho::MH_PIE | macho::MH_DYLDLINK | macho::MH_NOUNDEFS | macho::MH_TWOLEVEL;
+    // `MH_PIE` says an executable may be loaded anywhere; a dylib always may, and setting it there
+    // is meaningless. `MH_NOUNDEFS` claims nothing is left unresolved, which only holds when there
+    // are no imports to bind.
+    let mut flags = macho::MH_DYLDLINK | macho::MH_TWOLEVEL;
+
+    if !layout.args().dylib {
+        flags |= macho::MH_PIE;
+    }
+
+    if layout.format_specific.imported_symbols.is_empty() {
+        flags |= macho::MH_NOUNDEFS;
+    }
 
     // dyld only walks `__thread_vars` and fills in each descriptor's thunk and key if this flag
     // says the image has descriptors to fill in. Without it the descriptors keep whatever the
@@ -558,9 +635,51 @@ fn split_segment_command_buffer(
     Ok((command, sections))
 }
 
+/// Writes `LC_ID_DYLIB`: the name this dylib will be looked up by.
+fn write_id_dylib_command(layout: &MachOLayout<'_>, buffer: &mut &mut [u8]) -> Result {
+    let name = crate::macho::own_install_name(layout.args());
+    let size = crate::macho::load_dylib_command_size(name);
+
+    let buffer = buffer
+        .split_off_mut(..size)
+        .ok_or_else(|| error!("Invalid LOAD_COMMANDS allocation"))?;
+
+    let (command, path_buffer) = buffer.split_at_mut(size_of::<DylibCommand>());
+    let command: &mut DylibCommand = from_bytes_mut(command)
+        .map_err(|_| error!("Invalid LC_ID_DYLIB allocation"))?
+        .0;
+
+    write_dylib_command(command, path_buffer, name);
+    // Same shape as a load command, differing only in which question it answers: this names the
+    // library itself rather than one it depends on.
+    command.cmd.set(LE, object::macho::LC_ID_DYLIB);
+
+    Ok(())
+}
+
+/// Writes `LC_DYLD_EXPORTS_TRIE`, which points dyld at the table of what this image supplies.
+fn write_exports_trie_command(
+    layout: &MachOLayout<'_>,
+    command: &mut object::macho::LinkeditDataCommand<Endianness>,
+) {
+    let trie = layout.section_layouts.get(output_section_id::EXPORT_TRIE);
+
+    command.cmd.set(LE, object::macho::LC_DYLD_EXPORTS_TRIE);
+    command.cmdsize.set(
+        LE,
+        size_of::<object::macho::LinkeditDataCommand<Endianness>>() as u32,
+    );
+    command.dataoff.set(LE, trie.file_offset as u32);
+    command.datasize.set(LE, trie.file_size as u32);
+}
+
 fn write_segment_commands(layout: &MachOLayout, load_commands: &mut &mut [u8]) -> Result {
     let load_cmd_err = |()| error!("Invalid LOAD_COMMANDS allocation");
     let num_stub_slots = num_stub_slots(layout);
+
+    // `__PAGEZERO` reserves the bottom of the address space so that a null dereference faults. That
+    // is the process's address space, not the library's, so only an executable declares it - a
+    // dylib is mapped into someone else's.
     let pagezero_segment = take_mut(load_commands)?;
     write_segment(
         SEG_PAGEZERO,
@@ -569,7 +688,11 @@ fn write_segment_commands(layout: &MachOLayout, load_commands: &mut &mut [u8]) -
         0,
         0,
         0,
-        MACHO_START_MEM_ADDRESS,
+        if layout.args().dylib {
+            0
+        } else {
+            MACHO_START_MEM_ADDRESS
+        },
         0,
         SegmentFlags::default(),
     );
@@ -2204,8 +2327,9 @@ fn write_fixup_chains(
 
             ensure!(
                 offset_in_page.is_multiple_of(CHAINED_PTR_NEXT_STRIDE),
-                "Chained fixup at address 0x{:x} isn't aligned to the chain stride",
-                site.address
+                "Chained fixup at address 0x{:x} (segment at 0x{:x}) isn't aligned to the chain stride",
+                site.address,
+                segment.sizes.mem_offset
             );
 
             let page_start = &mut segment.page_starts[usize::try_from(page)?];

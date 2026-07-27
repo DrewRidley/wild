@@ -10,10 +10,52 @@ use crate::version_script::parse_matcher;
 use winnow::BStr;
 use winnow::Parser;
 
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &bytes[start..end]
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ExportList<'data>(MatchRules<'data>);
 
 impl<'data> ExportList<'data> {
+    /// Reads the plain form: one symbol name per line, `#` starting a comment.
+    ///
+    /// This is what `-exported_symbols_list` takes. It is not the same file as ELF's version
+    /// script, which the parse below reads - that one groups its names in braces and can say what
+    /// is *not* exported as well as what is.
+    pub(crate) fn parse_lines(data: ScriptData<'data>) -> Result<Self> {
+        let mut out = ExportList::default();
+
+        for line in data.raw.split(|byte| *byte == b'\n') {
+            let line = match line.iter().position(|byte| *byte == b'#') {
+                Some(comment) => &line[..comment],
+                None => line,
+            };
+
+            let name = trim_ascii_whitespace(line);
+            if name.is_empty() {
+                continue;
+            }
+
+            // A name may be a glob, which `parse_matcher` already knows how to classify - going
+            // through it keeps globbing behaving the same however the list was written.
+            out.0
+                .push(crate::version_script::ParsedSymbolMatcher::Single(
+                    crate::version_script::classify_matcher(name)?,
+                ));
+        }
+
+        Ok(out)
+    }
+
     pub(crate) fn parse(data: ScriptData<'data>) -> Result<Self> {
         parse_export_list
             .parse(BStr::new(data.raw))

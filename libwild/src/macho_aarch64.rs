@@ -76,8 +76,15 @@ impl crate::platform::Arch for MachOAArch64 {
     type Relaxation = Relaxation;
 
     type Platform = MachO;
-    fn start_memory_address(_output_kind: crate::output_kind::OutputKind) -> u64 {
-        crate::macho::MACHO_START_MEM_ADDRESS
+    fn start_memory_address(output_kind: crate::output_kind::OutputKind) -> u64 {
+        // An executable asks to be loaded above `__PAGEZERO`, so that the bottom of the address
+        // space stays unmapped. A dylib is placed wherever dyld has room, so it starts at zero and
+        // everything in it is an offset.
+        if output_kind.is_shared_object() {
+            0
+        } else {
+            crate::macho::MACHO_START_MEM_ADDRESS
+        }
     }
     fn arch_identifier() -> <Self::Platform as crate::platform::Platform>::ArchIdentifier {
         todo!()

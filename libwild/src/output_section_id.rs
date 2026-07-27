@@ -115,6 +115,7 @@ pub(crate) const CHAINED_FIXUP_TABLE: OutputSectionId =
     part_id::CHAINED_FIXUP_TABLE.output_section_id();
 pub(crate) const INDIRECT_SYMTAB: OutputSectionId = part_id::INDIRECT_SYMTAB.output_section_id();
 pub(crate) const UNWIND_INFO: OutputSectionId = part_id::UNWIND_INFO.output_section_id();
+pub(crate) const EXPORT_TRIE: OutputSectionId = part_id::EXPORT_TRIE.output_section_id();
 pub(crate) const CODE_SIGNATURE: OutputSectionId = part_id::CODE_SIGNATURE.output_section_id();
 
 // Wasm specific sections.

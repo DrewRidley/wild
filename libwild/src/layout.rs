@@ -613,6 +613,11 @@ fn update_dynamic_symbol_resolutions<'data, P: Platform>(
 ) {
     timing_phase!("Update dynamic symbol resolutions");
 
+    // Nothing to number where exports aren't reached by index.
+    if !P::HAS_DYNAMIC_SYMBOL_TABLE {
+        return;
+    }
+
     let Some(FileLayout::Epilogue(epilogue)) = layouts.last().and_then(|g| g.files.last()) else {
         panic!("Epilogue should be the last file");
     };

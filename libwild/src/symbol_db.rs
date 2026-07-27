@@ -346,7 +346,13 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
 
         let export_list = auxiliary
             .export_list_data
-            .map(ExportList::parse)
+            .map(|data| {
+                if P::EXPORT_LIST_IS_PLAIN_LINES {
+                    ExportList::parse_lines(data)
+                } else {
+                    ExportList::parse(data)
+                }
+            })
             .transpose()?;
 
         let num_buckets = num_symbol_hash_buckets(args);

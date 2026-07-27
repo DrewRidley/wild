@@ -200,6 +200,16 @@ pub(crate) fn code_signature_padded_identifier_size(args: &MachOArgs) -> u64 {
     (code_signature_identifier(args).len() as u64 + 1).next_multiple_of(CS_SECTION_ALIGNMENT)
 }
 
+/// The name a dylib we're producing records for itself, which is what an image linking against it
+/// will look for. Distinct from `install_name`, which reads the name out of a dylib we're reading.
+///
+/// Falls back to the output path when `-install_name` wasn't given, which is what ld64 does.
+pub(crate) fn own_install_name(args: &MachOArgs) -> &[u8] {
+    args.install_name
+        .as_deref()
+        .map_or_else(|| args.output_path_bytes(), str::as_bytes)
+}
+
 pub(crate) fn load_dylib_command_size(path: &[u8]) -> usize {
     (size_of::<DylibCommand>() + path.len() + 1).next_multiple_of(MACHO_COMMAND_ALIGNMENT)
 }
@@ -319,13 +329,21 @@ impl Atoms {
         addresses.sort_unstable();
         addresses.dedup();
 
+        // A cut is only safe where it preserves how everything inside the atom is aligned. Placing
+        // an atom respects its own alignment, but everything within it keeps the offsets it had -
+        // so if the atom starts partway through the section's alignment, a pointer that was aligned
+        // inside it stops being so, and dyld refuses a fixup it can't reach. Cutting only on the
+        // section's own alignment means an atom can be placed anywhere that alignment allows and
+        // its contents land exactly as they did.
+        let section_alignment = 1u64 << section.align.get(LE).min(63);
+
         // Anything before the first symbol has no name to be reached by, so it stays with the
         // section rather than becoming droppable on its own.
         let mut offset = 0;
         let mut cuts = addresses
             .iter()
             .filter_map(|address| address.checked_sub(base))
-            .filter(|cut| *cut > 0 && *cut < size)
+            .filter(|cut| *cut > 0 && *cut < size && cut.is_multiple_of(section_alignment))
             .peekable();
 
         if cuts.peek().is_none() {
@@ -376,12 +394,9 @@ impl Atoms {
             atom.offset.set(LE, section.offset.get(LE) + offset as u32);
         }
 
-        // Only the first atom can rely on the section's alignment; the rest begin wherever a symbol
-        // did, so they can promise no more than the address itself provides.
-        if offset != 0 {
-            let from_address = offset.trailing_zeros().min(section.align.get(LE));
-            atom.align.set(LE, from_address);
-        }
+        // Every atom keeps the section's alignment. Cuts are only made where that alignment allows,
+        // so this is a promise each of them can keep, and it is what makes their contents land as
+        // they did in the section.
 
         self.sections.push(atom);
         self.parents.push(parent);
@@ -1140,6 +1155,7 @@ fn mapped_segment_type(section_id: crate::output_section_id::OutputSectionId) ->
         | output_section_id::SYMTAB_LOCAL
         | output_section_id::SYMTAB_GLOBAL
         | output_section_id::INDIRECT_SYMTAB
+        | output_section_id::EXPORT_TRIE
         | output_section_id::STRTAB
         | output_section_id::CODE_SIGNATURE => SegmentType::LinkeditSections,
 
@@ -1366,6 +1382,13 @@ impl platform::Platform for MachO {
     // definition the symbol table settled on.
     const COALESCES_LOSING_DEFINITIONS: bool = true;
 
+    // What a Mach-O image exports is a trie over the names rather than a numbered table, so there
+    // are no indices to assign.
+    const HAS_DYNAMIC_SYMBOL_TABLE: bool = false;
+
+    // `-exported_symbols_list` names one symbol per line.
+    const EXPORT_LIST_IS_PLAIN_LINES: bool = true;
+
     fn link_for_arch<'data>(
         linker: &'data crate::Linker,
         args: &'data Self::Args,
@@ -1546,11 +1569,19 @@ impl platform::Platform for MachO {
         Ok(())
     }
 
+    /// Records that a symbol is to be exported.
+    ///
+    /// Nothing beyond the name is needed: Mach-O has no symbol versioning, so what a name resolves
+    /// to is decided entirely by the export trie built from these.
     fn create_dynamic_symbol_definition<'data>(
-        _symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
-        _symbol_id: crate::symbol_db::SymbolId,
+        symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
+        symbol_id: crate::symbol_db::SymbolId,
     ) -> crate::error::Result<crate::layout::DynamicSymbolDefinition<'data, Self>> {
-        todo!()
+        Ok(crate::layout::DynamicSymbolDefinition {
+            symbol_id,
+            name: symbol_db.symbol_name(symbol_id)?.bytes(),
+            format_specific: (),
+        })
     }
 
     fn update_segment_keep_list(
@@ -1784,7 +1815,7 @@ impl platform::Platform for MachO {
     fn new_epilogue_layout<'data>(
         _args: &Self::Args,
         _output_kind: crate::output_kind::OutputKind,
-        _dynamic_symbol_definitions: &mut [crate::layout::DynamicSymbolDefinition<'data, Self>],
+        dynamic_symbol_definitions: &mut [crate::layout::DynamicSymbolDefinition<'data, Self>],
         group_states: &[layout::GroupState<'data, Self>],
     ) -> Self::EpilogueLayoutExt {
         verbose_timing_phase!("Gather imported symbol IDs");
@@ -1805,7 +1836,19 @@ impl platform::Platform for MachO {
             .copied()
             .collect();
 
-        EpilogueLayoutExt { imported_symbols }
+        // Sorted here rather than at the point of use because the trie is built from a sorted
+        // list, and this is the only place the names are to hand.
+        dynamic_symbol_definitions.sort_unstable_by_key(|definition| definition.name);
+
+        let exported_symbols = dynamic_symbol_definitions
+            .iter()
+            .map(|definition| definition.symbol_id)
+            .collect();
+
+        EpilogueLayoutExt {
+            imported_symbols,
+            exported_symbols,
+        }
     }
 
     fn apply_non_addressable_indexes_epilogue(
@@ -1826,10 +1869,25 @@ impl platform::Platform for MachO {
     fn finalise_sizes_epilogue<'data>(
         state: &mut Self::EpilogueLayoutExt,
         mem_sizes: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
-        _dynamic_symbol_definitions: &[crate::layout::DynamicSymbolDefinition<'data, Self>],
+        dynamic_symbol_definitions: &[crate::layout::DynamicSymbolDefinition<'data, Self>],
         _format_specific: &Self::FinaliseSizesExt<'data>,
         symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
     ) {
+        // How large the trie encodes to depends on the addresses in it, and those aren't assigned
+        // yet. Building it with the widest address any of them could have gives an upper bound: no
+        // node can be larger than this, so no offset can be either, so neither can the whole.
+        if !dynamic_symbol_definitions.is_empty() {
+            let widest = dynamic_symbol_definitions
+                .iter()
+                .map(|definition| (definition.name, u64::MAX))
+                .collect_vec();
+
+            mem_sizes.increment(
+                part_id::EXPORT_TRIE,
+                crate::macho_export_trie::ExportTrie::build(&widest).len() as u64,
+            );
+        }
+
         let mut fixup_table_size = CHAINED_FIXUP_TABLE_BASE_SIZE;
 
         fixup_table_size += state
@@ -2031,7 +2089,15 @@ impl platform::Platform for MachO {
             );
         }
         allocate_load_cmd(size_of::<SegmentCommand>());
-        allocate_load_cmd(size_of::<EntryPointCommand>());
+
+        if args.dylib {
+            // A dylib is entered through its exports rather than at one address, so it carries no
+            // entry point. What it does carry is the name it will be looked up by.
+            allocate_load_cmd(load_dylib_command_size(own_install_name(args)));
+            allocate_load_cmd(size_of::<object::macho::LinkeditDataCommand<Endianness>>());
+        } else {
+            allocate_load_cmd(size_of::<EntryPointCommand>());
+        }
         allocate_load_cmd(
             (size_of::<DylinkerCommand>() + DYLINKER_PATH.len())
                 .next_multiple_of(MACHO_COMMAND_ALIGNMENT),
@@ -2297,6 +2363,7 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::SYMTAB_LOCAL);
         builder.add_section(output_section_id::SYMTAB_GLOBAL);
         builder.add_section(output_section_id::INDIRECT_SYMTAB);
+        builder.add_section(output_section_id::EXPORT_TRIE);
         builder.add_section(output_section_id::CODE_SIGNATURE);
 
         builder.build()
@@ -2422,6 +2489,11 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         min_alignment: Alignment { exponent: 2 },
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::EXPORT_TRIE.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"EXPORT_TRIE")),
+        min_alignment: alignment::USIZE,
+        ..DEFAULT_DEFS
+    };
     defs[output_section_id::CODE_SIGNATURE.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"CODE_SIGNATURE")),
         min_alignment: Alignment {
@@ -2496,11 +2568,14 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         // into the output - a `S_REGULAR` section of the same name is just an array of pointers
         // nobody reads.
         section_flags: macho::S_MOD_INIT_FUNC_POINTERS.to_flags(),
+        // Pointers, so dyld requires them aligned as such before it will walk them.
+        min_alignment: alignment::USIZE,
         ..DEFAULT_DEFS
     };
     defs[output_section_id::FINI_ARRAY.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"__mod_term_func")),
         section_flags: macho::S_MOD_TERM_FUNC_POINTERS.to_flags(),
+        min_alignment: alignment::USIZE,
         ..DEFAULT_DEFS
     };
     defs[output_section_id::MACHO_EH_FRAME.as_usize()] = BuiltInSectionDetails {
@@ -2526,6 +2601,10 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
 #[derive(Debug, Default)]
 pub(crate) struct EpilogueLayoutExt {
     imported_symbols: Vec<SymbolId>,
+
+    /// The symbols this image supplies to others, already in name order because that is the order
+    /// the export trie is built in. Empty for an executable, which exports nothing.
+    pub(crate) exported_symbols: Vec<SymbolId>,
 }
 
 #[derive(Debug)]
@@ -2759,10 +2838,32 @@ pub(crate) fn get_segment_sections<'data>(
         .find(|seg| seg.id == segment_id)
         .map(|seg| seg.sizes);
 
-    segment_size.map(|segment_size| SegmentSectionsInfo {
-        segment_sections: sections,
-        section_ids,
-        segment_size,
+    segment_size.map(|mut segment_size| {
+        // A section is placed at whatever address its alignment demands, and an empty one still
+        // takes an address even though it adds nothing to the segment's extent - so the last
+        // section can begin, and end, past where the segment was measured to end. dyld checks that
+        // sections lie within their segment, so the segment is stretched to cover them.
+        for (section, _, _) in &sections {
+            let end = section.mem_offset + section.mem_size;
+            let past_end = end.saturating_sub(segment_size.mem_offset);
+
+            segment_size.mem_size = segment_size.mem_size.max(past_end);
+
+            // File size only follows for a section that has contents; a zerofill one occupies
+            // address space and no file.
+            if section.file_size > 0 {
+                let file_end = section.file_offset + section.file_size;
+                segment_size.file_size = segment_size
+                    .file_size
+                    .max(file_end.saturating_sub(segment_size.file_offset));
+            }
+        }
+
+        SegmentSectionsInfo {
+            segment_sections: sections,
+            section_ids,
+            segment_size,
+        }
     })
 }
 

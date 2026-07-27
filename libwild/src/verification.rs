@@ -124,6 +124,7 @@ pub(crate) fn clear_ignored(expected: &mut OutputSectionPartMap<u64>) {
         part_id::CHAINED_FIXUP_TABLE,
         part_id::INDIRECT_SYMTAB,
         part_id::UNWIND_INFO,
+        part_id::EXPORT_TRIE,
         part_id::CODE_SIGNATURE,
     ];
 
