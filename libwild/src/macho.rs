@@ -158,6 +158,18 @@ pub(crate) fn load_dylib_command_size(path: &[u8]) -> usize {
 pub(crate) struct LayoutExt {
     /// Imported STUB library symbols, sorted by GOT.
     pub(crate) imported_symbols: Vec<ImportedSymbolWithResolution>,
+
+    /// Symbols defined in this image that were nonetheless given a `__got` slot, because something
+    /// stores the address of the slot rather than reading through it. Sorted by slot address.
+    /// Unlike an import, the slot's contents are known at link time - it holds the symbol's own
+    /// address, and needs a rebase so that it follows the image when dyld slides it.
+    pub(crate) local_got_symbols: Vec<LocalGotSymbol>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocalGotSymbol {
+    pub(crate) got_address: NonZeroU64,
+    pub(crate) value: u64,
 }
 
 #[derive(Debug, Default)]
@@ -1369,6 +1381,21 @@ impl platform::Platform for MachO {
             .sorted_by_key(|symbol| symbol.got_address)
             .collect();
 
+        // Everything else that was given a slot is defined here, so the slot's contents are known
+        // now rather than at load time. `is_dynamic` is what separates the two: an import's slot is
+        // filled in by dyld from the bind, this one we write ourselves.
+        layout_ext.local_got_symbols = resolutions
+            .iter()
+            .filter(|(_, resolution)| !resolution.flags.is_dynamic())
+            .filter_map(|(_, resolution)| {
+                Some(LocalGotSymbol {
+                    got_address: resolution.format_specific.got_address?,
+                    value: resolution.raw_value,
+                })
+            })
+            .sorted_by_key(|symbol| symbol.got_address)
+            .collect();
+
         Ok(layout_ext)
     }
 
@@ -1805,7 +1832,12 @@ impl platform::Platform for MachO {
         if indirection.got {
             let got_address = allocate_got(memory_offsets);
             resolution.format_specific.got_address = Some(got_address);
-            if !indirection.plt {
+
+            // An imported symbol has no address of its own until dyld binds it, so `raw_value` is
+            // free to stand in for the indirection that reaches it. A locally defined one does have
+            // an address, and references that aren't going through the GOT still need it, so
+            // leaving `raw_value` alone is what lets a symbol have both.
+            if !indirection.plt && flags.is_dynamic() {
                 resolution.raw_value = got_address.get();
             }
         }
@@ -2125,21 +2157,21 @@ struct Indirection {
 }
 
 impl Indirection {
-    /// Only symbols imported from a dylib need indirection, because only their addresses are
-    /// unknown until dyld binds them. A symbol defined in the output has a known address, so a
-    /// `GOT_LOAD` relocation against it is relaxed into a direct reference when the relocation is
-    /// applied (`Arch::relax_got_load`), which is what ld64 does too - it emits a `__got` holding
-    /// only the dylib imports.
+    /// A symbol imported from a dylib needs indirection because its address isn't known until dyld
+    /// binds it. A symbol defined in the output doesn't: a `GOT_LOAD` relocation against it is
+    /// relaxed into direct addressing when the relocation is applied (`Arch::relax_got_load`),
+    /// which is what ld64 does too.
     ///
-    /// Giving a locally defined symbol a `__got` slot instead would mean emitting a rebase fixup
-    /// for the slot, and would also corrupt plain absolute relocations against that symbol, since
-    /// `Resolution::raw_value` is repurposed to hold the GOT address when a GOT entry exists.
+    /// The exception is a reference that stores the address of the slot rather than reading through
+    /// it, since something else will dereference what it finds there. That can't be relaxed away,
+    /// so the slot has to exist even for a symbol we know the address of - which is how a CIE
+    /// reaches a personality routine defined in this image.
     fn for_symbol(flags: ValueFlags) -> Self {
         let indirect = flags.is_dynamic();
 
         Self {
             plt: indirect && flags.needs_plt(),
-            got: indirect && (flags.needs_got() || flags.needs_plt()),
+            got: (indirect && (flags.needs_got() || flags.needs_plt())) || flags.needs_got_entry(),
         }
     }
 }
@@ -2336,6 +2368,14 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
 
         let relocation = A::relocation_from_raw(rel_info)?;
         let mut flags_to_add = layout::resolution_flags(relocation.kind);
+
+        // The GOT-load relocations are written in a GOT-addressing form but don't require the slot
+        // to exist - if the symbol's address is known at link time, `relax_got_load` rewrites the
+        // instruction to address it directly. This one is different: it stores the address of the
+        // slot for something else to dereference, so the slot has to be there.
+        if rel_info.r_type == object::macho::ARM64_RELOC_POINTER_TO_GOT {
+            flags_to_add |= ValueFlags::GOT_ENTRY_REQUIRED;
+        }
         if is_dynamic_library(&symbol_db.file(symbol_db.file_id_for_symbol(symbol_id))) {
             flags_to_add |= ValueFlags::GOT;
             // TODO: classify symbols more reliably, likely by checking whether their section is

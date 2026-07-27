@@ -185,8 +185,16 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
             Ok(())
         })?;
 
+    let mut fixup_sites = fixup_sites
+        .into_inner()
+        .expect("Fixup site list mutex was poisoned");
+
     let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
-    write_got_entries(layout, section_buffers.get_mut(output_section_id::GOT))?;
+    write_got_entries(
+        layout,
+        section_buffers.get_mut(output_section_id::GOT),
+        &mut fixup_sites,
+    )?;
     write_plt_entries::<A>(layout, section_buffers.get_mut(output_section_id::PLT_GOT))?;
     write_indirect_symtab(
         layout,
@@ -194,9 +202,6 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     )?;
     drop(section_buffers);
 
-    let fixup_sites = fixup_sites
-        .into_inner()
-        .expect("Fixup site list mutex was poisoned");
     write_chained_fixups(layout, sized_output, fixup_sites)?;
 
     write_code_signature_metadata(layout, sized_output)?;
@@ -377,8 +382,37 @@ fn write_prelude<'data>(
     Ok(())
 }
 
-fn write_got_entries(layout: &MachOLayout<'_>, got: &mut [u8]) -> Result {
+fn write_got_entries(
+    layout: &MachOLayout<'_>,
+    got: &mut [u8],
+    fixup_sites: &mut Vec<FixupSite>,
+) -> Result {
     let got_layout = layout.section_layouts.get(output_section_id::GOT);
+
+    // Slots for symbols defined here hold the symbol's own address rather than a bind, so we fill
+    // them in and record a rebase, the same as any other pointer we write into the image.
+    for local in &layout.format_specific.local_got_symbols {
+        let offset = local
+            .got_address
+            .get()
+            .checked_sub(got_layout.mem_offset)
+            .ok_or_else(|| error!("GOT entry address is before __got"))?
+            as usize;
+
+        let slot = got
+            .get_mut(offset..offset + GOT_ENTRY_SIZE as usize)
+            .ok_or_else(|| error!("GOT entry is outside __got"))?;
+        slot.copy_from_slice(&local.value.to_le_bytes());
+
+        // A resolution of zero is an undefined weak reference; it stays null rather than becoming
+        // a pointer to the image base.
+        if local.value != 0 {
+            fixup_sites.push(FixupSite {
+                address: local.got_address.get(),
+                is_bind: false,
+            });
+        }
+    }
 
     let sorted_symbols = &layout.format_specific.imported_symbols;
     for (i, imported_symbol) in sorted_symbols.iter().enumerate() {
@@ -966,16 +1000,18 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         }
     }
 
-    // Layout only gives a `__got` slot to symbols whose address isn't known until dyld binds them.
-    // A GOT-style relocation against anything else has to be turned into a direct reference, which
-    // means rewriting the instruction as well as computing a different value for it. Keying this
-    // off the resolution rather than off the flags means the writer can't disagree with whatever
-    // layout decided (see `macho::Indirection`).
-    if matches!(
+    let is_got_relocation = matches!(
         rel_info.kind,
         RelocationKind::Got | RelocationKind::GotRelative
-    ) && resolution.format_specific.got_address.is_none()
-    {
+    );
+
+    // Layout gives a `__got` slot to symbols whose address isn't known until dyld binds them, and
+    // to any symbol whose slot address is itself stored somewhere. A GOT-style relocation against
+    // anything else has to be turned into a direct reference, which means rewriting the instruction
+    // as well as computing a different value for it. Keying this off the resolution rather than off
+    // the flags means the writer can't disagree with whatever layout decided
+    // (`macho::Indirection`).
+    if is_got_relocation && resolution.format_specific.got_address.is_none() {
         A::relax_got_load(rel, &mut out[offset_in_section as usize..]).with_context(|| {
             format!(
                 "Failed to relax {} against {}",
@@ -985,19 +1021,22 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         })?;
     }
 
+    // A GOT relocation names the slot, not the symbol. For an import the two coincide, because an
+    // import has no address of its own to put in `raw_value`; for a locally defined symbol they
+    // don't, and using `raw_value` would quietly address the symbol itself.
+    let target = match resolution.format_specific.got_address {
+        Some(got_address) if is_got_relocation => got_address.get(),
+        _ => resolution.raw_value,
+    };
+
     let mask = get_page_mask(rel_info.mask);
     let mut value = match rel_info.kind {
-        RelocationKind::Absolute => resolution.raw_value.bitand(mask.symbol_plus_addend),
-        RelocationKind::AbsoluteLowPart => resolution.raw_value.bitand(mask.symbol_plus_addend),
-        RelocationKind::Relative => resolution
-            .raw_value
+        RelocationKind::Absolute | RelocationKind::AbsoluteLowPart | RelocationKind::Got => {
+            target.bitand(mask.symbol_plus_addend)
+        }
+        RelocationKind::Relative | RelocationKind::GotRelative => target
             .bitand(mask.symbol_plus_addend)
             .wrapping_sub(place.bitand(mask.place)),
-        RelocationKind::GotRelative => resolution
-            .raw_value
-            .bitand(mask.symbol_plus_addend)
-            .wrapping_sub(place.bitand(mask.place)),
-        RelocationKind::Got => resolution.raw_value.bitand(mask.symbol_plus_addend),
         _ => todo!(),
     };
 
@@ -1338,6 +1377,13 @@ fn write_indirect_symtab(layout: &MachOLayout, out: &mut [u8]) -> Result {
         .mem_offset;
 
     let entries: &mut [U32<Endianness>] = slice_from_all_bytes_mut(out);
+
+    // Not every slot names a symbol another image has to supply: one holding the address of a
+    // symbol defined here is marked as such, so nothing tries to read a symbol index out of it.
+    // Zero would otherwise be read as "the symbol at index 0", which is a real entry.
+    for entry in entries.iter_mut() {
+        entry.set(LE, macho::INDIRECT_SYMBOL_LOCAL.0);
+    }
 
     for (import_index, imported_symbol) in
         layout.format_specific.imported_symbols.iter().enumerate()

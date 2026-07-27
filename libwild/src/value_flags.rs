@@ -112,6 +112,13 @@ bitflags! {
         /// thread-local block rather than an address in the image. Note that this says what the
         /// symbol *is*, whereas the `GOT_TLS_*` flags say what a reference to it *needs*.
         const THREAD_LOCAL = 1 << 17;
+
+        /// A reference stores the address of the symbol's GOT entry, so the entry has to physically
+        /// exist. That's different from `GOT`, which only says the reference is written in a
+        /// GOT-addressing form: such a reference can be rewritten to address the symbol directly
+        /// when its address is known at link time, and usually is. This one can't be, because
+        /// whoever reads the stored address will dereference it.
+        const GOT_ENTRY_REQUIRED = 1 << 18;
     }
 }
 
@@ -209,6 +216,11 @@ impl ValueFlags {
     #[must_use]
     pub(crate) fn needs_export_dynamic(self) -> bool {
         self.contains(ValueFlags::EXPORT_DYNAMIC)
+    }
+
+    #[must_use]
+    pub(crate) fn needs_got_entry(self) -> bool {
+        self.contains(ValueFlags::GOT_ENTRY_REQUIRED)
     }
 
     #[must_use]

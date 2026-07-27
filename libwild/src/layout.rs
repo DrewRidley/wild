@@ -775,6 +775,16 @@ impl<P: Platform> SymbolResolutions<P> {
     pub(crate) fn get(&self, symbol_id: SymbolId) -> Option<&Resolution<P>> {
         self.resolutions[symbol_id.as_usize()].as_ref()
     }
+
+    /// Returns every symbol that got a resolution, paired with its ID.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (SymbolId, &Resolution<P>)> {
+        self.resolutions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, resolution)| {
+                Some((SymbolId::from_usize(index), resolution.as_ref()?))
+            })
+    }
 }
 
 pub(crate) enum FileLayout<'data, P: Platform> {
