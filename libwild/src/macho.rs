@@ -2586,37 +2586,43 @@ fn allocate_plt(memory_offsets: &mut OutputSectionPartMap<u64>) -> NonZeroU64 {
 
 // TODO: sort properly
 const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
-    SectionRule::exact_section_keep(b"__text", crate::output_section_id::TEXT),
+    SectionRule::exact_section(b"__text", crate::output_section_id::TEXT),
     // Also code: clang puts the functions that run global constructors here rather than in
     // `__text`. Getting this wrong is not a size difference - the catch-all below sends what it
     // doesn't recognise to `__DATA`, and a function there faults on the first instruction fetched.
-    SectionRule::exact_section_keep(b"__StaticInit", crate::output_section_id::TEXT),
-    SectionRule::exact_section_keep(b"__cstring", crate::output_section_id::CSTRING),
-    SectionRule::exact_section_keep(b"__ustring", crate::output_section_id::CONST),
+    SectionRule::exact_section(b"__StaticInit", crate::output_section_id::TEXT),
+    SectionRule::exact_section(b"__cstring", crate::output_section_id::CSTRING),
+    SectionRule::exact_section(b"__ustring", crate::output_section_id::CONST),
     SectionRule::prefix_section(b"__objc_meth", crate::output_section_id::CSTRING),
-    SectionRule::exact_section_keep(b"__objc_classname", crate::output_section_id::CSTRING),
-    SectionRule::exact_section_keep(b"__const", crate::output_section_id::CONST),
+    SectionRule::exact_section(b"__objc_classname", crate::output_section_id::CSTRING),
+    SectionRule::exact_section(b"__const", crate::output_section_id::CONST),
     SectionRule::exact_section_keep(
         b"__gcc_except_tab",
         crate::output_section_id::GCC_EXCEPT_TABLE,
     ),
-    SectionRule::exact_section_keep(b"__data", crate::output_section_id::DATA),
-    SectionRule::exact_section_keep(b"__thread_vars", crate::output_section_id::THREAD_VARS),
-    SectionRule::exact_section_keep(b"__thread_data", crate::output_section_id::TDATA),
-    SectionRule::exact_section_keep(b"__thread_bss", crate::output_section_id::TBSS),
-    // Roots: nothing in the image refers to an initialiser list - dyld finds it from the section
-    // type - so without `keep` these are never loaded and the constructors silently never run.
+    SectionRule::exact_section(b"__data", crate::output_section_id::DATA),
+    SectionRule::exact_section(b"__thread_vars", crate::output_section_id::THREAD_VARS),
+    SectionRule::exact_section(b"__thread_data", crate::output_section_id::TDATA),
+    SectionRule::exact_section(b"__thread_bss", crate::output_section_id::TBSS),
+    // Roots. Nothing in the image refers to these, so without `keep` they are unreachable by
+    // definition and would be dropped: dyld finds the initialiser lists from the section type, and
+    // `__unwind_info` reaches into `__eh_frame` by offset rather than through a symbol.
+    //
+    // `__gcc_except_tab` is a root for a narrower reason: the only thing naming a landing pad is a
+    // `__compact_unwind` entry, and those name it with a section-relative relocation, which the
+    // reachability walk doesn't follow. Keeping it whole is larger than ld64's output but correct;
+    // making it droppable needs the walk to follow those relocations first.
     SectionRule::exact_section_keep(b"__mod_init_func", crate::output_section_id::INIT_ARRAY),
     SectionRule::exact_section_keep(b"__mod_term_func", crate::output_section_id::FINI_ARRAY),
-    SectionRule::exact_section_keep(b"__common", crate::output_section_id::COMMON),
-    SectionRule::exact_section_keep(b"__bss", crate::output_section_id::BSS),
+    SectionRule::exact_section(b"__common", crate::output_section_id::COMMON),
+    SectionRule::exact_section(b"__bss", crate::output_section_id::BSS),
     // The literal pools are read-only constants that the assembler kept apart only so that the
     // linker could deduplicate them by size. We don't deduplicate them yet, and ld64 doesn't carry
     // the names through to the output either - it folds all three into `__TEXT,__const` - so
     // sending them there costs no fidelity.
-    SectionRule::exact_section_keep(b"__literal4", crate::output_section_id::CONST),
-    SectionRule::exact_section_keep(b"__literal8", crate::output_section_id::CONST),
-    SectionRule::exact_section_keep(b"__literal16", crate::output_section_id::CONST),
+    SectionRule::exact_section(b"__literal4", crate::output_section_id::CONST),
+    SectionRule::exact_section(b"__literal8", crate::output_section_id::CONST),
+    SectionRule::exact_section(b"__literal16", crate::output_section_id::CONST),
     // `__LD,__compact_unwind` is input to the linker, not output from it: ld64 consumes it to
     // build `__TEXT,__unwind_info` and emits no `__compact_unwind`. We can't build
     // `__unwind_info` yet (`warn_if_unwind_info_needed` says so when it matters), but copying

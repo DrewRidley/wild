@@ -26,6 +26,7 @@ pub struct MachOArgs {
     pub(crate) lib_search_path: Vec<Box<Path>>,
     pub(crate) plugin_path: Option<String>,
     pub(crate) dead_strip_dylibs: bool,
+    pub(crate) dead_strip: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +88,7 @@ impl Default for MachOArgs {
             lib_search_path: Vec::new(),
             plugin_path: None,
             dead_strip_dylibs: false,
+            dead_strip: false,
         }
     }
 }
@@ -150,6 +152,13 @@ impl platform::Args for MachOArgs {
     fn should_merge_sections(&self) -> bool {
         // TODO
         true
+    }
+
+    fn should_gc_sections(&self) -> bool {
+        // Only when asked. ld64 keeps everything unless given -dead_strip, and dropping something
+        // that was actually reachable produces a binary that links and then misbehaves, so this is
+        // not a default worth taking on.
+        self.dead_strip
     }
 
     fn should_output_executable(&self) -> bool {
@@ -307,14 +316,14 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
             Ok(())
         });
 
-    // Accepted rather than rejected because rustc passes it on every link, so refusing it stops
-    // wild linking Rust at all. We don't remove unreachable code yet, so the output is correct but
-    // larger than ld64's - say so rather than let that look like a size regression.
     parser
         .declare()
         .long("dead_strip")
-        .help("Remove unreachable code and data (not yet implemented)")
-        .execute(|args, _modifier_stack| args.warn_unsupported("-dead_strip"));
+        .help("Remove code and data that nothing reaches")
+        .execute(|args, _modifier_stack| {
+            args.dead_strip = true;
+            Ok(())
+        });
 
     // The option declaration cannot be moved to declare_common_args as other platforms
     // use `prefix("o")`.
