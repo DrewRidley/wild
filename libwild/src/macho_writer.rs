@@ -1162,10 +1162,12 @@ fn write_unwind_info(layout: &MachOLayout<'_>, out: &mut [u8]) -> Result {
     let mut writer = UnwindInfoWriter { out, offset: 0 };
 
     // Header. We emit no common encodings: they only save space for the compressed page format,
-    // and we use the regular one, where every entry carries its own encoding anyway.
+    // and we use the regular one, where every entry carries its own encoding anyway. The offset
+    // still names where they would have begun, which is directly after the header, so that it
+    // stays right if any are ever added.
     writer.u32(UNWIND_SECTION_VERSION)?;
-    writer.u32(index_offset as u32)?; // Common encodings, of which there are none, so this is
-    writer.u32(0)?; // just where they would have started.
+    writer.u32(UNWIND_INFO_HEADER_SIZE as u32)?;
+    writer.u32(0)?;
     writer.u32(personality_offset as u32)?;
     writer.u32(personalities.len() as u32)?;
     writer.u32(index_offset as u32)?;
