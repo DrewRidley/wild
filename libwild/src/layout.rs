@@ -1583,19 +1583,23 @@ impl<'data, P: Platform> Layout<'data, P> {
                 return Ok(0);
             }
 
-            // There's no entry point specified, set it to the start of .text. This is pretty weird,
-            // but it's what GNU ld does.
+            // There's no entry point specified, set it to the start of the text section. This is
+            // pretty weird, but it's what GNU ld does.
             let text_layout = self.section_layouts.get(output_section_id::TEXT);
+            let entry_name = String::from_utf8_lossy(self.symbol_db.entry_symbol_name());
+            let text_name = self.output_sections.display_name(output_section_id::TEXT);
+
             if text_layout.mem_size == 0 {
-                self.symbol_db.warning(
-                    "cannot find entry symbol `_start` and .text is empty, not setting entry point",
-                );
+                self.symbol_db.warning(format!(
+                    "cannot find entry symbol `{entry_name}` and {text_name} is empty, not \
+                     setting entry point"
+                ));
 
                 return Ok(0);
             }
 
             self.symbol_db.warning(format!(
-                "cannot find entry symbol `_start`, defaulting to 0x{}",
+                "cannot find entry symbol `{entry_name}`, defaulting to 0x{:x}",
                 text_layout.mem_offset
             ));
             return Ok(text_layout.mem_offset);
