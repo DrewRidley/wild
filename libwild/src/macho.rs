@@ -1043,7 +1043,10 @@ impl platform::Platform for MachO {
     type VerneedTable<'data> = VerneedTable<'data>;
     type ResolvedObjectExt<'data> = ();
 
-    const HAS_NULL_SYMBOL_ENTRY: bool = true;
+    // ELF reserves symbol index 0 for a null entry, so resolution skips it. Mach-O has no such
+    // reservation - index 0 is an ordinary symbol - and answering `true` here made us drop whatever
+    // symbol happened to be first from resolution entirely.
+    const HAS_NULL_SYMBOL_ENTRY: bool = false;
 
     fn link_for_arch<'data>(
         linker: &'data crate::Linker,
@@ -1236,10 +1239,21 @@ impl platform::Platform for MachO {
     }
 
     fn create_linker_defined_symbols(
-        _symbols: &mut crate::parsing::InternalSymbolsBuilder<Self>,
+        symbols: &mut crate::parsing::InternalSymbolsBuilder<Self>,
         _output_kind: crate::output_kind::OutputKind,
         _args: &Self::Args,
     ) {
+        // Symbol ID 0 means "undefined" everywhere in the linker, so it must not name a real
+        // symbol. The prelude is allocated ids first, so claiming one here is what reserves it.
+        // ELF gets this for free from its null symbol table entry; Mach-O has no such entry, so
+        // without this the first symbol of the first object would land on the sentinel and read
+        // back as undefined.
+        symbols
+            .add_symbol(crate::parsing::InternalSymDefInfo::new(
+                crate::parsing::SymbolPlacement::Undefined,
+                b"",
+            ))
+            .hide();
     }
 
     fn built_in_section_infos<'data>()
