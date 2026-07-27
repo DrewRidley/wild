@@ -103,6 +103,7 @@ use crate::verbose_timing_phase;
 use hashbrown::HashMap;
 use itertools::Itertools;
 use linker_utils::elf::RelocationKind;
+use linker_utils::elf::RelocationKindInfo;
 use linker_utils::elf::RelocationSize;
 use linker_utils::utils::slice_from_all_bytes_mut;
 use object::BigEndian;
@@ -778,6 +779,7 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
         }
     }
 
+    write_thunks::<A>(object, buffers, layout)?;
     write_symbols(object, buffers, layout, symbol_writer)?;
 
     Ok(())
@@ -796,6 +798,9 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     let section_address = object_layout.section_resolutions[section_index.0]
         .address()
         .context("Attempted to apply relocations to a section that we didn't load")?;
+
+    let section_part_id =
+        object_layout.section_part_id(section_index, &layout.symbol_db.section_part_ids);
 
     let relocations = object_layout.relocations(section_index)?.relocations;
     let mut index = 0;
@@ -863,6 +868,7 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
         apply_relocation::<A>(
             object_layout,
             section_address,
+            section_part_id,
             relocations[index].info(LE),
             addend,
             layout,
@@ -948,6 +954,7 @@ fn apply_subtractor_pair(
 fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     object_layout: &ObjectLayout<'data, MachO>,
     section_address: u64,
+    section_part_id: crate::part_id::PartId,
     rel: RelocationInfo,
     addend: u64,
     layout: &MachOLayout<'data>,
@@ -1040,8 +1047,28 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         RelocationKind::Relative | RelocationKind::GotRelative => target
             .bitand(mask.symbol_plus_addend)
             .wrapping_sub(place.bitand(mask.place)),
-        _ => todo!(),
+        other => bail!(
+            "Unsupported relocation kind {other:?} applying {} to {}",
+            A::rel_type_to_string(rel),
+            layout.symbol_debug(local_symbol_id)
+        ),
     };
+
+    // A branch that can't reach its target goes to an island instead, which does the long jump.
+    // Recomputed rather than adjusted, because the displacement is to the island, not the target.
+    if let Some(thunk_address) = thunk_address_for_relocation::<A>(
+        object_layout,
+        section_part_id,
+        layout,
+        rel_info,
+        local_symbol_id,
+        value,
+    )? {
+        value = thunk_address
+            .wrapping_add(rel_info.bias)
+            .bitand(mask.symbol_plus_addend)
+            .wrapping_sub(place.bitand(mask.place));
+    }
 
     // What a pointer-sized absolute slot needs depends on what it points at. Anything else - a
     // smaller reference, or an N_ABS symbol, which names a fixed value rather than a place in the
@@ -2673,6 +2700,106 @@ fn write_symbols<'data>(
         }
 
         symbol_writer.define_symbol(buffers, info.name, section, symbol_type, desc, value)?;
+    }
+
+    Ok(())
+}
+
+/// Returns the address of the branch island to use for a branch that can't reach its target, or
+/// `None` if it can reach it directly.
+///
+/// A `BRANCH26` carries a 26-bit signed word displacement, so it reaches +-128 MiB. Past that the
+/// branch physically cannot encode the target, and the only way to keep it is to send it somewhere
+/// nearer that does the long jump - so layout reserves an island per out-of-range target and this
+/// redirects the branch to it.
+fn thunk_address_for_relocation<A: Arch<Platform = MachO>>(
+    object_layout: &ObjectLayout<'_, MachO>,
+    part_id: crate::part_id::PartId,
+    layout: &MachOLayout<'_>,
+    rel_info: RelocationKindInfo,
+    local_symbol_id: SymbolId,
+    value: u64,
+) -> Result<Option<u64>> {
+    let Some(config) = A::thunk_config() else {
+        return Ok(None);
+    };
+
+    if !rel_info.thunkable || rel_info.range.contains(value as i64) {
+        return Ok(None);
+    }
+
+    let canonical_id = layout.symbol_db.definition(local_symbol_id);
+
+    // Code in the main alignment bucket gets its object's own block of islands, which keeps each
+    // island near the branches that use it. Anything else falls back to the first block.
+    let thunk_id = if part_id == config.primary_function_part_id {
+        object_layout.thunk_block_id
+    } else {
+        crate::thunks::ThunkBlockId::FIRST
+    };
+
+    let thunk_address = layout
+        .thunk_block_addresses
+        .get(thunk_id.as_usize())
+        .and_then(|addresses| addresses.get(&canonical_id))
+        .copied();
+
+    let Some(thunk_address) = thunk_address else {
+        bail!(
+            "Branch to {} is out of range and no thunk was reserved for it",
+            layout.symbol_db.symbol_name_for_display(local_symbol_id)
+        );
+    };
+
+    ensure!(
+        thunk_address != 0,
+        "Thunk address not yet allocated for {}",
+        layout.symbol_db.symbol_name_for_display(local_symbol_id)
+    );
+
+    Ok(Some(thunk_address))
+}
+
+/// Writes the branch islands this object is responsible for.
+fn write_thunks<A: Arch<Platform = MachO>>(
+    object: &ObjectLayout<'_, MachO>,
+    buffers: &mut OutputSectionPartMap<&mut [u8]>,
+    layout: &MachOLayout<'_>,
+) -> Result {
+    if !object.owns_thunk_block {
+        return Ok(());
+    }
+
+    let Some(addresses) = layout
+        .thunk_block_addresses
+        .get(object.thunk_block_id.as_usize())
+    else {
+        return Ok(());
+    };
+
+    if addresses.is_empty() {
+        return Ok(());
+    }
+
+    let config = A::thunk_config().context("Thunks were reserved without a thunk config")?;
+    let thunk_size = config.thunk_size as usize;
+    let buffer = buffers.get_mut(config.primary_function_part_id);
+
+    for (&symbol_id, &thunk_address) in addresses {
+        let resolution = layout
+            .merged_symbol_resolution(symbol_id)
+            .with_context(|| {
+                format!(
+                    "Thunk target {} has no resolution",
+                    layout.symbol_db.symbol_name_for_display(symbol_id)
+                )
+            })?;
+
+        let thunk = buffer
+            .split_off_mut(..thunk_size)
+            .ok_or_else(|| error!("Insufficient space reserved for branch islands"))?;
+
+        A::write_thunk(thunk_address, resolution.raw_value, thunk);
     }
 
     Ok(())

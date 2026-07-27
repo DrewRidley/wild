@@ -25,6 +25,17 @@ const STUB_TEMPLATE: &[u8] = &[
     0x00, 0x02, 0x1f, 0xd6, // BR   x16
 ];
 
+/// How far a `BRANCH26` reaches. Below this much executable input no branch can be out of range,
+/// so thunks can be skipped entirely.
+const MIN_BRANCH_RANGE: u64 = 128 * 1024 * 1024;
+
+/// ADRP+ADD+BR: form the target's address relative to the island, then jump to it.
+const THUNK_TEMPLATE: &[u8] = &[
+    0x10, 0x00, 0x00, 0x90, // ADRP x16, 0
+    0x10, 0x02, 0x00, 0x91, // ADD  x16, x16, #0
+    0x00, 0x02, 0x1F, 0xD6, // BR   x16
+];
+
 const _ASSERTS: () = {
     assert!(STUB_TEMPLATE.len() as u64 == crate::macho::PLT_ENTRY_SIZE);
 };
@@ -117,12 +128,17 @@ impl crate::platform::Arch for MachOAArch64 {
             RelocationKind::Absolute
         };
 
+        // Only a branch has a reach short enough to need one, and only a branch can be redirected
+        // to an island without changing what the instruction means.
+        let mut is_thunkable = false;
+
         let (kind, size, mask, range, alignment) = match rel.r_type {
             object::macho::ARM64_RELOC_UNSIGNED => {
                 (rel_kind, rel_size, None, AllowedRange::no_check(), 1)
             }
             object::macho::ARM64_RELOC_BRANCH26 => {
                 debug_assert_eq!(rel_size, RelocationSize::ByteSize(4));
+                is_thunkable = true;
                 (
                     rel_kind,
                     RelocationSize::bit_mask_aarch64(2, 28, AArch64Instruction::JumpCall),
@@ -229,8 +245,40 @@ impl crate::platform::Arch for MachOAArch64 {
             mask,
             range,
             size,
-            thunkable: false,
+            thunkable: is_thunkable,
         })
+    }
+
+    fn thunk_config() -> Option<crate::platform::ThunkConfig> {
+        Some(crate::platform::ThunkConfig {
+            primary_function_part_id: const {
+                crate::output_section_id::TEXT
+                    .part_id_with_alignment(crate::alignment::Alignment { exponent: 2 })
+            },
+            min_branch_range: MIN_BRANCH_RANGE,
+            thunk_size: THUNK_TEMPLATE.len() as u64,
+        })
+    }
+
+    /// Writes a branch island: compute the target's page, add its offset, and jump there.
+    ///
+    /// PC-relative throughout, which matters because a Mach-O executable is always position
+    /// independent - an absolute sequence would need a rebase, and a rebase in `__TEXT` is not
+    /// something dyld will apply.
+    fn write_thunk(thunk_address: u64, target_address: u64, buf: &mut [u8]) {
+        buf.copy_from_slice(THUNK_TEMPLATE);
+
+        let thunk_page = thunk_address & !PAGE_MASK_4KB;
+        let target_page = target_address & !PAGE_MASK_4KB;
+        let page_diff = (target_page as i64).wrapping_sub(thunk_page as i64);
+        let page_count = (page_diff / SIZE_4KB as i64) as u64 & 0x1F_FFFF;
+
+        AArch64Instruction::Adr.write_to_value(page_count, false, &mut buf[0..4]);
+        AArch64Instruction::Add.write_to_value(
+            target_address & PAGE_MASK_4KB,
+            false,
+            &mut buf[4..8],
+        );
     }
 
     fn relax_got_load(

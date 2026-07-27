@@ -1331,6 +1331,12 @@ impl platform::Platform for MachO {
         &[]
     }
 
+    /// Mach-O only ever holds arm64 code here, so the thunk shape never varies by object the way
+    /// it does for ELF, where one link can mix architectures.
+    fn file_thunk_config<'data>(_file: &Self::File<'data>) -> Option<crate::platform::ThunkConfig> {
+        <crate::macho_aarch64::MachOAArch64 as platform::Arch>::thunk_config()
+    }
+
     fn create_linker_defined_symbols(
         symbols: &mut crate::parsing::InternalSymbolsBuilder<Self>,
         _output_kind: crate::output_kind::OutputKind,
@@ -2557,6 +2563,17 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
 
         let atomic_flags = &resources.per_symbol_flags.get_atomic(symbol_id);
         let previous_flags = atomic_flags.fetch_or(flags_to_add);
+
+        // A branch can only reach so far. This records that the target is branched to, so that
+        // layout can reserve an island for it if it turns out to land out of range - by the time
+        // relocations are applied it is far too late to make room for one.
+        crate::thunks::handle_thunk_extensions_for_relocation::<A>(
+            object.section_part_id(section_index, &symbol_db.section_part_ids),
+            resources,
+            local_symbol_id,
+            symbol_id,
+            rel_info,
+        );
 
         layout::check_for_undefined::<A>(
             object,
