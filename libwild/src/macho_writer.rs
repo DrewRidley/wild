@@ -142,12 +142,13 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
         split_output_into_sections(layout, &mut sized_output.out);
     padding.fill_zero();
 
-    // Addresses of pointer-sized slots that hold an address within this image. Each one needs a
-    // rebase entry in the chained-fixup table, otherwise dyld leaves the link-time address in
-    // place and the program dereferences an address that hasn't been slid by the load bias.
-    // They're discovered while relocations are applied, which happens in parallel, so each group
-    // accumulates its own list and merges it in once.
-    let rebase_addresses = Mutex::new(Vec::new());
+    // Pointer-sized slots that dyld has to write to at load time: rebases, for slots holding an
+    // address within this image that has to be slid by the load bias, and binds, for slots holding
+    // the address of a symbol in another image. The `__got` binds are added later by
+    // `write_chained_fixups`, since they follow from the import list rather than from a
+    // relocation. These are discovered while relocations are applied, which happens in parallel,
+    // so each group accumulates its own list and merges it in once.
+    let fixup_sites = Mutex::new(Vec::new());
 
     let mut writable_buckets = split_buffers_by_alignment(&mut section_buffers, layout);
     let groups_and_buffers = split_output_by_group(layout, &mut writable_buckets);
@@ -159,7 +160,7 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
             let mut symbol_writer = MachOSymbolTableWriter {
                 next_strtab_offset: group.strtab_start_offset,
             };
-            let mut group_rebases = Vec::new();
+            let mut group_fixups = Vec::new();
             for file in &group.files {
                 write_file::<A>(
                     file,
@@ -167,15 +168,15 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
                     layout,
                     &sized_output.trace,
                     &mut symbol_writer,
-                    &mut group_rebases,
+                    &mut group_fixups,
                 )
                 .with_context(|| format!("Failed copying from {file} to output file"))?;
             }
-            if !group_rebases.is_empty() {
-                rebase_addresses
+            if !group_fixups.is_empty() {
+                fixup_sites
                     .lock()
-                    .expect("Rebase list mutex was poisoned")
-                    .append(&mut group_rebases);
+                    .expect("Fixup site list mutex was poisoned")
+                    .append(&mut group_fixups);
             }
             Ok(())
         })?;
@@ -185,10 +186,10 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     write_plt_entries::<A>(layout, section_buffers.get_mut(output_section_id::PLT_GOT))?;
     drop(section_buffers);
 
-    let rebase_addresses = rebase_addresses
+    let fixup_sites = fixup_sites
         .into_inner()
-        .expect("Rebase list mutex was poisoned");
-    write_chained_fixups(layout, sized_output, rebase_addresses)?;
+        .expect("Fixup site list mutex was poisoned");
+    write_chained_fixups(layout, sized_output, fixup_sites)?;
 
     write_code_signature_metadata(layout, sized_output)?;
     write_uuid(layout, sized_output)?;
@@ -248,11 +249,11 @@ fn write_file<'data, A: Arch<Platform = MachO>>(
     layout: &MachOLayout<'data>,
     _trace: &TraceOutput,
     symbol_writer: &mut MachOSymbolTableWriter,
-    rebase_addresses: &mut Vec<u64>,
+    fixup_sites: &mut Vec<FixupSite>,
 ) -> Result {
     match file {
         FileLayout::Object(s) => {
-            write_object::<A>(s, buffers, layout, symbol_writer, rebase_addresses)?;
+            write_object::<A>(s, buffers, layout, symbol_writer, fixup_sites)?;
         }
         FileLayout::Prelude(s) => write_prelude(s, buffers, layout)?,
         _ => {
@@ -641,7 +642,7 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &MachOLayout<'data>,
     symbol_writer: &mut MachOSymbolTableWriter,
-    rebase_addresses: &mut Vec<u64>,
+    fixup_sites: &mut Vec<FixupSite>,
 ) -> Result {
     verbose_timing_phase!("Write object", file_id = object.file_id.as_u32());
 
@@ -656,7 +657,7 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
                     *sec,
                     object::SectionIndex(i),
                     buffers,
-                    rebase_addresses,
+                    fixup_sites,
                 )?;
             }
             _ => (),
@@ -674,7 +675,7 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     section: Section,
     section_index: object::SectionIndex,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
-    rebase_addresses: &mut Vec<u64>,
+    fixup_sites: &mut Vec<FixupSite>,
 ) -> Result {
     let out = write_section_raw(object_layout, layout, section, section_index, buffers)?;
 
@@ -689,7 +690,7 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
             rel.info(LE),
             layout,
             out,
-            rebase_addresses,
+            fixup_sites,
         )?;
     }
 
@@ -703,7 +704,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     rel: RelocationInfo,
     layout: &MachOLayout<'data>,
     out: &mut [u8],
-    rebase_addresses: &mut Vec<u64>,
+    fixup_sites: &mut Vec<FixupSite>,
 ) -> Result {
     let offset_in_section = u64::from(rel.r_address);
     let place = section_address + offset_in_section;
@@ -739,7 +740,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     }
 
     let mask = get_page_mask(rel_info.mask);
-    let value = match rel_info.kind {
+    let mut value = match rel_info.kind {
         RelocationKind::Absolute => resolution.raw_value.bitand(mask.symbol_plus_addend),
         RelocationKind::AbsoluteLowPart => resolution.raw_value.bitand(mask.symbol_plus_addend),
         RelocationKind::Relative => resolution
@@ -754,6 +755,40 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         _ => todo!(),
     };
 
+    // What a pointer-sized absolute slot needs depends on what it points at. Anything else - a
+    // smaller reference, or an N_ABS symbol, which names a fixed value rather than a place in the
+    // image - is written as-is and left alone.
+    if rel_info.kind == RelocationKind::Absolute
+        && rel_info.size == RelocationSize::ByteSize(size_of::<u64>())
+        && !flags.is_absolute()
+    {
+        if flags.is_tls() {
+            // The last word of a `tlv_descriptor` holds where the variable sits within the
+            // thread-local block, not where the template copy of it sits in the image. dyld adds
+            // that offset to the block it allocates per thread, so this must be a plain number:
+            // sliding it, as a rebase would, gives every access a wild pointer.
+            value = value.wrapping_sub(thread_local_block_address(layout));
+        } else if flags.is_dynamic() {
+            // The slot names a symbol in another image, so dyld has to bind it. Encode the import
+            // ordinal the same way `write_got_entries` does for `__got`; the difference is only
+            // where the slot lives. `__tlv_bootstrap`, which every `tlv_descriptor` starts with,
+            // reaches us this way.
+            value = CHAINED_PTR_BIND | import_ordinal(layout, local_symbol_id)?;
+            fixup_sites.push(FixupSite {
+                address: place,
+                is_bind: true,
+            });
+        } else if value != 0 {
+            // An address inside this image, written as the link-time address, which is only
+            // correct if dyld happens to load us where we asked. Record a rebase so it gets the
+            // load bias added. A resolution of zero is an undefined weak reference and stays null.
+            fixup_sites.push(FixupSite {
+                address: place,
+                is_bind: false,
+            });
+        }
+    }
+
     tracing::trace!(
             %flags,
             ?rel_info.kind,
@@ -762,20 +797,6 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
             value_hex = %HexU64::new(value),
             symbol_name = %layout.symbol_db.symbol_name_for_display(local_symbol_id),
             "relocation applied");
-
-    // A pointer-sized absolute reference to an address inside this image is written as the
-    // link-time address, which is only correct if dyld happens to load us at our preferred
-    // address. Record the slot so that a rebase fixup gets emitted for it; dyld then adds the
-    // load bias when it walks the chain. Absolute symbols (`N_ABS`) name a fixed value rather
-    // than a place in the image, so they must not be slid, and a resolution of zero is an
-    // undefined weak reference, which stays null.
-    if rel_info.kind == RelocationKind::Absolute
-        && rel_info.size == RelocationSize::ByteSize(size_of::<u64>())
-        && !flags.is_absolute()
-        && value != 0
-    {
-        rebase_addresses.push(place);
-    }
 
     rel_info
         .write_to_buffer(value, &mut out[offset_in_section as usize..])
@@ -1036,6 +1057,43 @@ const CHAINED_PTR_64_TARGET_BITS: u32 = 36;
 /// Width of the `name_offset` field of a `dyld_chained_import`.
 const CHAINED_IMPORT_NAME_OFFSET_BITS: u32 = 23;
 
+/// Set in a `DYLD_CHAINED_PTR_64` slot to say that dyld should bind it to an imported symbol
+/// rather than slide it as a rebase.
+const CHAINED_PTR_BIND: u64 = 1 << 63;
+
+/// Returns the address the thread-local template starts at, which is what offsets stored in a
+/// `tlv_descriptor` are measured from. `__thread_data` comes first and `__thread_bss` follows it,
+/// so the start of `__thread_data` is the base of the whole block.
+fn thread_local_block_address(layout: &MachOLayout<'_>) -> u64 {
+    layout
+        .section_layouts
+        .get(output_section_id::TDATA)
+        .mem_offset
+}
+
+/// Returns the position of a symbol in the import list, which is what a bind slot stores to say
+/// which symbol dyld should resolve it to.
+fn import_ordinal(layout: &MachOLayout<'_>, symbol_id: SymbolId) -> Result<u64> {
+    layout
+        .format_specific
+        .imported_symbols
+        .iter()
+        .position(|imported| imported.symbol_id == symbol_id)
+        .map(|ordinal| ordinal as u64)
+        .ok_or_else(|| {
+            // Only symbols that get a `__got` or `__stubs` entry are currently recorded as
+            // imports, so a symbol reached solely through a pointer in initialised data - a global
+            // initialised to the address of a libc function, say - never makes it into the list
+            // and has no ordinal to bind to. Erroring beats the alternative: before binds were
+            // emitted at all, such a slot got a rebase of a nonsense address and the binary took
+            // SIGBUS the first time it was used.
+            error!(
+                "{} is only referenced by a pointer in data, which wild cannot import yet",
+                layout.symbol_debug(symbol_id)
+            )
+        })
+}
+
 /// A slot in the output image that dyld has to write to at load time.
 #[derive(Clone, Copy)]
 struct FixupSite {
@@ -1075,7 +1133,7 @@ struct SegmentFixups {
 fn write_chained_fixups(
     layout: &MachOLayout,
     sized_output: &mut SizedOutput,
-    rebase_addresses: Vec<u64>,
+    fixup_sites: Vec<FixupSite>,
 ) -> Result {
     verbose_timing_phase!("Write chained fixups");
 
@@ -1133,10 +1191,7 @@ fn write_chained_fixups(
             address: imported_symbol.got_address.get(),
             is_bind: true,
         })
-        .chain(rebase_addresses.into_iter().map(|address| FixupSite {
-            address,
-            is_bind: false,
-        }))
+        .chain(fixup_sites)
         .collect_vec();
 
     // dyld walks each chain from low to high address, so that's the order the links go in.
