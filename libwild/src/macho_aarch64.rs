@@ -1,6 +1,3 @@
-// TODO
-#![allow(unused_variables)]
-
 use crate::bail;
 use crate::ensure;
 use crate::error;
@@ -54,7 +51,7 @@ const ADD_IMM_64: u32 = 0x9100_0000;
 pub(crate) struct Relaxation {}
 
 impl crate::platform::Relaxation for Relaxation {
-    fn apply(&self, section_bytes: &mut [u8], offset_in_section: &mut u64, addend: &mut i64) {
+    fn apply(&self, _section_bytes: &mut [u8], _offset_in_section: &mut u64, _addend: &mut i64) {
         todo!()
     }
 
@@ -87,7 +84,7 @@ impl crate::platform::Arch for MachOAArch64 {
     }
 
     fn get_dynamic_relocation_type(
-        relocation: linker_utils::elf::DynamicRelocationKind,
+        _relocation: linker_utils::elf::DynamicRelocationKind,
     ) -> object::macho::RelocationInfo {
         todo!()
     }
@@ -330,15 +327,15 @@ impl crate::platform::Arch for MachOAArch64 {
         }
     }
 
-    fn tp_offset_start(layout: &crate::layout::Layout<Self::Platform>) -> u64 {
+    fn tp_offset_start(_layout: &crate::layout::Layout<Self::Platform>) -> u64 {
         todo!()
     }
 
-    fn get_property_class(property_type: u32) -> Option<crate::elf::PropertyClass> {
+    fn get_property_class(_property_type: u32) -> Option<crate::elf::PropertyClass> {
         todo!()
     }
 
-    fn merge_eflags(eflags: impl Iterator<Item = u32>) -> crate::error::Result<u32> {
+    fn merge_eflags(_eflags: impl Iterator<Item = u32>) -> crate::error::Result<u32> {
         todo!()
     }
 
@@ -347,23 +344,23 @@ impl crate::platform::Arch for MachOAArch64 {
     }
 
     fn get_source_info<'data>(
-        object: &<Self::Platform as crate::platform::Platform>::File<'data>,
-        relocations: &<Self::Platform as crate::platform::Platform>::RelocationSections,
-        section: &<Self::Platform as crate::platform::Platform>::SectionHeader,
-        offset_in_section: u64,
+        _object: &<Self::Platform as crate::platform::Platform>::File<'data>,
+        _relocations: &<Self::Platform as crate::platform::Platform>::RelocationSections,
+        _section: &<Self::Platform as crate::platform::Platform>::SectionHeader,
+        _offset_in_section: u64,
     ) -> crate::error::Result<crate::platform::SourceInfo> {
         Ok(crate::platform::SourceInfo(None))
     }
 
     fn new_relaxation(
-        relocation_kind: object::macho::RelocationInfo,
-        section_bytes: &[u8],
-        offset_in_section: u64,
-        flags: crate::value_flags::ValueFlags,
-        output_kind: crate::output_kind::OutputKind,
-        section_flags: <Self::Platform as crate::platform::Platform>::SectionFlags,
-        non_zero_address: bool,
-        relax_deltas: Option<&linker_utils::relaxation::SectionRelaxDeltas>,
+        _relocation_kind: object::macho::RelocationInfo,
+        _section_bytes: &[u8],
+        _offset_in_section: u64,
+        _flags: crate::value_flags::ValueFlags,
+        _output_kind: crate::output_kind::OutputKind,
+        _section_flags: <Self::Platform as crate::platform::Platform>::SectionFlags,
+        _non_zero_address: bool,
+        _relax_deltas: Option<&linker_utils::relaxation::SectionRelaxDeltas>,
     ) -> Option<Self::Relaxation> {
         todo!()
     }
