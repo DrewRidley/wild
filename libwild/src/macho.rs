@@ -1288,6 +1288,13 @@ impl platform::Platform for MachO {
                 b"",
             ))
             .hide();
+
+        // Both name the address the mach header is loaded at, which is also the image's base.
+        // `__mh_execute_header` is how code finds its own header; `___dso_handle` is what
+        // `__cxa_atexit` is handed to say which image a destructor belongs to, so anything with a
+        // static or thread-local destructor references it - which is most C++ programs.
+        symbols.section_start(output_section_id::FILE_HEADER, "__mh_execute_header");
+        symbols.section_start(output_section_id::FILE_HEADER, "___dso_handle");
     }
 
     fn built_in_section_infos<'data>()
@@ -1781,7 +1788,11 @@ impl platform::Platform for MachO {
         _sizes: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
         _symbol_db: &crate::symbol_db::SymbolDb<Self>,
     ) -> crate::error::Result {
-        todo!()
+        // Linker-defined symbols resolve references but aren't written to the symbol table, so they
+        // need no space in it. Reserving some would leave a hole, since nothing in the writer emits
+        // them. ld64 does list `__mh_execute_header`, so this is a difference from its output;
+        // fixing it means emitting these symbols, not just allocating for them.
+        Ok(())
     }
 
     fn allocate_prelude(
@@ -1883,9 +1894,6 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::DATA);
         builder.add_section(output_section_id::INIT_ARRAY);
         builder.add_section(output_section_id::FINI_ARRAY);
-        // ld64 puts the descriptors ahead of the thread-local data they point at.
-        builder.add_section(output_section_id::THREAD_VARS);
-        builder.add_section(output_section_id::TDATA);
         // Sections we have no built-in ID for are mapped to `__DATA` by `mapped_segment_type`, so
         // they have to be added here or the segment's section count and its contents disagree.
         // They go before the zerofill sections below because they do have file content, and a
@@ -1895,6 +1903,12 @@ impl platform::Platform for MachO {
         // every custom section in the `nonalloc` bucket; there's nothing to read from the other
         // buckets.
         builder.add_sections(&custom.nonalloc);
+        // ld64 puts the descriptors ahead of the thread-local data they point at. `__thread_data`
+        // and `__thread_bss` are the template dyld copies for each thread, and a descriptor names
+        // its variable by an offset into that template - so nothing may come between them, or the
+        // offsets run past the end of what dyld allocated and it refuses to load the image.
+        builder.add_section(output_section_id::THREAD_VARS);
+        builder.add_section(output_section_id::TDATA);
         builder.add_section(output_section_id::TBSS);
         builder.add_section(output_section_id::COMMON);
         builder.add_section(output_section_id::BSS);
@@ -2191,7 +2205,14 @@ fn allocate_plt(memory_offsets: &mut OutputSectionPartMap<u64>) -> NonZeroU64 {
 // TODO: sort properly
 const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
     SectionRule::exact_section_keep(b"__text", crate::output_section_id::TEXT),
+    // Also code: clang puts the functions that run global constructors here rather than in
+    // `__text`. Getting this wrong is not a size difference - the catch-all below sends what it
+    // doesn't recognise to `__DATA`, and a function there faults on the first instruction fetched.
+    SectionRule::exact_section_keep(b"__StaticInit", crate::output_section_id::TEXT),
     SectionRule::exact_section_keep(b"__cstring", crate::output_section_id::CSTRING),
+    SectionRule::exact_section_keep(b"__ustring", crate::output_section_id::CONST),
+    SectionRule::prefix_section(b"__objc_meth", crate::output_section_id::CSTRING),
+    SectionRule::exact_section_keep(b"__objc_classname", crate::output_section_id::CSTRING),
     SectionRule::exact_section_keep(b"__const", crate::output_section_id::CONST),
     SectionRule::exact_section_keep(
         b"__gcc_except_tab",
