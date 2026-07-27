@@ -986,6 +986,20 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
         index: object::SymbolIndex,
     ) -> Result<Option<object::SectionIndex>>;
 
+    /// Returns whether `symbol` names a thread-local variable.
+    ///
+    /// ELF marks this on the symbol itself, so the default answer just asks the symbol. Mach-O only
+    /// marks it on the section that the symbol is defined in, which is why this takes the defining
+    /// object rather than living on `Symbol`.
+    fn is_symbol_thread_local(
+        &self,
+        symbol: &<Self::Platform as Platform>::SymtabEntry,
+        index: object::SymbolIndex,
+    ) -> Result<bool> {
+        let _ = index;
+        Ok(symbol.is_tls())
+    }
+
     fn symbol_versions(&self) -> &[<Self::Platform as Platform>::SymbolVersionIndex];
 
     fn dynamic_symbol_used(

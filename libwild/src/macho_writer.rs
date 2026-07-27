@@ -49,6 +49,7 @@ use crate::macho::UuidCommand;
 use crate::macho::code_signature_identifier;
 use crate::macho::code_signature_padded_identifier_size;
 use crate::macho::get_segment_sections;
+use crate::macho::is_no_bits_section_type;
 use crate::macho::load_dylib_command_size;
 use crate::macho_object::CS_ADHOC;
 use crate::macho_object::CS_EXECSEG_MAIN_BINARY;
@@ -136,7 +137,6 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
 ) -> Result {
     timing_phase!("Write data to file");
     warn_if_unwind_info_needed(layout);
-    reject_incomplete_thread_locals(layout)?;
 
     let (mut section_buffers, mut padding) =
         split_output_into_sections(layout, &mut sized_output.out);
@@ -225,24 +225,6 @@ fn warn_if_unwind_info_needed(layout: &MachOLayout<'_>) {
 /// The addressing side of thread-local storage works: `__thread_vars`, `__thread_data` and
 /// `__thread_bss` are laid out into `__DATA`, and the TLVP relocation pair relaxes to a direct
 /// reference to the descriptor exactly as ld64 does. What is missing is the descriptor contents.
-/// Each `tlv_descriptor` needs its first word bound to `__tlv_bootstrap` in libSystem, and its
-/// third word holding the variable's offset within the thread-local block rather than an address -
-/// we currently emit a rebase for both, so the binary builds and then takes SIGBUS on first use.
-///
-/// Refusing to write the file keeps that from looking like a working link. Remove this once the
-/// descriptors are filled in properly.
-fn reject_incomplete_thread_locals(layout: &MachOLayout<'_>) -> Result {
-    let thread_vars = layout.section_layouts.get(output_section_id::THREAD_VARS);
-
-    ensure!(
-        thread_vars.mem_size == 0,
-        "thread-local variables are not supported yet: the __thread_vars descriptors would need \
-         binding to __tlv_bootstrap and a thread-block offset, and wild does not emit either yet"
-    );
-
-    Ok(())
-}
-
 fn write_file<'data, A: Arch<Platform = MachO>>(
     file: &FileLayout<'data, MachO>,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
@@ -416,6 +398,18 @@ fn populate_file_header(
         .sizeofcmds
         .set(LE, load_commands_info.segment_size.file_size as u32);
     let mut flags = macho::MH_PIE | macho::MH_DYLDLINK | macho::MH_NOUNDEFS | macho::MH_TWOLEVEL;
+
+    // dyld only walks `__thread_vars` and fills in each descriptor's thunk and key if this flag
+    // says the image has descriptors to fill in. Without it the descriptors keep whatever the
+    // linker left in them and the first access calls straight into `__tlv_bootstrap`, which aborts.
+    if layout
+        .section_layouts
+        .get(output_section_id::THREAD_VARS)
+        .mem_size
+        > 0
+    {
+        flags |= macho::MH_HAS_TLV_DESCRIPTORS;
+    }
 
     // Malfunction: clear MH_PIE. The binary still links and still runs, but it is no longer
     // position independent, so the loader stops applying ASLR to it. This is the archetypal
@@ -617,7 +611,16 @@ fn write_sections(
         section.sectname[section_name.len()..].zero();
         section.addr.set(LE, size.mem_offset);
         section.size.set(LE, size.mem_size);
-        section.offset.set(LE, size.file_offset as u32);
+
+        // A zerofill section has no bytes in the file, so there's no file offset to name. ld64
+        // writes zero here, and tools read the field without first checking the section type, so
+        // pointing it at the byte that happens to follow the segment would misreport the contents.
+        let file_offset = if is_no_bits_section_type(section_flags.typ()) {
+            0
+        } else {
+            size.file_offset as u32
+        };
+        section.offset.set(LE, file_offset);
         section.align.set(LE, u32::from(size.alignment.exponent));
         section.reloff.set(LE, 0);
         section.nreloc.set(LE, 0);
@@ -762,7 +765,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         && rel_info.size == RelocationSize::ByteSize(size_of::<u64>())
         && !flags.is_absolute()
     {
-        if flags.is_tls() {
+        if flags.is_thread_local() {
             // The last word of a `tlv_descriptor` holds where the variable sits within the
             // thread-local block, not where the template copy of it sits in the image. dyld adds
             // that offset to the block it allocates per thread, so this must be a plain number:

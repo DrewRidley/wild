@@ -348,6 +348,30 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         }
     }
 
+    fn is_symbol_thread_local(
+        &self,
+        symbol: &<Self::Platform as platform::Platform>::SymtabEntry,
+        index: object::SymbolIndex,
+    ) -> crate::error::Result<bool> {
+        // We take a dylib's exported symbols without parsing its section table, so there's nothing
+        // to consult. That costs nothing: a thread-local in another image is reached through a
+        // descriptor over there, never by taking its address from here.
+        if self.is_dynamic() {
+            return Ok(false);
+        }
+
+        // An nlist entry says nothing about thread-locality; the section type does. So a symbol is
+        // thread-local exactly when it's defined in one of the thread-local sections, which also
+        // means an undefined symbol can't be recognised as one until it's been resolved.
+        let Some(section_index) = self.symbol_section(symbol, index)? else {
+            return Ok(false);
+        };
+
+        Ok(platform::SectionHeader::is_tls(
+            self.section(section_index)?,
+        ))
+    }
+
     fn symbol_versions(&self) -> &[<Self::Platform as platform::Platform>::SymbolVersionIndex] {
         todo!()
     }
@@ -574,13 +598,21 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn is_no_bits(&self) -> bool {
-        // The zerofill section types are the ones that occupy address space without occupying any
-        // space in the file, which is what ELF calls SHT_NOBITS.
-        matches!(
-            self.section_type(LE),
-            macho::S_ZEROFILL | macho::S_GB_ZEROFILL | macho::S_THREAD_LOCAL_ZEROFILL
-        )
+        is_no_bits_section_type(self.section_type(LE))
     }
+}
+
+/// Returns whether a section of this type occupies address space without occupying any space in the
+/// file, which is what ELF calls `SHT_NOBITS`.
+///
+/// Both an input section header and an output section's attributes answer `is_no_bits` from here,
+/// so that a zerofill section can't be read as having file content and then written as not having
+/// any, or the other way around.
+pub(crate) fn is_no_bits_section_type(section_type: macho::SectionType) -> bool {
+    matches!(
+        section_type,
+        macho::S_ZEROFILL | macho::S_GB_ZEROFILL | macho::S_THREAD_LOCAL_ZEROFILL
+    )
 }
 
 #[derive(Debug, Copy, Clone, Default)]
@@ -731,6 +763,11 @@ impl platform::SectionAttributes for SectionAttributes {
     }
 
     fn is_tls(&self) -> bool {
+        // Layout only asks this in order to give ELF's `.tbss` its special treatment: there, a
+        // no-bits TLS section occupies no address space in the image, so layout rewinds over it.
+        // Mach-O's `__thread_bss` is not like that - it's the tail of the template block that dyld
+        // copies per thread, and ld64 gives it an address directly after `__thread_data` - so
+        // answering `false` keeps it laid out as an ordinary zerofill section.
         false
     }
 
@@ -739,7 +776,7 @@ impl platform::SectionAttributes for SectionAttributes {
     }
 
     fn is_no_bits(&self) -> bool {
-        false
+        is_no_bits_section_type(self.flags.typ())
     }
 
     fn flags(&self) -> <Self::Platform as platform::Platform>::SectionFlags {

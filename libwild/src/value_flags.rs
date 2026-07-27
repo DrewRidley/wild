@@ -107,6 +107,11 @@ bitflags! {
 
         /// Whether the symbol has a reference from non-IR code.
         const HAS_NON_IR_REF = 1 << 16;
+
+        /// The symbol names a thread-local variable, so its value is an offset within a
+        /// thread-local block rather than an address in the image. Note that this says what the
+        /// symbol *is*, whereas the `GOT_TLS_*` flags say what a reference to it *needs*.
+        const THREAD_LOCAL = 1 << 17;
     }
 }
 
@@ -236,11 +241,18 @@ impl ValueFlags {
         self.contains(ValueFlags::IFUNC_GOT_FOR_ADDRESS)
     }
 
+    /// Returns whether any reference to this symbol asked for a TLS GOT entry. This is about what
+    /// references need, not about what the symbol is - see `is_thread_local` for the latter.
     #[must_use]
     pub(crate) fn is_tls(self) -> bool {
         self.contains(ValueFlags::GOT_TLS_OFFSET)
             || self.contains(ValueFlags::GOT_TLS_MODULE)
             || self.contains(ValueFlags::GOT_TLS_DESCRIPTOR)
+    }
+
+    #[must_use]
+    pub(crate) fn is_thread_local(self) -> bool {
+        self.contains(ValueFlags::THREAD_LOCAL)
     }
 
     #[must_use]

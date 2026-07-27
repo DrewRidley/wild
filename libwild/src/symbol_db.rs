@@ -1711,6 +1711,13 @@ trait SymbolLoader<'data, P: Platform> {
             let mut flags = self.compute_value_flags(symbol);
             let local_index = symbol_id.offset_from(base_symbol_id);
 
+            if self
+                .object()
+                .is_symbol_thread_local(symbol, object::SymbolIndex(local_index))?
+            {
+                flags |= ValueFlags::THREAD_LOCAL;
+            }
+
             if symbol.is_undefined() || self.should_ignore_symbol(symbol) {
                 symbols_out.set_next(flags, SymbolId::undefined(), file_id);
                 continue;
