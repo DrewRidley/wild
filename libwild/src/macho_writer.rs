@@ -86,6 +86,7 @@ use crate::macho_object::DyldChainedStartsInSegment;
 use crate::malfunction;
 use crate::output_section_id;
 use crate::output_section_id::SectionName;
+use crate::output_section_map::OutputSectionMap;
 use crate::output_section_part_map::OutputSectionPartMap;
 use crate::output_trace::HexU64;
 use crate::output_trace::TraceOutput;
@@ -171,6 +172,8 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     // so each group accumulates its own list and merges it in once.
     let fixup_sites = Mutex::new(Vec::new());
 
+    let section_indices = build_section_index_map(layout)?;
+
     let mut writable_buckets = split_buffers_by_alignment(&mut section_buffers, layout);
     let groups_and_buffers = split_output_by_group(layout, &mut writable_buckets);
     groups_and_buffers
@@ -180,6 +183,7 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
 
             let mut symbol_writer = MachOSymbolTableWriter {
                 next_strtab_offset: group.strtab_start_offset,
+                section_indices: &section_indices,
             };
             let mut group_fixups = Vec::new();
             for file in &group.files {
@@ -242,7 +246,7 @@ fn write_file<'data, A: Arch<Platform = MachO>>(
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &MachOLayout<'data>,
     _trace: &TraceOutput,
-    symbol_writer: &mut MachOSymbolTableWriter,
+    symbol_writer: &mut MachOSymbolTableWriter<'_>,
     fixup_sites: &mut Vec<FixupSite>,
 ) -> Result {
     match file {
@@ -266,7 +270,7 @@ fn write_file<'data, A: Arch<Platform = MachO>>(
 fn write_epilogue(
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &MachOLayout<'_>,
-    symbol_writer: &mut MachOSymbolTableWriter,
+    symbol_writer: &mut MachOSymbolTableWriter<'_>,
 ) -> Result {
     verbose_timing_phase!("Write epilogue");
 
@@ -751,7 +755,7 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
     object: &ObjectLayout<'data, MachO>,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &MachOLayout<'data>,
-    symbol_writer: &mut MachOSymbolTableWriter,
+    symbol_writer: &mut MachOSymbolTableWriter<'_>,
     fixup_sites: &mut Vec<FixupSite>,
 ) -> Result {
     verbose_timing_phase!("Write object", file_id = object.file_id.as_u32());
@@ -2542,11 +2546,14 @@ fn write_code_signature_hashes(layout: &MachOLayout, sized_output: &mut SizedOut
     Ok(())
 }
 
-struct MachOSymbolTableWriter {
+struct MachOSymbolTableWriter<'layout> {
     next_strtab_offset: u32,
+    /// Which Mach-O section index each output section got. Computed once, because every symbol
+    /// needs it and working it out from the output order is a walk of the whole order.
+    section_indices: &'layout OutputSectionMap<u8>,
 }
 
-impl MachOSymbolTableWriter {
+impl MachOSymbolTableWriter<'_> {
     fn write_str(&mut self, name: &[u8], buffers: &mut OutputSectionPartMap<&mut [u8]>) -> u32 {
         let len_with_terminator = name.len() + 1;
         let offset = self.next_strtab_offset;
@@ -2611,7 +2618,7 @@ fn write_symbols<'data>(
     object: &ObjectLayout<'data, MachO>,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &MachOLayout<'data>,
-    symbol_writer: &mut MachOSymbolTableWriter,
+    symbol_writer: &mut MachOSymbolTableWriter<'_>,
 ) -> Result {
     for ((sym_index, sym), flags) in object
         .object
@@ -2645,13 +2652,13 @@ fn write_symbols<'data>(
                 };
                 let primary_id = layout.output_sections.primary_output_section(section_id);
                 let n_type = sym.n_type.with_type(N_SECT);
-                let n_sect = macho_section_index(layout, primary_id).with_context(|| {
-                    format!(
-                        "No Mach-O section index for {} while writing {}",
-                        primary_id,
-                        layout.symbol_debug(symbol_id)
-                    )
-                })?;
+                let n_sect = *symbol_writer.section_indices.get(primary_id);
+                ensure!(
+                    n_sect != 0,
+                    "No Mach-O section index for {} while writing {}",
+                    primary_id,
+                    layout.symbol_debug(symbol_id)
+                );
                 let n_desc = sym.n_desc.get(LE);
                 (n_sect, n_type, n_desc)
             } else if sym.is_absolute() {
@@ -2671,42 +2678,38 @@ fn write_symbols<'data>(
     Ok(())
 }
 
-// TODO: This is inefficient; simplify it once load commands use a table allocator instead of
-// being modeled as a section.
-fn macho_section_index(
-    layout: &MachOLayout<'_>,
-    section_id: output_section_id::OutputSectionId,
-) -> Result<u8> {
-    // The section index is one-based.
-    let mut section_idx = 1u8;
-    let mut in_section_segment = false;
-    for event in &layout.output_order {
-        match event {
-            output_section_id::OrderEvent::SegmentStart(segment_id) => {
-                let segment_type = layout.program_segments.segment_def(segment_id).segment_type;
-                // TODO: Right now, the various load commands are mapped as "sections", so we can't
-                // just take the mapped index of the output "section".
-                in_section_segment = matches!(
-                    segment_type,
-                    SegmentType::TextSections
-                        | SegmentType::DataSections
-                        | SegmentType::DataConstSections
-                );
-            }
-            output_section_id::OrderEvent::SegmentEnd(_) => {
-                in_section_segment = false;
-            }
-            output_section_id::OrderEvent::Section(current) if in_section_segment => {
-                if current == section_id {
-                    return Ok(section_idx);
-                }
-                section_idx = section_idx
-                    .checked_add(1)
-                    .ok_or(error!("Section index out of range (u8)"))?;
-            }
-            _ => {}
+/// Numbers the output sections the way a symbol table entry has to refer to them: by position among
+/// the sections actually emitted, counting from one.
+///
+/// This can't be worked out by walking the output order and counting, because the order contains
+/// sections that don't reach the output - a segment with nothing in it is dropped entirely, and its
+/// sections go with it, but they still sit in the order. Counting them shifted every later
+/// section's number past the end of the section list, and a symbol naming a section that doesn't
+/// exist is malformed: tools stop reading the symbol table at that point, which loses every symbol
+/// after it.
+///
+/// Taking the sections from `get_segment_sections`, in the order `write_segment_commands` emits the
+/// segments, is what makes this agree with the section list by construction.
+fn build_section_index_map(layout: &MachOLayout<'_>) -> Result<OutputSectionMap<u8>> {
+    let mut map = layout.output_sections.new_section_map::<u8>();
+    let mut index: u8 = 1;
+
+    for segment_type in [
+        SegmentType::TextSections,
+        SegmentType::DataSections,
+        SegmentType::DataConstSections,
+    ] {
+        let Some(info) = get_segment_sections(layout, segment_type) else {
+            continue;
+        };
+
+        for section_id in info.section_ids {
+            *map.get_mut(section_id) = index;
+            index = index
+                .checked_add(1)
+                .ok_or_else(|| error!("More than 255 output sections"))?;
         }
     }
 
-    bail!("cannot find the output section")
+    Ok(map)
 }

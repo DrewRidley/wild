@@ -2460,6 +2460,10 @@ pub(crate) struct SegmentSectionsInfo<'data> {
     pub(crate) segment_size: OutputRecordLayout,
     pub(crate) segment_sections:
         Vec<(OutputRecordLayout, Option<SectionName<'data>>, SectionFlags)>,
+    /// The same sections, in the same order, identified rather than measured. A symbol table entry
+    /// names the section it's in by its position among the sections actually emitted, so that
+    /// position has to come from here rather than from a separate walk that might disagree.
+    pub(crate) section_ids: Vec<crate::output_section_id::OutputSectionId>,
 }
 
 pub(crate) fn get_segment_sections<'data>(
@@ -2468,6 +2472,7 @@ pub(crate) fn get_segment_sections<'data>(
 ) -> Option<SegmentSectionsInfo<'data>> {
     let mut in_matching_segment = false;
     let mut sections = Vec::new();
+    let mut section_ids = Vec::new();
     let mut segment_id = None;
 
     for event in &layout.output_order {
@@ -2491,6 +2496,7 @@ pub(crate) fn get_segment_sections<'data>(
                     layout.output_sections.name(section_id),
                     layout.output_sections.section_flags(section_id),
                 ));
+                section_ids.push(section_id);
             }
             _ => {}
         }
@@ -2506,6 +2512,7 @@ pub(crate) fn get_segment_sections<'data>(
 
     segment_size.map(|segment_size| SegmentSectionsInfo {
         segment_sections: sections,
+        section_ids,
         segment_size,
     })
 }
