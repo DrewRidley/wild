@@ -155,10 +155,25 @@ struct SectionAllocation {
 
 impl Output {
     pub(crate) fn new(args: &impl platform::Args, output_kind: OutputKind) -> Output {
-        let file_replacement_mode = args
+        let mut file_replacement_mode = args
             .common()
             .file_replacement_mode
             .unwrap_or_else(|| default_file_replacement_mode(args, output_kind));
+
+        // Updating in place is an optimisation, whereas needing a fresh file is a correctness
+        // requirement of the output format, so the requirement wins even when the mode was asked
+        // for explicitly. Staying silent would hand back a binary the kernel refuses to run.
+        if args.requires_fresh_output_file()
+            && matches!(
+                file_replacement_mode,
+                FileReplacementMode::UpdateInPlace | FileReplacementMode::UpdateInPlaceWithFallback
+            )
+        {
+            args.warning(
+                "ignoring --update-in-place: code-signed output must be written to a new file",
+            );
+            file_replacement_mode = FileReplacementMode::UnlinkAndReplace;
+        }
 
         let creator = if args.common().available_threads.get() > 1 {
             let (sized_output_sender, sized_output_recv) = std::sync::mpsc::channel();
@@ -281,6 +296,12 @@ fn default_file_replacement_mode(
     output_kind: OutputKind,
 ) -> FileReplacementMode {
     if output_kind.is_shared_object() {
+        return FileReplacementMode::UnlinkAndReplace;
+    }
+
+    // Formats whose output is code signed can't be updated in place, since the kernel may hold a
+    // signature for the old content that is keyed to the file we'd be reusing.
+    if args.requires_fresh_output_file() {
         return FileReplacementMode::UnlinkAndReplace;
     }
 

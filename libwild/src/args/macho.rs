@@ -133,6 +133,12 @@ impl platform::Args for MachOArgs {
         false
     }
 
+    fn requires_fresh_output_file(&self) -> bool {
+        // Everything we emit is code signed, so updating an existing output in place would leave
+        // the kernel's cached signature for that vnode stale.
+        true
+    }
+
     fn should_export_dynamic(&self, _lib_name: &[u8]) -> bool {
         todo!()
     }

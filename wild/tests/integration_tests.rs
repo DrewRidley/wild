@@ -223,6 +223,14 @@
 //! having been pre-filled with random data. It then compares the output of the two runs to verify
 //! that they're the same.
 //!
+//! TestRelinkAfterExec:{bool} Whether to check that relinking over a binary that has already been
+//! executed produces a binary that can still be executed. Unlike `TestUpdateInPlace`, which
+//! compares the bytes of two runs, this one actually runs the binary either side of the relink.
+//! That distinction matters on macOS: the bytes wild writes are correct, but if the output reuses
+//! the inode of a binary the kernel has already execed, the kernel's cached code signature for
+//! that vnode no longer describes the file and the next exec dies with SIGKILL. Requires
+//! RunEnabled.
+//!
 //! AssertOutputFileMatches:{filename}:{regex} Verifies that a file in the output directory contains
 //! at least one line matching the specified regex. Such output files are generally written by
 //! specifying a flag in LinkArgs that uses $OUT_DIR.
@@ -1174,6 +1182,7 @@ struct Config {
     requires_rust_musl: bool,
     requires_linker_plugin: bool,
     test_update_in_place: bool,
+    test_relink_after_exec: bool,
     test_config: TestConfig,
     tracked_files: Vec<PathBuf>,
     so_single_linker: Option<Linker>,
@@ -1876,6 +1885,7 @@ impl Config {
             rustc_channel: RustcChannel::Default,
             requires_rust_musl: false,
             test_update_in_place: false,
+            test_relink_after_exec: false,
             test_config: test_config.clone(),
             tracked_files: Default::default(),
             available_linkers: available_linkers.to_owned(),
@@ -2395,6 +2405,9 @@ fn process_directive(
         "TestUpdateInPlace" => {
             config.test_update_in_place = arg.parse()?;
         }
+        "TestRelinkAfterExec" => {
+            config.test_relink_after_exec = arg.parse()?;
+        }
         "DriverMode" => {
             config.driver_mode = Some(DriverMode::from_str(arg).map_err(|_| {
                 error!(
@@ -2655,7 +2668,86 @@ impl Debug for SectionDiff {
 const TEST_BINARY_TIMEOUT: Duration = std::time::Duration::from_secs(10);
 const EXIT_SUCCESS: i32 = 42;
 
+/// Returns something that identifies the file itself rather than the path, so that we can tell
+/// whether a relink wrote over the original file or created a new one in its place.
+fn file_identity(path: &Path) -> Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(std::fs::metadata(path)
+            .with_context(|| format!("Failed to stat {}", path.display()))?
+            .ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(0)
+    }
+}
+
 impl Program<'_> {
+    /// Relinks over a binary that has just been executed, then runs it again.
+    ///
+    /// The caller has already run the binary once, which is the part that matters: it gives the
+    /// kernel a chance to cache state about the file, so that reusing it for the second link can
+    /// be caught. See the `TestRelinkAfterExec` directive.
+    fn relink_and_rerun(&mut self, config: &Config, cross_arch: Option<Architecture>) -> Result {
+        let path = self.link_output.binary.clone();
+        let content_before = std::fs::read(&path)?;
+        let inode_before = file_identity(&path)?;
+
+        self.link_output.messages = self
+            .link_output
+            .command
+            .run(config)
+            .with_context(|| format!("Failed to relink {}", path.display()))?;
+
+        ensure!(
+            self.link_output.binary == path,
+            "Relink wrote to {} rather than back over {}, so nothing was tested",
+            self.link_output.binary.display(),
+            path.display()
+        );
+
+        // Relinking the same inputs has to be deterministic. Checking this here rather than only
+        // running the binary matters because whether a stale byte actually breaks the output
+        // depends on what happened to be in the file underneath it, which varies with the size and
+        // shape of the link.
+        let content_after = std::fs::read(&path)?;
+        if content_before != content_after {
+            let diffs = sections_with_diffs(&content_before, &content_after)?;
+            bail!(
+                "Relinking `{path}` over itself produced different bytes to the first link. \
+                 Diffs:\n{diffs:#?}\nRerun with:\n{cmd}",
+                path = path.display(),
+                cmd = self.link_output.command,
+            );
+        }
+
+        // A code-signed format can't reuse the file: once the kernel has execed a vnode it caches
+        // the signature against it, and rewriting the same inode leaves that cache describing
+        // content that is no longer there. Assert the invariant directly, because the symptom it
+        // prevents only shows up on links big enough for the stale pages to matter.
+        if config.platform == PlatformKind::MachO {
+            ensure!(
+                file_identity(&path)? != inode_before,
+                "Relinking `{}` reused the original file. Code-signed output has to be written to \
+                 a newly created file, otherwise executing the binary, relinking, then executing \
+                 again dies with SIGKILL.",
+                path.display()
+            );
+        }
+
+        self.run(cross_arch).with_context(|| {
+            format!(
+                "Relinking over `{}` after it had been executed produced a binary that no longer \
+                 runs. Rerun with:\n{cmd}",
+                path.display(),
+                cmd = self.link_output.command,
+            )
+        })
+    }
+
     fn run(&self, cross_arch: Option<Architecture>) -> Result {
         if self.link_output.command.config.platform == PlatformKind::Wasm {
             return run_wasm_with_wasmtime(
@@ -6593,7 +6685,7 @@ fn run_with_config(
         );
     }
 
-    for program in programs {
+    for mut program in programs {
         if config.should_run {
             // If RunDynSym is set, execute our binary by loading it dynamically and calling the
             // configured function.
@@ -6614,6 +6706,10 @@ fn run_with_config(
                 program
                     .run(cross_arch)
                     .with_context(|| format!("Failed to run program. {program}"))?;
+
+                if config.test_relink_after_exec && program.link_output.linker_used.is_wild() {
+                    program.relink_and_rerun(config, cross_arch)?;
+                }
             }
         } else if config.run_dyn_sym.is_some() {
             // RunEnabled is false but RunDynSym is set.

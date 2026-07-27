@@ -1416,6 +1416,19 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
         false
     }
 
+    /// Returns whether the output must be written to a freshly created file rather than by
+    /// updating an existing one in place.
+    ///
+    /// Mach-O executables carry a code signature that covers the whole file. Once such a binary
+    /// has been executed, the kernel caches the signature validation state against that vnode, so
+    /// rewriting the same inode leaves the cache describing content that is no longer there and
+    /// the next exec is killed with SIGKILL. The file we write is byte-for-byte correct - only the
+    /// kernel's view of it is stale - so nothing short of giving the new content a new inode
+    /// avoids this. See `default_file_replacement_mode`.
+    fn requires_fresh_output_file(&self) -> bool {
+        false
+    }
+
     fn should_export_all_dynamic_symbols(&self) -> bool;
 
     /// Returns whether all symbols from the specified input should be exported as dynamic symbols.
