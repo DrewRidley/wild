@@ -774,7 +774,12 @@ impl platform::Symbol for SymtabEntry {
     }
 
     fn is_default_strippable(&self, name: &[u8]) -> bool {
-        self.is_local() && name.starts_with(b"ltmp")
+        // A leading `l` marks a label the assembler made for its own use - string constants,
+        // section anchors, jump tables. It carries no meaning outside the object it came from, and
+        // ld64 drops these from the linked image, so keeping them only inflates the symbol table.
+        // Nothing a user writes lands here: C and C++ names reach the assembler with a leading
+        // underscore, so only generated labels start with a letter at all.
+        self.is_local() && name.starts_with(b"l")
     }
 
     fn debug_string(&self) -> String {
