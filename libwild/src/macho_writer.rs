@@ -958,9 +958,9 @@ fn write_sections(
     Ok(())
 }
 
-fn write_object<'data, A: Arch<Platform = MachO>>(
+fn write_object<'data, 'buf, A: Arch<Platform = MachO>>(
     object: &ObjectLayout<'data, MachO>,
-    buffers: &mut OutputSectionPartMap<&mut [u8]>,
+    buffers: &mut OutputSectionPartMap<&'buf mut [u8]>,
     layout: &MachOLayout<'data>,
     symbol_writer: &mut MachOSymbolTableWriter<'_>,
     fixup_sites: &mut Vec<FixupSite>,
@@ -969,17 +969,20 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
 
     let _span = debug_span!("write_file", filename = %object.input).entered();
     let _file_span = layout.args().common().trace_span_for_file(object.file_id);
-    for (i, sec) in object.sections.iter().enumerate() {
-        match sec {
+
+    // Claiming each section's room advances a cursor, so it has to happen in order. Filling what
+    // was claimed doesn't, and it is where the time goes - copying the bytes and applying the
+    // relocations. An object built with one codegen unit is a single input holding most of the
+    // program, so without this the whole of it is one thread's work while the rest wait.
+    let mut claimed = Vec::new();
+
+    for (i, slot) in object.sections.iter().enumerate() {
+        match slot {
             SectionSlot::Loaded(sec) => {
-                write_object_section::<A>(
-                    object,
-                    layout,
-                    *sec,
-                    object::SectionIndex(i),
-                    buffers,
-                    fixup_sites,
-                )?;
+                let section_index = object::SectionIndex(i);
+                let allocation = take_section_buffer(object, layout, *sec, section_index, buffers)?;
+
+                claimed.push((section_index, *sec, allocation));
             }
 
             // `__compact_unwind` is frame data too, but it's consumed rather than copied - it
@@ -992,6 +995,32 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
 
             _ => (),
         }
+    }
+
+    // The fixup sites every section produces are gathered and sorted by address later, so which
+    // order they arrive in doesn't matter.
+    let section_fixups = claimed
+        .into_par_iter()
+        .map(
+            |(section_index, sec, allocation)| -> Result<Vec<FixupSite>> {
+                let mut fixups = Vec::new();
+
+                write_object_section::<A>(
+                    object,
+                    layout,
+                    sec,
+                    section_index,
+                    allocation,
+                    &mut fixups,
+                )?;
+
+                Ok(fixups)
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+
+    for mut fixups in section_fixups {
+        fixup_sites.append(&mut fixups);
     }
 
     write_thunks::<A>(object, buffers, layout)?;
@@ -1021,12 +1050,12 @@ fn rebase_to_atom(
 fn write_object_section<'data, A: Arch<Platform = MachO>>(
     object_layout: &ObjectLayout<'data, MachO>,
     layout: &MachOLayout<'data>,
-    section: Section,
+    _section: Section,
     section_index: object::SectionIndex,
-    buffers: &mut OutputSectionPartMap<&mut [u8]>,
+    allocation: &mut [u8],
     fixup_sites: &mut Vec<FixupSite>,
 ) -> Result {
-    let out = write_section_raw(object_layout, layout, section, section_index, buffers)?;
+    let out = fill_section_buffer(object_layout, section_index, allocation)?;
 
     let section_address = object_layout.section_resolutions[section_index.0]
         .address()
@@ -1211,6 +1240,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     let offset_in_section = u64::from(rel.r_address);
     let place = section_address + offset_in_section;
 
+    #[cfg(feature = "relocation-spans")]
     let _span = tracing::trace_span!(
         "relocation",
         address = place,
@@ -2370,39 +2400,61 @@ fn resolve_compact_unwind_target(
     Ok(Some(output_address + offset_in_atom))
 }
 
-fn write_section_raw<'out, 'data>(
+/// Claims this section's room in the output.
+///
+/// Buffers are handed out by advancing a cursor, so which section gets which bytes depends on the
+/// order this is called in - it has to stay sequential. Filling what it hands back does not, which
+/// is what lets an object's sections be written in parallel.
+fn take_section_buffer<'buf, 'data>(
     object: &ObjectLayout<'data, MachO>,
     layout: &MachOLayout,
     sec: Section,
     section_index: object::SectionIndex,
-    buffers: &'out mut OutputSectionPartMap<&mut [u8]>,
-) -> Result<&'out mut [u8]> {
+    buffers: &mut OutputSectionPartMap<&'buf mut [u8]>,
+) -> Result<&'buf mut [u8]> {
     let part_id = object.section_part_id(section_index, &layout.symbol_db.section_part_ids);
-    if layout
+
+    if !layout
         .output_sections
         .has_data_in_file(part_id.output_section_id())
     {
-        let section_buffer = buffers.get_mut(part_id);
-        let allocation_size = sec.capacity(part_id, &layout.output_sections) as usize;
-        if section_buffer.len() < allocation_size {
-            bail!(
-                "Insufficient space allocated to section `{}`. Tried to take {} bytes, but only {} remain",
-                object.object.section_display_name(section_index),
-                allocation_size,
-                section_buffer.len()
-            );
-        }
-        let out = section_buffer.split_off_mut(..allocation_size).unwrap();
-        let object_section = object.object.section(section_index)?;
-
-        let section_size = object.object.section_size(object_section)?;
-        let (out, padding) = out.split_at_mut(section_size as usize);
-        object.object.copy_section_data(object_section, out)?;
-        padding.fill(0);
-        Ok(out)
-    } else {
-        Ok(&mut [])
+        return Ok(&mut []);
     }
+
+    let section_buffer = buffers.get_mut(part_id);
+    let allocation_size = sec.capacity(part_id, &layout.output_sections) as usize;
+
+    if section_buffer.len() < allocation_size {
+        bail!(
+            "Insufficient space allocated to section `{}`. Tried to take {} bytes, but only {} remain",
+            object.object.section_display_name(section_index),
+            allocation_size,
+            section_buffer.len()
+        );
+    }
+
+    Ok(section_buffer.split_off_mut(..allocation_size).unwrap())
+}
+
+/// Copies a section's bytes into the room claimed for it, returning just the part that came from
+/// the input - what follows is padding and is zeroed.
+fn fill_section_buffer<'out, 'data>(
+    object: &ObjectLayout<'data, MachO>,
+    section_index: object::SectionIndex,
+    allocation: &'out mut [u8],
+) -> Result<&'out mut [u8]> {
+    if allocation.is_empty() {
+        return Ok(allocation);
+    }
+
+    let object_section = object.object.section(section_index)?;
+    let section_size = object.object.section_size(object_section)?;
+    let (out, padding) = allocation.split_at_mut(section_size as usize);
+
+    object.object.copy_section_data(object_section, out)?;
+    padding.fill(0);
+
+    Ok(out)
 }
 
 fn get_resolution<'data>(

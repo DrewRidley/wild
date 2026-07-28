@@ -84,6 +84,11 @@ plugins = ["libloading"]
 # Enable support for emitting a perfetto trace.
 perfetto = ["perfetto-recorder/enable", "tracing/release_max_level_info"]
 
+# Emit a tracing span for every relocation applied. Answers "what happened at this address" when
+# something is written wrong, at the cost of building a span per relocation - which on a link whose
+# work sits in one large object is a measurable fraction of the time spent writing.
+relocation-spans = []
+
 # Enable work-in-progress features
 wip = []
 
