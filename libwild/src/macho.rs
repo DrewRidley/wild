@@ -2664,13 +2664,17 @@ impl platform::Platform for MachO {
         }
         allocate_load_cmd(size_of::<SegmentCommand>());
 
-        if args.dylib {
-            // A dylib is entered through its exports rather than at one address, so it carries no
-            // entry point. What it does carry is the name it will be looked up by.
-            allocate_load_cmd(load_dylib_command_size(own_install_name(args)));
-            allocate_load_cmd(size_of::<object::macho::LinkeditDataCommand<Endianness>>());
-        } else {
+        if args.is_executable() {
             allocate_load_cmd(size_of::<EntryPointCommand>());
+        } else {
+            // A dylib or a bundle is entered through its exports rather than at one address, so it
+            // carries no entry point but does say where those exports are listed. Only a dylib also
+            // records the name it will be looked up by; a bundle is opened by path.
+            if args.dylib {
+                allocate_load_cmd(load_dylib_command_size(own_install_name(args)));
+            }
+
+            allocate_load_cmd(size_of::<object::macho::LinkeditDataCommand<Endianness>>());
         }
         allocate_load_cmd(
             (size_of::<DylinkerCommand>() + DYLINKER_PATH.len())
@@ -3112,6 +3116,22 @@ pub(crate) fn debug_map_info(
     }
 
     crate::macho_debug_map::read_object_debug_info(object)
+}
+
+/// Whether a dependency was asked for only if it happens to be there.
+///
+/// Such a library is recorded with `LC_LOAD_WEAK_DYLIB` and everything imported from it is marked
+/// weak, which together tell dyld to carry on with those symbols resolved to zero rather than
+/// refuse to start. It is how a program supports a system older than the one it was built against.
+pub(crate) fn is_weak_library(
+    file_id: FileId,
+    symbol_db: &crate::symbol_db::SymbolDb<'_, MachO>,
+) -> bool {
+    match symbol_db.file(file_id) {
+        SequencedInput::StubLibrary(stub) => stub.input.file.modifiers.weak,
+        SequencedInput::Object(obj) => obj.parsed.input.file.modifiers.weak,
+        _ => false,
+    }
 }
 
 /// What a dependency says about its versions, for the `LC_LOAD_DYLIB` naming it.

@@ -49,6 +49,9 @@ pub struct MachOArgs {
     pub(crate) all_load: bool,
     /// Whether to leave out the debug map, from `-S`.
     pub(crate) strip_debug: bool,
+    /// Emit a bundle: like a dylib, but loaded by `dlopen` rather than named as a dependency, so
+    /// it records no install name of its own.
+    pub(crate) bundle: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +145,6 @@ const UNSUPPORTED_FLAGS: &[(&str, &str)] = &[
         "no_fixup_chains",
         "we only produce chained fixups, not the older rebase and bind opcodes",
     ),
-    ("bundle", "we only produce executables and dylibs"),
     ("bundle_loader", "we only produce executables and dylibs"),
     (
         "ObjC",
@@ -156,19 +158,9 @@ const UNSUPPORTED_FLAGS: &[(&str, &str)] = &[
     ("map", "we don't write a link map"),
     ("order_file", "we don't order functions by a supplied list"),
     ("sectcreate", "we don't add sections from a file"),
-    ("filelist", "we don't read input filenames from a file"),
     (
         "unexported_symbols_list",
         "we don't yet hide symbols by list; use -exported_symbols_list to say what to keep",
-    ),
-    (
-        "weak_framework",
-        "we don't yet record a framework as weakly referenced, and recording it strongly would \
-         make a missing one fatal at startup",
-    ),
-    (
-        "weak_library",
-        "we don't yet record a library as weakly referenced",
     ),
     (
         "reexport_library",
@@ -213,6 +205,7 @@ impl Default for MachOArgs {
             exported_symbols: Vec::new(),
             all_load: false,
             strip_debug: false,
+            bundle: false,
         }
     }
 }
@@ -221,6 +214,15 @@ impl Default for MachOArgs {
 const DEFAULT_FRAMEWORK_PATHS: &[&str] = &["/Library/Frameworks", "/System/Library/Frameworks"];
 
 impl MachOArgs {
+    /// Whether the output is entered at an address, as opposed to being loaded and called into.
+    ///
+    /// A dylib and a bundle are both the latter: no entry point, no page zero, and a base address
+    /// of zero so they can be placed anywhere. What separates them is that a dylib names itself for
+    /// others to depend on and a bundle does not.
+    pub(crate) fn is_executable(&self) -> bool {
+        !self.dylib && !self.bundle
+    }
+
     /// The output path as bytes, for the places Mach-O records a path in the file itself.
     pub(crate) fn output_path_bytes(&self) -> &[u8] {
         self.common.output.as_os_str().as_encoded_bytes()
@@ -319,7 +321,7 @@ impl platform::Args for MachOArgs {
     }
 
     fn should_output_executable(&self) -> bool {
-        !self.dylib
+        self.is_executable()
     }
 
     fn is_ignored_flag(&self, flag: &str) -> bool {
@@ -505,6 +507,15 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
 
     parser
         .declare()
+        .long("bundle")
+        .help("Produce a bundle, to be loaded with dlopen")
+        .execute(|args, _modifier_stack| {
+            args.bundle = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
         .long("dylib")
         .help("Produce a dynamic library rather than an executable")
         .execute(|args, _modifier_stack| {
@@ -643,6 +654,99 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
             args.compatibility_version = Some(
                 SemanticVersion::try_from(value).context("cannot parse -compatibility_version")?,
             );
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("weak_framework")
+        .help("Link with a framework, but only if it is there at run time")
+        .execute(|args, modifier_stack, value| {
+            let mut modifiers = *modifier_stack.last().unwrap();
+            modifiers.weak = true;
+
+            args.common_mut().inputs.push(Input {
+                spec: InputSpec::Framework(Box::from(value)),
+                search_first: None,
+                modifiers,
+            });
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("weak_library")
+        .help("Link with a library by path, but only if it is there at run time")
+        .execute(|args, modifier_stack, value| {
+            args.common_mut().save_dir.handle_file(value);
+
+            let mut modifiers = *modifier_stack.last().unwrap();
+            modifiers.weak = true;
+
+            args.common_mut().inputs.push(Input {
+                spec: InputSpec::File(Box::from(Path::new(value))),
+                search_first: None,
+                modifiers,
+            });
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .prefix("weak-l")
+        .help("Link with a library, but only if it is there at run time")
+        .execute(|args, modifier_stack, value| {
+            let mut modifiers = *modifier_stack.last().unwrap();
+            modifiers.weak = true;
+
+            args.common_mut().inputs.push(Input {
+                spec: InputSpec::Lib(Box::from(value)),
+                search_first: None,
+                modifiers,
+            });
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("filelist")
+        .help("Read input filenames from a file, one per line")
+        .execute(|args, modifier_stack, value| {
+            // `-filelist path,dir` prefixes every name in the file with the directory, which is
+            // how Xcode names objects that all sit in one build directory.
+            let (path, directory) = match value.split_once(',') {
+                Some((path, directory)) => (path, Some(Path::new(directory))),
+                None => (value, None),
+            };
+
+            args.common_mut().save_dir.handle_file(path);
+
+            let list = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read file list `{path}`"))?;
+
+            for line in list.lines() {
+                let line = line.trim();
+
+                if line.is_empty() {
+                    continue;
+                }
+
+                let file = match directory {
+                    Some(directory) => directory.join(line),
+                    None => PathBuf::from(line),
+                };
+
+                args.common_mut()
+                    .save_dir
+                    .handle_file(&file.to_string_lossy());
+
+                args.common_mut().inputs.push(Input {
+                    spec: InputSpec::File(file.into_boxed_path()),
+                    search_first: None,
+                    modifiers: *modifier_stack.last().unwrap(),
+                });
+            }
+
             Ok(())
         });
 

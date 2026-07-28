@@ -437,14 +437,17 @@ fn write_prelude<'data>(
     let mut load_command_buffer = slice_from_all_bytes_mut(buffers.get_mut(part_id::LOAD_COMMANDS));
     write_segment_commands(layout, &mut load_command_buffer)?;
 
-    if layout.args().dylib {
-        // A dylib has no single address to enter at - callers arrive through its exports - so
-        // instead of an entry point it records the name it will be found by, and where the table
-        // of those exports is.
-        write_id_dylib_command(layout, &mut load_command_buffer)?;
-        write_exports_trie_command(layout, take_mut(&mut load_command_buffer)?);
-    } else {
+    if layout.args().is_executable() {
         write_entry_point_command(layout, take_mut(&mut load_command_buffer)?)?;
+    } else {
+        // Nothing enters a dylib or a bundle at one address - callers arrive through its exports -
+        // so instead of an entry point it records where the table of those exports is. A dylib also
+        // records the name it will be found by; a bundle is opened by path and has none.
+        if layout.args().dylib {
+            write_id_dylib_command(layout, &mut load_command_buffer)?;
+        }
+
+        write_exports_trie_command(layout, take_mut(&mut load_command_buffer)?);
     }
 
     write_uuid_command(take_mut(&mut load_command_buffer)?);
@@ -470,8 +473,9 @@ fn write_prelude<'data>(
         let dylib_command = take_mut(&mut command_buffer)?;
         let path = crate::macho::install_name(file_id, &layout.symbol_db);
         let versions = crate::macho::dylib_versions(file_id, &layout.symbol_db);
+        let is_weak = crate::macho::is_weak_library(file_id, &layout.symbol_db);
 
-        write_dylib_command(dylib_command, command_buffer, path, versions);
+        write_dylib_command(dylib_command, command_buffer, path, versions, is_weak);
     }
 
     for rpath in &layout.args().rpaths {
@@ -606,6 +610,8 @@ fn populate_file_header(
         LE,
         if layout.args().dylib {
             macho::MH_DYLIB
+        } else if layout.args().bundle {
+            macho::MH_BUNDLE
         } else {
             MH_EXECUTE
         },
@@ -621,7 +627,7 @@ fn populate_file_header(
     // are no imports to bind.
     let mut flags = macho::MH_DYLDLINK | macho::MH_TWOLEVEL;
 
-    if !layout.args().dylib {
+    if layout.args().is_executable() {
         flags |= macho::MH_PIE;
     }
 
@@ -698,7 +704,7 @@ fn write_id_dylib_command(layout: &MachOLayout<'_>, buffer: &mut &mut [u8]) -> R
             .map_or(zero, |version| version.get()),
     };
 
-    write_dylib_command(command, path_buffer, name, versions);
+    write_dylib_command(command, path_buffer, name, versions, false);
     // Same shape as a load command, differing only in which question it answers: this names the
     // library itself rather than one it depends on.
     command.cmd.set(LE, object::macho::LC_ID_DYLIB);
@@ -737,10 +743,10 @@ fn write_segment_commands(layout: &MachOLayout, load_commands: &mut &mut [u8]) -
         0,
         0,
         0,
-        if layout.args().dylib {
-            0
-        } else {
+        if layout.args().is_executable() {
             MACHO_START_MEM_ADDRESS
+        } else {
+            0
         },
         0,
         SegmentFlags::default(),
@@ -2529,8 +2535,17 @@ fn write_dylib_command(
     path_buffer: &mut [u8],
     path: &[u8],
     versions: crate::macho::DylibVersions,
+    is_weak: bool,
 ) {
-    command.cmd.set(LE, LC_LOAD_DYLIB);
+    // Same command either way, differing only in whether dyld insists on finding the library.
+    command.cmd.set(
+        LE,
+        if is_weak {
+            object::macho::LC_LOAD_WEAK_DYLIB
+        } else {
+            LC_LOAD_DYLIB
+        },
+    );
     command
         .cmdsize
         .set(LE, load_dylib_command_size(path) as u32);
@@ -2777,6 +2792,9 @@ const CHAINED_PTR_64_HIGH8_SHIFT: u32 = 56;
 
 /// Width of the `name_offset` field of a `dyld_chained_import`.
 const CHAINED_IMPORT_NAME_OFFSET_BITS: u32 = 23;
+/// Where the "this need not be there" bit sits in a `dyld_chained_import`, between the library
+/// ordinal below it and the name offset above.
+const CHAINED_IMPORT_WEAK_BIT: u32 = 8;
 
 /// Set in a `DYLD_CHAINED_PTR_64` slot to say that dyld should bind it to an imported symbol
 /// rather than slide it as a rebase.
@@ -3249,7 +3267,14 @@ fn write_chained_fixup_table(
             "Chained fixup symbol string pool is too large"
         );
 
-        blob.extend_from_slice(&(u32::from(lib_ordinal) | (symbol_offset << 9)).to_le_bytes());
+        // The bit between the ordinal and the name says the symbol need not be there: dyld
+        // resolves a missing weak import to zero instead of failing to load the image.
+        let weak_import = u32::from(crate::macho::is_weak_library(file_id, &layout.symbol_db))
+            << CHAINED_IMPORT_WEAK_BIT;
+
+        blob.extend_from_slice(
+            &(u32::from(lib_ordinal) | weak_import | (symbol_offset << 9)).to_le_bytes(),
+        );
     }
 
     blob.extend_from_slice(&string_pool);

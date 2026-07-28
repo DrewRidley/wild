@@ -562,6 +562,11 @@ pub struct Modifiers {
     /// Whether archive semantics should be applied even for regular objects.
     pub(crate) archive_semantics: bool,
 
+    /// Whether a dependency is only wanted if it happens to be there. Mach-O records such a
+    /// library with `LC_LOAD_WEAK_DYLIB` and marks what it imports weak, so that dyld resolves
+    /// a missing one to zero rather than refusing to start.
+    pub(crate) weak: bool,
+
     /// Whether the file is known to be a temporary file that will be deleted when the linker
     /// exits, e.g. an output file from a linker plugin. This doesn't affect linking, but is
     /// stored in the layout file if written so that linker-diff knows not to error if the file
@@ -576,6 +581,7 @@ impl Default for Modifiers {
             allow_shared: true,
             whole_archive: false,
             archive_semantics: false,
+            weak: false,
             temporary: false,
         }
     }
