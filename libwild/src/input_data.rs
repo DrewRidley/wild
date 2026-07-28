@@ -874,8 +874,21 @@ impl Input {
                 })
             }
             InputSpec::Lib(lib_name) => {
+                // Dynamic first, then static, which is what both platforms' system linkers do. The
+                // dynamic spellings are per-format and only one of them will ever be found: `.so`
+                // on ELF, and on Mach-O either the library itself or the `.tbd` stub that stands
+                // in for it inside an SDK.
+                let mut candidates = Vec::new();
+
                 if self.modifiers.allow_shared {
-                    let filename = format!("lib{lib_name}.so");
+                    candidates.push(format!("lib{lib_name}.so"));
+                    candidates.push(format!("lib{lib_name}.dylib"));
+                    candidates.push(format!("lib{lib_name}.tbd"));
+                }
+
+                candidates.push(format!("lib{lib_name}.a"));
+
+                for filename in candidates {
                     if let Some(path) = search_for_file(
                         args.lib_search_path(),
                         self.search_first.as_ref(),
@@ -887,28 +900,7 @@ impl Input {
                         });
                     }
                 }
-                let filename = format!("lib{lib_name}.a");
-                if let Some(path) = search_for_file(
-                    args.lib_search_path(),
-                    self.search_first.as_ref(),
-                    &filename,
-                ) {
-                    return Ok(InputPath {
-                        absolute: std::path::absolute(&path)?,
-                        original: PathBuf::from(filename),
-                    });
-                }
-                let filename = format!("lib{lib_name}.tbd");
-                if let Some(path) = search_for_file(
-                    args.lib_search_path(),
-                    self.search_first.as_ref(),
-                    &filename,
-                ) {
-                    return Ok(InputPath {
-                        absolute: std::path::absolute(&path)?,
-                        original: PathBuf::from(filename),
-                    });
-                }
+
                 bail!("Couldn't find library `{lib_name}` on library search path");
             }
             // A framework is a directory `Name.framework` holding, among other things, a library
