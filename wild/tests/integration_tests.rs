@@ -3602,6 +3602,11 @@ fn compiler_for_file(
             get_c_compiler(&config.compiler, CLanguage::C, cross_arch)?,
             CompilerKind::C,
         ),
+        // Objective-C is compiled by the C compiler, which recognises it by the extension.
+        "m" => (
+            get_c_compiler(&config.compiler, CLanguage::C, cross_arch)?,
+            CompilerKind::C,
+        ),
         "s" => (
             get_c_compiler(&config.compiler, CLanguage::C, cross_arch)?,
             CompilerKind::C,
@@ -6954,7 +6959,7 @@ fn run_integration_test(
 
 /// Determine the name of the primary source file for a test source directory.
 fn identify_primary_source(test_src_dir: &Path, test_name: &str) -> Result<PathBuf> {
-    let extensions = &["rs", "c", "cc", "s", "wat"];
+    let extensions = &["rs", "c", "cc", "m", "s", "wat"];
 
     for ext in extensions {
         let path = test_src_dir.join(format!("{test_name}.{ext}"));

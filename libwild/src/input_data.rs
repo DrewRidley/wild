@@ -51,6 +51,9 @@ pub(crate) struct FileLoader<'data> {
     pub(crate) has_dynamic: bool,
 
     inputs_arena: &'data Arena<InputFile>,
+
+    /// Where symbol names we construct rather than read are kept, so that they outlive the parse.
+    symbol_names_arena: &'data Arena<String>,
 }
 
 #[derive(Default)]
@@ -188,6 +191,8 @@ struct TemporaryState<'data, P: Platform> {
     files: SegQueue<LoadedFile<'data, P>>,
 
     inputs_arena: &'data Arena<InputFile>,
+
+    symbol_names_arena: &'data Arena<String>,
 }
 
 struct LoadedFile<'data, P: Platform> {
@@ -200,7 +205,11 @@ enum LoadedFileState<'data, P: Platform> {
     Archive(&'data InputFile, Vec<InputRecord<'data, P>>),
     ThinArchive(Vec<&'data InputFile>, Vec<InputRecord<'data, P>>),
     LinkerScript(LoadedLinkerScriptState<'data>),
-    StubLibrary(&'data InputFile, DefinedStubLibrary<'data>),
+    StubLibrary(
+        &'data InputFile,
+        DefinedStubLibrary<'data>,
+        Vec<FileLoadIndex>,
+    ),
     Error(Error),
 }
 
@@ -282,8 +291,12 @@ impl<'data> AuxiliaryFiles<'data> {
 }
 
 impl<'data> FileLoader<'data> {
-    pub(crate) fn new(inputs_arena: &'data Arena<InputFile>) -> Self {
+    pub(crate) fn new(
+        inputs_arena: &'data Arena<InputFile>,
+        symbol_names_arena: &'data Arena<String>,
+    ) -> Self {
         Self {
+            symbol_names_arena,
             loaded_files: Vec::new(),
             inputs_arena,
             has_dynamic: false,
@@ -325,6 +338,7 @@ impl<'data> FileLoader<'data> {
             next_file_load_index: AtomicUsize::new(initial_work.len()),
             files: SegQueue::new(),
             inputs_arena: self.inputs_arena,
+            symbol_names_arena: self.symbol_names_arena,
         };
 
         // Open files, mmap them and identify their type from separate threads.
@@ -447,7 +461,7 @@ impl<'data> FileLoader<'data> {
                     self.extract_file(i, files, loaded, plugin)?;
                 }
             }
-            Some(LoadedFileState::StubLibrary(input_file, defined_stub_library)) => {
+            Some(LoadedFileState::StubLibrary(input_file, defined_stub_library, file_indexes)) => {
                 self.has_dynamic = true;
                 loaded.stub_libraries.push(LoadedStubLibrary {
                     input: InputRef {
@@ -458,6 +472,10 @@ impl<'data> FileLoader<'data> {
                     defined_symbols: defined_stub_library,
                 });
                 self.loaded_files.push(input_file);
+
+                for i in file_indexes {
+                    self.extract_file(i, files, loaded, plugin)?;
+                }
             }
             Some(LoadedFileState::Error(error)) => {
                 // For now, we just report the first error that we come to.
@@ -623,6 +641,19 @@ fn process_fat_macho_object<'data, P: Platform>(
 }
 
 impl<'data, P: Platform> TemporaryState<'data, P> {
+    /// Returns the stub that describes the library with the given install name.
+    ///
+    /// An install name says where the library will be at run time; inside an SDK what sits at that
+    /// path is the `.tbd` standing in for it. `/usr/lib/libobjc.A.dylib` is described by
+    /// `libobjc.A.tbd`, and a framework's versioned binary by a `.tbd` beside it.
+    fn stub_library_path(&self, install_name: &str) -> Option<PathBuf> {
+        let sysroot = self.args.sysroot()?;
+        let relative = install_name.strip_prefix('/')?;
+        let candidate = sysroot.join(relative).with_extension("tbd");
+
+        candidate.exists().then_some(candidate)
+    }
+
     fn process_and_record_open_file_request<'scope>(
         &'scope self,
         request: OpenFileRequest,
@@ -698,11 +729,39 @@ impl<'data, P: Platform> TemporaryState<'data, P> {
                 }))
             }
             FileKind::MachOStubLibrary => {
-                let defined_library = parse_defined_library(str::from_utf8(input_file.data())?)
-                    .with_context(|| format!("Failed to process `{}`", absolute_path.display()))?;
+                let defined_library = parse_defined_library(
+                    str::from_utf8(input_file.data())?,
+                    self.symbol_names_arena,
+                )
+                .with_context(|| format!("Failed to process `{}`", absolute_path.display()))?;
                 tracing::debug!(file = ?input_file.filename, symbols = defined_library.symbols.len(),
                     weak_symbols = defined_library.weak_symbols.len(), "loaded TBD library");
-                Ok(LoadedFileState::StubLibrary(input_file, defined_library))
+
+                // What a library passes on the exports of is as much a part of what it offers as
+                // what it defines itself, so those files are read too.
+                let file_indexes = defined_library
+                    .reexported_libraries
+                    .iter()
+                    .filter_map(|install_name| {
+                        let path = self.stub_library_path(install_name)?;
+
+                        Some(self.load_input(
+                            &Input {
+                                spec: InputSpec::File(path.into_boxed_path()),
+                                search_first: None,
+                                modifiers: input_file.modifiers,
+                            },
+                            scope,
+                            Some(input_file.filename.clone()),
+                        ))
+                    })
+                    .collect::<Result<Vec<FileLoadIndex>>>()?;
+
+                Ok(LoadedFileState::StubLibrary(
+                    input_file,
+                    defined_library,
+                    file_indexes,
+                ))
             }
             FileKind::FatMachOObject => process_fat_macho_object(input_ref, &Arc::new(file), self),
             _ => {

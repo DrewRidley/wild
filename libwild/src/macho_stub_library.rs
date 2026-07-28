@@ -76,6 +76,19 @@ struct Exports<'a> {
     #[serde(default)]
     #[serde(borrow)]
     weak_symbols: Vec<&'a str>,
+    /// Objective-C classes. A class is named once here and stands for the several symbols it
+    /// actually defines, which the linker is expected to form itself.
+    #[serde(default)]
+    #[serde(borrow)]
+    objc_classes: Vec<&'a str>,
+    /// Instance variables, named `Class.ivar`.
+    #[serde(default)]
+    #[serde(borrow)]
+    objc_ivars: Vec<&'a str>,
+    /// Classes that can be thrown and caught across an image boundary.
+    #[serde(default)]
+    #[serde(borrow)]
+    objc_eh_types: Vec<&'a str>,
 }
 // TODO: remove
 #[allow(unused)]
@@ -93,6 +106,11 @@ pub(crate) struct DefinedStubLibrary<'a> {
     pub(crate) symbols: Vec<&'a str>,
     /// Weak symbols defined by the library or by any reexported child library.
     pub(crate) weak_symbols: Vec<&'a str>,
+    /// The install names of libraries this one passes on the exports of. What they define counts
+    /// as defined by this library, so they have to be read too - `Foundation` re-exports
+    /// `CoreFoundation` and `libobjc`, and most of what an Objective-C program refers to is in
+    /// those rather than in `Foundation` itself.
+    pub(crate) reexported_libraries: Vec<&'a str>,
 }
 
 impl DefinedStubLibrary<'_> {
@@ -101,7 +119,10 @@ impl DefinedStubLibrary<'_> {
     }
 }
 
-pub fn parse_defined_library<'data>(input: &'data str) -> Result<DefinedStubLibrary<'data>> {
+pub fn parse_defined_library<'data>(
+    input: &'data str,
+    symbol_names: &'data colosseum::sync::Arena<String>,
+) -> Result<DefinedStubLibrary<'data>> {
     let library_definitions = serde_yaml::Deserializer::from_str(input)
         .map(TextBasedDefinition::deserialize)
         .collect::<Result<Vec<_>, _>>()?;
@@ -130,6 +151,7 @@ pub fn parse_defined_library<'data>(input: &'data str) -> Result<DefinedStubLibr
                 .map(|exp| exp.symbols.len())
                 .sum(),
         ),
+        reexported_libraries: Vec::new(),
         weak_symbols: Vec::with_capacity(
             library_definitions
                 .iter()
@@ -158,6 +180,19 @@ pub fn parse_defined_library<'data>(input: &'data str) -> Result<DefinedStubLibr
         HashSet::new()
     };
 
+    // A library named here that isn't also a document in this file is a separate file to go and
+    // read. The two cases look the same in the format and are told apart by what turns up.
+    let own_install_names: HashSet<_> = library_definitions
+        .iter()
+        .map(|lib| lib.install_name)
+        .collect();
+
+    defined_library.reexported_libraries = exported_libraries
+        .iter()
+        .filter(|name| !own_install_names.contains(*name))
+        .copied()
+        .collect();
+
     for lib in &library_definitions {
         ensure!(
             lib.tbd_version == 4,
@@ -178,6 +213,31 @@ pub fn parse_defined_library<'data>(input: &'data str) -> Result<DefinedStubLibr
                 defined_library
                     .weak_symbols
                     .extend(export.weak_symbols.iter());
+
+                // An Objective-C class is listed by its bare name and stands for several symbols:
+                // the class itself, the metaclass behind it, and - if it can cross an image
+                // boundary in a throw - its exception type. A reference from an object names one of
+                // those in full, so they have to be formed here or nothing referring to a class
+                // from a system library resolves.
+                for class in &export.objc_classes {
+                    for prefix in ["_OBJC_CLASS_$_", "_OBJC_METACLASS_$_"] {
+                        defined_library
+                            .symbols
+                            .push(symbol_names.alloc(format!("{prefix}{class}")));
+                    }
+                }
+
+                for ivar in &export.objc_ivars {
+                    defined_library
+                        .symbols
+                        .push(symbol_names.alloc(format!("_OBJC_IVAR_$_{ivar}")));
+                }
+
+                for class in &export.objc_eh_types {
+                    defined_library
+                        .symbols
+                        .push(symbol_names.alloc(format!("_OBJC_EHTYPE_$_{class}")));
+                }
             }
         }
     }
@@ -191,6 +251,7 @@ mod tests {
 
     #[test]
     fn parse_library_with_reexports() {
+        let symbol_names = colosseum::sync::Arena::new();
         let stub_library = parse_defined_library(
             r"--- !tapi-tbd
 tbd-version:     4
@@ -237,6 +298,7 @@ reexports:
     symbols:         [ _b_exported_arm64 ]
     weak-symbols:    [ _b_weak_exported_arm64 ]
 ",
+            &symbol_names,
         )
         .expect("definition should parse");
 

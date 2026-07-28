@@ -171,6 +171,11 @@ pub struct Linker {
     /// We store our input files here once we've read them.
     inputs_arena: Arena<InputFile>,
 
+    /// Symbol names that we construct rather than read. A `.tbd` names an Objective-C class once
+    /// and leaves the linker to form the several symbols that class actually defines, and those
+    /// names have to outlive the parse that made them.
+    symbol_names_arena: Arena<String>,
+
     linker_plugin_arena: Arena<linker_plugins::LoadedPlugin>,
 
     /// Anything that doesn't need a custom Drop implementation can go in here. In practice, it's
@@ -201,6 +206,7 @@ impl Linker {
 
         Self {
             inputs_arena: Arena::new(),
+            symbol_names_arena: Arena::new(),
             linker_plugin_arena: Arena::new(),
             herd: Default::default(),
             shutdown_scope: Default::default(),
@@ -261,7 +267,8 @@ impl Linker {
         &'data self,
         args: &'data P::Args,
     ) -> error::Result<LinkerOutput<'data>> {
-        let mut file_loader = input_data::FileLoader::new(&self.inputs_arena);
+        let mut file_loader =
+            input_data::FileLoader::new(&self.inputs_arena, &self.symbol_names_arena);
 
         // Note, we propagate errors from `link_with_input_data` after we've checked if any files
         // changed. We want inputs-changed errors to take precedence over all other errors.
@@ -401,6 +408,7 @@ impl Drop for Linker {
     fn drop(&mut self) {
         timing_phase!("Drop inputs");
         self.inputs_arena = Arena::new();
+        self.symbol_names_arena = Arena::new();
         self.herd = Default::default();
     }
 }
