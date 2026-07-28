@@ -202,6 +202,8 @@ struct LoadedFile<'data, P: Platform> {
 
 enum LoadedFileState<'data, P: Platform> {
     Loaded(&'data InputFile, InputRecord<'data, P>),
+    /// A Mach-O object, together with any libraries it named for itself.
+    Object(&'data InputFile, InputRecord<'data, P>, Vec<FileLoadIndex>),
     Archive(&'data InputFile, Vec<InputRecord<'data, P>>),
     ThinArchive(Vec<&'data InputFile>, Vec<InputRecord<'data, P>>),
     LinkerScript(LoadedLinkerScriptState<'data>),
@@ -441,6 +443,14 @@ impl<'data> FileLoader<'data> {
                 loaded.add_record(parse_result, plugin);
                 self.loaded_files.push(input_file);
             }
+            Some(LoadedFileState::Object(input_file, parsed, file_indexes)) => {
+                loaded.add_record(parsed, plugin);
+                self.loaded_files.push(input_file);
+
+                for i in file_indexes {
+                    self.extract_file(i, files, loaded, plugin)?;
+                }
+            }
             Some(LoadedFileState::Archive(input_file, parsed_parts)) => {
                 loaded.add_records(parsed_parts, plugin);
                 self.loaded_files.push(input_file);
@@ -641,6 +651,45 @@ fn process_fat_macho_object<'data, P: Platform>(
 }
 
 impl<'data, P: Platform> TemporaryState<'data, P> {
+    /// Loads the libraries a Mach-O object names for itself, returning where each one landed.
+    ///
+    /// The options are the arguments that would otherwise have been passed, so they are turned back
+    /// into the inputs those arguments would have produced. Anything we don't recognise is left
+    /// alone: an option we can't act on is better ignored than guessed at, and the symbols it would
+    /// have provided will be reported missing by name if they are actually needed.
+    fn macho_autolinked_inputs<'scope>(
+        &'scope self,
+        input_file: &'data InputFile,
+        scope: &Scope<'scope>,
+    ) -> Result<Vec<FileLoadIndex>>
+    where
+        'data: 'scope,
+    {
+        let mut indexes = Vec::new();
+
+        for option in crate::macho::linker_options(input_file.data())? {
+            let spec = match option.as_slice() {
+                [flag] if let Some(name) = flag.strip_prefix("-l") => {
+                    InputSpec::Lib(Box::from(name))
+                }
+                ["-framework", name] => InputSpec::Framework(Box::from(*name)),
+                _ => continue,
+            };
+
+            indexes.push(self.load_input(
+                &Input {
+                    spec,
+                    search_first: None,
+                    modifiers: input_file.modifiers,
+                },
+                scope,
+                Some(input_file.filename.clone()),
+            )?);
+        }
+
+        Ok(indexes)
+    }
+
     /// Returns the stub that describes the library with the given install name.
     ///
     /// An install name says where the library will be at run time; inside an SDK what sits at that
@@ -764,6 +813,15 @@ impl<'data, P: Platform> TemporaryState<'data, P> {
                 ))
             }
             FileKind::FatMachOObject => process_fat_macho_object(input_ref, &Arc::new(file), self),
+            FileKind::MachOObject => {
+                // An object can name the libraries it needs rather than leaving it to whoever
+                // links it. Those are read before the object is parsed, so that what they define is
+                // available to resolve it against.
+                let file_indexes = self.macho_autolinked_inputs(input_file, scope)?;
+                let parsed = self.process_input(input_ref, &Arc::new(file), kind)?;
+
+                Ok(LoadedFileState::Object(input_file, parsed, file_indexes))
+            }
             _ => {
                 let parsed = self.process_input(input_ref, &Arc::new(file), kind)?;
                 Ok(LoadedFileState::Loaded(input_file, parsed))

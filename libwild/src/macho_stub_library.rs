@@ -136,10 +136,9 @@ pub fn parse_defined_library<'data>(
         targets = main_library.targets,
     );
 
-    ensure!(
-        !main_library.current_version.is_empty(),
-        "Missing library version of the main library"
-    );
+    // `current-version` is optional: the format says an absent one means 1.0, which is what a
+    // library that has never revised itself carries anyway. Requiring it turned every library that
+    // left it out into a link failure.
     let mut defined_library = DefinedStubLibrary {
         install_name: main_library.install_name,
         current_version: main_library.current_version,

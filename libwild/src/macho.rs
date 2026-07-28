@@ -3118,6 +3118,51 @@ pub(crate) fn debug_map_info(
     crate::macho_debug_map::read_object_debug_info(object)
 }
 
+/// Reads the libraries an object says it needs, from its `LC_LINKER_OPTION` commands.
+///
+/// A compiler that knows which library provides what it just emitted records the linker flags for
+/// it in the object itself, rather than relying on whoever links to remember. Swift does this for
+/// its whole runtime - a single object carries a couple of dozen of these - and clang does it for
+/// modules. An object's options are the arguments that would have been passed, in the same form:
+/// `-lfoo`, or `-framework` followed by a name.
+pub(crate) fn linker_options(data: &[u8]) -> Result<Vec<Vec<&str>>> {
+    let header = macho::MachHeader64::<Endianness>::parse(data, 0)?;
+    let mut commands = header.load_commands(LE, data, 0)?;
+    let mut options = Vec::new();
+
+    while let Some(command) = commands.next()? {
+        if command.cmd() != object::macho::LC_LINKER_OPTION {
+            continue;
+        }
+
+        let option: &object::macho::LinkerOptionCommand<Endianness> = command.data()?;
+        let count = option.count.get(LE) as usize;
+
+        // The strings sit directly after the command, run together and each terminated, with
+        // whatever padding the command's size demands after the last of them.
+        let strings = command
+            .raw_data()
+            .get(size_of::<object::macho::LinkerOptionCommand<Endianness>>()..)
+            .context("LC_LINKER_OPTION has no room for its strings")?;
+
+        let mut values = Vec::with_capacity(count);
+
+        for value in strings.split(|byte| *byte == 0).take(count) {
+            values.push(std::str::from_utf8(value).context("LC_LINKER_OPTION is not valid UTF-8")?);
+        }
+
+        ensure!(
+            values.len() == count,
+            "LC_LINKER_OPTION says it has {count} strings but only {} are there",
+            values.len()
+        );
+
+        options.push(values);
+    }
+
+    Ok(options)
+}
+
 /// Whether a dependency was asked for only if it happens to be there.
 ///
 /// Such a library is recorded with `LC_LOAD_WEAK_DYLIB` and everything imported from it is marked
