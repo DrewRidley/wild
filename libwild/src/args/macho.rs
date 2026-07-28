@@ -47,6 +47,8 @@ pub struct MachOArgs {
     pub(crate) exported_symbols: Vec<String>,
     /// Whether every archive member is to be loaded, referenced or not.
     pub(crate) all_load: bool,
+    /// Whether to leave out the debug map, from `-S`.
+    pub(crate) strip_debug: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,10 +103,8 @@ const SILENTLY_IGNORED_FLAGS: &[&str] = &[
     // and buys nothing at link time; a later retrofit may find less slack than it wanted, which is
     // that tool's error to report rather than ours to pre-empt.
     "headerpad_max_install_names",
-    // Strip debug symbols, and strip local symbols. We emit no debug map at all, so the first is
-    // already true, and keeping locals only makes the symbol table larger than asked - never
+    // Strip local symbols. Keeping them only makes the symbol table larger than asked - never
     // wrong, and never something the loader reads.
-    "S",
     "x",
     // Marks the image as safe to use from an app extension. ld64 sets a header bit and checks the
     // APIs used against a list; we do neither, and the bit is advisory.
@@ -212,6 +212,7 @@ impl Default for MachOArgs {
             undefined: Vec::new(),
             exported_symbols: Vec::new(),
             all_load: false,
+            strip_debug: false,
         }
     }
 }
@@ -236,7 +237,7 @@ impl platform::Args for MachOArgs {
     }
 
     fn should_strip_debug(&self) -> bool {
-        todo!()
+        self.strip_debug
     }
 
     fn should_strip_all(&self) -> bool {
@@ -585,6 +586,15 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
         .help("Export this symbol")
         .execute(|args, _modifier_stack, value| {
             args.exported_symbols.push(value.to_owned());
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .short("S")
+        .help("Leave the debug map out of the output")
+        .execute(|args, _modifier_stack| {
+            args.strip_debug = true;
             Ok(())
         });
 

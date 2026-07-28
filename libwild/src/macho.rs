@@ -833,10 +833,11 @@ pub(crate) struct DylibVersions {
 enum ObjectKind<'data> {
     Regular(RegularObject<'data>),
     Dylib {
-        /// The name the library calls itself, from its `LC_ID_DYLIB`. This, not the path we happened
-        /// to open it by, is what an image linking against it must record: the path is where the
-        /// library was at link time, while the install name is where it expects to be found at run
-        /// time - commonly `@rpath/...`, which is the whole point of `-rpath`.
+        /// The name the library calls itself, from its `LC_ID_DYLIB`. This, not the path we
+        /// happened to open it by, is what an image linking against it must record: the
+        /// path is where the library was at link time, while the install name is where it
+        /// expects to be found at run time - commonly `@rpath/...`, which is the whole
+        /// point of `-rpath`.
         install_name: Option<&'data [u8]>,
 
         /// What the library says about itself: the version it is, and the oldest version an image
@@ -1025,12 +1026,17 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
     fn section_by_name(
         &self,
-        _name: &str,
+        name: &str,
     ) -> Option<(
         object::SectionIndex,
         &<Self::Platform as platform::Platform>::SectionHeader,
     )> {
-        todo!()
+        // The file's own sections rather than the atoms cut from them: a caller asking by name
+        // wants the thing the object declared, and only whole sections have names of their own.
+        self.file_sections()
+            .iter()
+            .position(|section| section.name() == name.as_bytes())
+            .map(|index| (object::SectionIndex(index), &self.file_sections()[index]))
     }
 
     fn symbol_section(
@@ -2739,6 +2745,51 @@ impl platform::Platform for MachO {
                 strings_size += info.name.len() + 1;
             }
         }
+        // The debug map, which is stabs and so counts as local symbols. It has to be measured the
+        // same way the writer emits it, so both walk the symbols by the same rule.
+        if let Some(debug_info) = debug_map_info(state.object, symbol_db.args)? {
+            num_locals += crate::macho_debug_map::STABS_PER_OBJECT;
+
+            strings_size += EMPTY_NAME_SIZE * 2
+                + debug_info.directory.len()
+                + 1
+                + debug_info.file_name.len()
+                + 1
+                + state.input.debug_map_path().as_os_str().len()
+                + 1;
+
+            for ((sym_index, sym), flags) in state
+                .object
+                .enumerate_symbols()
+                .zip(per_symbol_flags.range(state.symbol_id_range))
+            {
+                let symbol_id = state.symbol_id_range.input_to_id(sym_index);
+                let Some(info) = SymbolCopyInfo::new(
+                    state.object,
+                    sym_index,
+                    sym,
+                    symbol_id,
+                    symbol_db,
+                    flags.get(),
+                    &state.sections,
+                ) else {
+                    continue;
+                };
+
+                match debug_map_stab_kind(state.object, sym, sym_index)? {
+                    Some(DebugMapEntry::Function) => {
+                        num_locals += crate::macho_debug_map::STABS_PER_FUNCTION;
+                        strings_size += info.name.len() + 1 + EMPTY_NAME_SIZE * 3;
+                    }
+                    Some(DebugMapEntry::Variable) => {
+                        num_locals += 1;
+                        strings_size += info.name.len() + 1;
+                    }
+                    None => {}
+                }
+            }
+        }
+
         let entry_size = size_of::<SymtabEntry>() as u64;
         common.allocate(part_id::SYMTAB_LOCAL, num_locals * entry_size);
         common.allocate(part_id::SYMTAB_GLOBAL, num_globals * entry_size);
@@ -2964,6 +3015,57 @@ pub(crate) fn install_name<'data>(
             panic!("Internal error: Expected StubLibrary or Dynamic");
         }
     }
+}
+
+/// One byte for the terminator of a name that is empty.
+pub(crate) const EMPTY_NAME_SIZE: usize = 1;
+
+/// What kind of debug map entry a symbol earns, if any.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DebugMapEntry {
+    /// Code, described by its bounds and its length.
+    Function,
+
+    /// Data, described by name alone.
+    Variable,
+}
+
+/// Returns the debug map entry a symbol earns.
+///
+/// A symbol that isn't the start of its atom is an interior label rather than a thing with a
+/// length, and a symbol outside any section - an absolute, say - describes nothing `dsymutil` can
+/// go and look up. Both are left out, which is what ld64 does with them.
+pub(crate) fn debug_map_stab_kind(
+    object: &File<'_>,
+    symbol: &SymtabEntry,
+    symbol_index: SymbolIndex,
+) -> Result<Option<DebugMapEntry>> {
+    let Some(section_index) = object.symbol_section(symbol, symbol_index)? else {
+        return Ok(None);
+    };
+
+    if !object.atom_is_code(section_index)? {
+        return Ok(Some(DebugMapEntry::Variable));
+    }
+
+    if symbol.n_value.get(LE) != object.section(section_index)?.addr.get(LE) {
+        return Ok(None);
+    }
+
+    Ok(Some(DebugMapEntry::Function))
+}
+
+/// Reads what an object says about the source it was built from, unless we were asked not to carry
+/// a debug map at all.
+pub(crate) fn debug_map_info(
+    object: &File<'_>,
+    args: &MachOArgs,
+) -> Result<Option<crate::macho_debug_map::ObjectDebugInfo>> {
+    if <MachOArgs as platform::Args>::should_strip_debug(args) {
+        return Ok(None);
+    }
+
+    crate::macho_debug_map::read_object_debug_info(object)
 }
 
 /// What a dependency says about its versions, for the `LC_LOAD_DYLIB` naming it.
@@ -3605,6 +3707,13 @@ impl<'data> File<'data> {
     }
 
     /// Returns the real section an atom was cut from.
+    /// Whether the section an atom was cut from holds code.
+    pub(crate) fn atom_is_code(&self, index: object::SectionIndex) -> Result<bool> {
+        Ok(crate::macho_debug_map::is_code_section(
+            self.atom_parent_section(index)?,
+        ))
+    }
+
     pub(crate) fn atom_parent_section(
         &self,
         index: object::SectionIndex,

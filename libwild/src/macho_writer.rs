@@ -78,6 +78,13 @@ use crate::macho::is_no_bits_section_type;
 use crate::macho::load_dylib_command_size;
 use crate::macho::relocations_by_record;
 use crate::macho::rpath_command_size;
+use crate::macho_debug_map::N_BNSYM;
+use crate::macho_debug_map::N_ENSYM;
+use crate::macho_debug_map::N_FUN;
+use crate::macho_debug_map::N_GSYM;
+use crate::macho_debug_map::N_OSO;
+use crate::macho_debug_map::N_SO;
+use crate::macho_debug_map::N_STSYM;
 use crate::macho_object::CS_ADHOC;
 use crate::macho_object::CS_EXECSEG_MAIN_BINARY;
 use crate::macho_object::CS_HASHTYPE_SHA256;
@@ -1653,7 +1660,9 @@ fn read_compact_unwind_section(
     }
 
     for (index, entry) in data
-        .chunks_exact(COMPACT_UNWIND_ENTRY_SIZE as usize)
+        .as_chunks::<{ COMPACT_UNWIND_ENTRY_SIZE as usize }>()
+        .0
+        .iter()
         .enumerate()
     {
         let base = index as u64 * COMPACT_UNWIND_ENTRY_SIZE;
@@ -3366,7 +3375,187 @@ fn write_symbols<'data>(
         symbol_writer.define_symbol(buffers, info.name, section, symbol_type, desc, value)?;
     }
 
+    write_debug_map(object, buffers, layout, symbol_writer)?;
+
     Ok(())
+}
+
+/// Writes the stabs that say where this object's debug info lives.
+///
+/// They go after the object's own symbols, which is where ld64 puts them and what keeps each
+/// object's map in one run. Everything here is a local symbol, so `LC_DYSYMTAB` counts them along
+/// with the rest without being told separately.
+fn write_debug_map<'data>(
+    object: &ObjectLayout<'data, MachO>,
+    buffers: &mut OutputSectionPartMap<&mut [u8]>,
+    layout: &MachOLayout<'data>,
+    symbol_writer: &mut MachOSymbolTableWriter<'_>,
+) -> Result {
+    let Some(debug_info) = crate::macho::debug_map_info(object.object, layout.args())? else {
+        return Ok(());
+    };
+
+    let text_section = *symbol_writer.section_indices.get(output_section_id::TEXT);
+
+    let stab = |writer: &mut MachOSymbolTableWriter<'_>,
+                buffers: &mut OutputSectionPartMap<&mut [u8]>,
+                kind: u8,
+                name: &[u8],
+                section: u8,
+                descriptor: u16,
+                value: u64|
+     -> Result {
+        writer.define_symbol(
+            buffers,
+            name,
+            section,
+            object::macho::SymbolFlags(kind),
+            object::macho::SymbolDesc(descriptor),
+            value,
+        )
+    };
+
+    // Where the compiler was run, and what it was compiling. `dsymutil` joins the two by
+    // concatenation, which is why the directory carries its own trailing separator.
+    stab(symbol_writer, buffers, N_SO, b"", text_section, 0, 0)?;
+    stab(symbol_writer, buffers, N_SO, &debug_info.directory, 0, 0, 0)?;
+    stab(symbol_writer, buffers, N_SO, &debug_info.file_name, 0, 0, 0)?;
+
+    // The object itself, and when it was written. `dsymutil` opens this path to read the DWARF, and
+    // compares the timestamp against the file it finds to know whether it is still the right one.
+    let object_path = object.input.debug_map_path();
+    stab(
+        symbol_writer,
+        buffers,
+        N_OSO,
+        object_path.as_os_str().as_encoded_bytes(),
+        0,
+        1,
+        object.input.modification_time_seconds(),
+    )?;
+
+    for ((sym_index, sym), flags) in object
+        .object
+        .enumerate_symbols()
+        .zip(layout.per_symbol_flags.raw_range(object.symbol_id_range))
+    {
+        let symbol_id = object.symbol_id_range.input_to_id(sym_index);
+        let Some(info) = SymbolCopyInfo::new(
+            object.object,
+            sym_index,
+            sym,
+            symbol_id,
+            &layout.symbol_db,
+            flags.get(),
+            &object.sections,
+        ) else {
+            continue;
+        };
+
+        let Some(kind) = crate::macho::debug_map_stab_kind(object.object, sym, sym_index)? else {
+            continue;
+        };
+
+        let address = layout
+            .local_symbol_resolution(symbol_id)
+            .map_or(0, |resolution| resolution.value_for_symbol_table());
+
+        match kind {
+            crate::macho::DebugMapEntry::Function => {
+                let length =
+                    object
+                        .object
+                        .symbol_section(sym, sym_index)?
+                        .map_or(0, |section_index| {
+                            object
+                                .object
+                                .section(section_index)
+                                .map_or(0, |section| section.size.get(LE))
+                        });
+
+                stab(
+                    symbol_writer,
+                    buffers,
+                    N_BNSYM,
+                    b"",
+                    text_section,
+                    0,
+                    address,
+                )?;
+                stab(
+                    symbol_writer,
+                    buffers,
+                    N_FUN,
+                    info.name,
+                    text_section,
+                    0,
+                    address,
+                )?;
+                // The function's length, in an entry with no name and no section - the pair is read
+                // together, and the second half says how far the first one extends.
+                stab(symbol_writer, buffers, N_FUN, b"", 0, 0, length)?;
+                stab(
+                    symbol_writer,
+                    buffers,
+                    N_ENSYM,
+                    b"",
+                    text_section,
+                    0,
+                    address,
+                )?;
+            }
+
+            crate::macho::DebugMapEntry::Variable => {
+                // A variable with external linkage is found by name from the ordinary symbol table,
+                // so its address is left at zero. One with internal linkage has no such symbol and
+                // carries its address here.
+                if sym.n_type.contains(macho::N_EXT) {
+                    stab(symbol_writer, buffers, N_GSYM, info.name, 0, 0, 0)?;
+                } else {
+                    let section = section_index_of(
+                        object,
+                        sym,
+                        sym_index,
+                        symbol_writer,
+                        &layout.symbol_db.section_part_ids,
+                    )?;
+
+                    stab(
+                        symbol_writer,
+                        buffers,
+                        N_STSYM,
+                        info.name,
+                        section,
+                        0,
+                        address,
+                    )?;
+                }
+            }
+        }
+    }
+
+    stab(symbol_writer, buffers, N_SO, b"", text_section, 0, 0)?;
+
+    Ok(())
+}
+
+/// The Mach-O section number a symbol's definition lands in.
+fn section_index_of(
+    object: &ObjectLayout<'_, MachO>,
+    symbol: &SymtabEntry,
+    symbol_index: SymbolIndex,
+    symbol_writer: &MachOSymbolTableWriter<'_>,
+    section_part_ids: &[crate::part_id::PartId],
+) -> Result<u8> {
+    let Some(section_index) = object.object.symbol_section(symbol, symbol_index)? else {
+        return Ok(0);
+    };
+
+    let section_id = object
+        .section_part_id(section_index, section_part_ids)
+        .output_section_id();
+
+    Ok(*symbol_writer.section_indices.get(section_id))
 }
 
 /// Returns the address of the branch island to use for a branch that can't reach its target, or

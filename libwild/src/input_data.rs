@@ -1112,6 +1112,51 @@ impl<'data> InputRef<'data> {
     fn is_archive_entry(&self) -> bool {
         self.entry.is_some()
     }
+
+    /// When the file was last written, as seconds since the epoch.
+    ///
+    /// A Mach-O debug map records this alongside the object's path so that a later `dsymutil` can
+    /// tell whether the object it finds there is still the one that was linked.
+    pub(crate) fn modification_time_seconds(&self) -> u64 {
+        // A member of an archive gets no timestamp. The archive's own would be the wrong answer -
+        // what a reader checks it against is the member's header inside the archive - and ld64
+        // writes zero here, which is read as "don't check".
+        if self.entry.is_some() {
+            return 0;
+        }
+
+        self.file
+            .data
+            .as_ref()
+            .and_then(|data| {
+                data.modification_time
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+            })
+            .map_or(0, |elapsed| elapsed.as_secs())
+    }
+
+    /// The path to record for this input, which for an archive member names the member inside the
+    /// archive the way `dsymutil` expects to read it back.
+    pub(crate) fn debug_map_path(&self) -> PathBuf {
+        // Absolute, because whoever reads the map later - `dsymutil`, or a debugger - is not
+        // running in the directory the link ran in, and a relative path would send them somewhere
+        // else or nowhere at all.
+        let filename =
+            std::path::absolute(&self.file.filename).unwrap_or_else(|_| self.file.filename.clone());
+
+        match &self.entry {
+            Some(entry) => {
+                let member = String::from_utf8_lossy(entry.identifier.as_slice()).into_owned();
+                let mut path = filename.into_os_string();
+                path.push("(");
+                path.push(member);
+                path.push(")");
+                PathBuf::from(path)
+            }
+            None => filename,
+        }
+    }
 }
 
 impl Display for InputBytes<'_> {

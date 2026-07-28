@@ -85,8 +85,9 @@ pub(crate) struct DefinedStubLibrary<'a> {
     pub(crate) install_name: &'a str,
     /// Current version recorded for the library, if present.
     pub(crate) current_version: &'a str,
-    /// The oldest version of the library an image linked against this one will accept. Absent means
-    /// 1.0, which is what the format says and what a library that never broke compatibility gets.
+    /// The oldest version of the library an image linked against this one will accept. Absent
+    /// means 1.0, which is what the format says and what a library that never broke
+    /// compatibility gets.
     pub(crate) compatibility_version: &'a str,
     /// Global symbols defined by the library or by any reexported child library.
     pub(crate) symbols: Vec<&'a str>,
