@@ -307,6 +307,40 @@ enum FrameKind {
     },
 }
 
+/// Which of a parent section's relocations fall inside one of the atoms cut from it.
+///
+/// Relocations arrive in address order - clang emits them from the end of a section backwards - so
+/// an atom's are a contiguous run and can be found rather than sifted out of the whole list. That
+/// matters because there is one atom per function: sifting means every atom walks every relocation
+/// of the section it came from, which on an object holding a whole crate is a hundred thousand
+/// relocations walked one and a half thousand times over.
+///
+/// `None` means the order isn't there to exploit and the caller should consider all of them, which
+/// is what it did before this existed.
+pub(crate) fn atom_relocation_range(
+    relocations: &[Relocation],
+    span: &std::ops::Range<u64>,
+) -> Option<std::ops::Range<usize>> {
+    let address = |index: usize| u64::from(relocations[index].info(LE).r_address);
+
+    if relocations.len() > 1 && address(0) >= address(relocations.len() - 1) {
+        // Descending, which is what clang emits.
+        let first = relocations.partition_point(|r| u64::from(r.info(LE).r_address) >= span.end);
+        let last = relocations.partition_point(|r| u64::from(r.info(LE).r_address) >= span.start);
+
+        return Some(first..last);
+    }
+
+    if relocations.is_sorted_by_key(|r| u64::from(r.info(LE).r_address)) {
+        let first = relocations.partition_point(|r| u64::from(r.info(LE).r_address) < span.start);
+        let last = relocations.partition_point(|r| u64::from(r.info(LE).r_address) < span.end);
+
+        return Some(first..last);
+    }
+
+    None
+}
+
 /// Returns the section holding the function a `__compact_unwind` entry describes.
 ///
 /// The answer is an atom rather than one of the object's own sections, because atoms are what the
@@ -2054,8 +2088,14 @@ impl platform::Platform for MachO {
         scope: &rayon::Scope<'scope>,
     ) -> crate::error::Result {
         let span = state.object.atom_span_in_parent(section_index)?;
+        let relocations = state.relocations(section_index)?.relocations;
 
-        for rel in state.relocations(section_index)?.relocations {
+        // Only the relocations landing inside this atom describe it. They are still checked below -
+        // this says where to start and stop looking, so that an atom doesn't walk the relocations
+        // of every other atom cut from the same section.
+        let range = atom_relocation_range(relocations, &span).unwrap_or(0..relocations.len());
+
+        for rel in &relocations[range] {
             if !span.contains(&u64::from(rel.info(LE).r_address)) {
                 continue;
             }

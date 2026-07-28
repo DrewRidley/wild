@@ -1069,9 +1069,15 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     // need rebasing onto its start before they can name a byte of it.
     let span = object_layout.object.atom_span_in_parent(section_index)?;
     let relocations = object_layout.relocations(section_index)?.relocations;
-    let mut index = 0;
 
-    while index < relocations.len() {
+    // Only the relocations landing inside this atom apply to it. They are still filtered below -
+    // this just says where to start and stop looking, so that an atom doesn't walk relocations
+    // belonging to every other atom of the same section.
+    let range =
+        crate::macho::atom_relocation_range(relocations, &span).unwrap_or(0..relocations.len());
+    let mut index = range.start;
+
+    while index < range.end {
         let rel = rebase_to_atom(relocations[index].info(LE), &span);
 
         let Some(rel) = rel else {
