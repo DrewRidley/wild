@@ -958,9 +958,9 @@ fn write_sections(
     Ok(())
 }
 
-fn write_object<'data, 'buf, A: Arch<Platform = MachO>>(
+fn write_object<'data, A: Arch<Platform = MachO>>(
     object: &ObjectLayout<'data, MachO>,
-    buffers: &mut OutputSectionPartMap<&'buf mut [u8]>,
+    buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &MachOLayout<'data>,
     symbol_writer: &mut MachOSymbolTableWriter<'_>,
     fixup_sites: &mut Vec<FixupSite>,
