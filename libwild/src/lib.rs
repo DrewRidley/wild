@@ -41,6 +41,7 @@ pub(crate) mod macho;
 pub(crate) mod macho_aarch64;
 pub(crate) mod macho_debug_map;
 pub(crate) mod macho_export_trie;
+pub(crate) mod macho_map;
 pub(crate) mod macho_object;
 pub(crate) mod macho_stub_library;
 pub(crate) mod macho_writer;

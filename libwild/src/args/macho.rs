@@ -52,6 +52,10 @@ pub struct MachOArgs {
     /// Emit a bundle: like a dylib, but loaded by `dlopen` rather than named as a dependency, so
     /// it records no install name of its own.
     pub(crate) bundle: bool,
+    /// How much stack the main thread gets, if not the system default.
+    pub(crate) stack_size: Option<u64>,
+    /// Where to write an account of what ended up where, from `-map`.
+    pub(crate) map_path: Option<Box<Path>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,7 +159,6 @@ const UNSUPPORTED_FLAGS: &[(&str, &str)] = &[
         "undefined",
         "we always treat an unresolved symbol as an error",
     ),
-    ("map", "we don't write a link map"),
     ("order_file", "we don't order functions by a supplied list"),
     ("sectcreate", "we don't add sections from a file"),
     (
@@ -167,7 +170,6 @@ const UNSUPPORTED_FLAGS: &[(&str, &str)] = &[
         "we don't pass on what a dependency exports as though it were ours",
     ),
     ("sub_library", "we don't record sub-library relationships"),
-    ("stack_size", "we don't set a non-default stack size"),
     ("image_base", "we don't set a non-default base address"),
     ("segprot", "we don't override segment protections"),
 ];
@@ -206,6 +208,8 @@ impl Default for MachOArgs {
             all_load: false,
             strip_debug: false,
             bundle: false,
+            stack_size: None,
+            map_path: None,
         }
     }
 }
@@ -654,6 +658,35 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
             args.compatibility_version = Some(
                 SemanticVersion::try_from(value).context("cannot parse -compatibility_version")?,
             );
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("map")
+        .help("Write an account of what ended up where")
+        .execute(|args, _modifier_stack, value| {
+            args.map_path = Some(Path::new(value).into());
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("stack_size")
+        .help("How much stack the main thread gets")
+        .execute(|args, _modifier_stack, value| {
+            let size = crate::args::parse_number(value)
+                .with_context(|| format!("Invalid -stack_size `{value}`"))?;
+
+            // dyld allocates the stack a page at a time, and a size that isn't a whole number of
+            // them is a request it cannot carry out.
+            ensure!(
+                size.is_multiple_of(MACHO_PAGE_ALIGNMENT.value()),
+                "-stack_size {value} is not a multiple of the {} byte page size",
+                MACHO_PAGE_ALIGNMENT.value()
+            );
+
+            args.stack_size = Some(size);
             Ok(())
         });
 

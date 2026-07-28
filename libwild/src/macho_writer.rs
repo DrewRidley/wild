@@ -254,6 +254,11 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
 
     write_chained_fixups(layout, sized_output, fixup_sites)?;
 
+    // Not part of the image: an account of what ended up where, for whoever asked for one.
+    if let Some(path) = &layout.args().map_path {
+        crate::macho_map::write_link_map(layout, path)?;
+    }
+
     write_code_signature_metadata(layout, sized_output)?;
     write_uuid(layout, sized_output)?;
     write_code_signature_hashes(layout, sized_output)?;
@@ -2460,7 +2465,10 @@ fn write_entry_point_command(layout: &MachOLayout, command: &mut EntryPointComma
         .cmdsize
         .set(LE, size_of::<EntryPointCommand>() as u32);
     command.entryoff.set(LE, entryoff);
-    command.stacksize.set(LE, 0);
+    // Zero leaves dyld to use the system default, which is what almost every program wants.
+    command
+        .stacksize
+        .set(LE, layout.args().stack_size.unwrap_or(0));
 
     // Malfunction: shift the entry point by one instruction. Deliberately expressed as a mutation
     // of whatever value was computed above rather than as part of the computation, so that this
