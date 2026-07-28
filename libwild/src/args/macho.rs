@@ -170,7 +170,6 @@ const UNSUPPORTED_FLAGS: &[(&str, &str)] = &[
         "we don't pass on what a dependency exports as though it were ours",
     ),
     ("sub_library", "we don't record sub-library relationships"),
-    ("image_base", "we don't set a non-default base address"),
     ("segprot", "we don't override segment protections"),
 ];
 
@@ -658,6 +657,19 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
             args.compatibility_version = Some(
                 SemanticVersion::try_from(value).context("cannot parse -compatibility_version")?,
             );
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("image_base")
+        .help("The address to lay the image out at, which a position-independent image ignores")
+        .execute(|args, _modifier_stack, _value| {
+            // Every image we produce is position-independent, and one of those is placed wherever
+            // the loader has room - so a preferred address is not something we can honour. ld64
+            // says the same thing and carries on, and honouring it instead would produce an image
+            // that asks for an address the loader has already given to something else.
+            args.warning("Linking with PIE, -image_base will be ignored");
             Ok(())
         });
 
