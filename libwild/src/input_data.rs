@@ -676,11 +676,14 @@ impl<'data, P: Platform> TemporaryState<'data, P> {
                 _ => continue,
             };
 
+            let mut modifiers = input_file.modifiers;
+            modifiers.autolinked = true;
+
             indexes.push(self.load_input(
                 &Input {
                     spec,
                     search_first: None,
-                    modifiers: input_file.modifiers,
+                    modifiers,
                 },
                 scope,
                 Some(input_file.filename.clone()),

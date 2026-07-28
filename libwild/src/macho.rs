@@ -1602,6 +1602,12 @@ impl platform::SegmentType for SegmentType {}
 
 /// Returns the segment that the supplied output section belongs to. `SegmentType::Unused` means
 /// that the section isn't part of the Mach-O output at all.
+/// Whether a section holds Swift metadata, which is kept together in `__TEXT`.
+fn is_swift_metadata_section(section_id: crate::output_section_id::OutputSectionId) -> bool {
+    (output_section_id::SWIFT5_TYPEREF.as_usize()..=output_section_id::SWIFT_MODHASH.as_usize())
+        .contains(&section_id.as_usize())
+}
+
 fn mapped_segment_type(section_id: crate::output_section_id::OutputSectionId) -> SegmentType {
     match section_id {
         output_section_id::FILE_HEADER => SegmentType::Text,
@@ -1612,6 +1618,8 @@ fn mapped_segment_type(section_id: crate::output_section_id::OutputSectionId) ->
         | output_section_id::UNWIND_INFO
         | output_section_id::MACHO_EH_FRAME
         | output_section_id::PLT_GOT => SegmentType::TextSections,
+        // Swift's metadata, which the runtime locates by segment and section name.
+        _ if is_swift_metadata_section(section_id) => SegmentType::TextSections,
         // `__const` holds constants, but constants include pointers, and a pointer has to be
         // rebased before it's read - which means living somewhere dyld can write to. ld64 sorts the
         // input sections: the ones with relocations go to `__DATA_CONST,__const` and the rest stay
@@ -2710,17 +2718,17 @@ impl platform::Platform for MachO {
     }
 
     fn new_stub_library_layout_state_ext<'data>(
-        _stub: &resolution::ResolvedStubLibrary<'data>,
+        stub: &resolution::ResolvedStubLibrary<'data>,
         args: &Self::Args,
     ) -> Self::StubLibraryLayoutStateExt {
-        DynamicLayoutStateExt::new(args)
+        DynamicLayoutStateExt::new(args, stub.input.file.modifiers)
     }
 
     fn new_dynamic_layout_state_ext<'data>(
-        _file: &resolution::ResolvedDynamic<'data, Self>,
+        file: &resolution::ResolvedDynamic<'data, Self>,
         args: &Self::Args,
     ) -> Self::DynamicLayoutStateExt<'data> {
-        DynamicLayoutStateExt::new(args)
+        DynamicLayoutStateExt::new(args, file.common.input.file.modifiers)
     }
 
     fn load_stub_library_symbol<'data>(
@@ -2958,6 +2966,22 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::GCC_EXCEPT_TABLE);
         builder.add_section(output_section_id::UNWIND_INFO);
         builder.add_section(output_section_id::MACHO_EH_FRAME);
+        builder.add_section(output_section_id::SWIFT5_TYPEREF);
+        builder.add_section(output_section_id::SWIFT5_REFLSTR);
+        builder.add_section(output_section_id::SWIFT5_FIELDMD);
+        builder.add_section(output_section_id::SWIFT5_ASSOCTY);
+        builder.add_section(output_section_id::SWIFT5_CAPTURE);
+        builder.add_section(output_section_id::SWIFT5_BUILTIN);
+        builder.add_section(output_section_id::SWIFT5_PROTO);
+        builder.add_section(output_section_id::SWIFT5_PROTOS);
+        builder.add_section(output_section_id::SWIFT5_TYPES);
+        builder.add_section(output_section_id::SWIFT5_ENTRY);
+        builder.add_section(output_section_id::SWIFT5_MPENUM);
+        builder.add_section(output_section_id::SWIFT5_REPLACE);
+        builder.add_section(output_section_id::SWIFT5_REPLAC2);
+        builder.add_section(output_section_id::SWIFT5_ACFUNCS);
+        builder.add_section(output_section_id::SWIFT_CONSTG);
+        builder.add_section(output_section_id::SWIFT_MODHASH);
         builder.add_section(output_section_id::PLT_GOT);
         builder.add_section(output_section_id::DATA);
         builder.add_section(output_section_id::INIT_ARRAY);
@@ -3387,6 +3411,70 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         min_alignment: Alignment { exponent: 3 },
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::SWIFT5_TYPEREF.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_typeref")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_REFLSTR.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_reflstr")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_FIELDMD.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_fieldmd")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_ASSOCTY.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_assocty")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_CAPTURE.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_capture")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_BUILTIN.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_builtin")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_PROTO.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_proto")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_PROTOS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_protos")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_TYPES.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_types")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_ENTRY.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_entry")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_MPENUM.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_mpenum")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_REPLACE.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_replace")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_REPLAC2.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_replac2")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_ACFUNCS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_acfuncs")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT_CONSTG.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__constg_swiftt")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT_MODHASH.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift_modhash")),
+        ..DEFAULT_DEFS
+    };
     defs[output_section_id::COMMON.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"__common")),
         section_flags: macho::S_ZEROFILL.to_flags(),
@@ -3487,6 +3575,49 @@ const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
         b"__gcc_except_tab",
         crate::output_section_id::GCC_EXCEPT_TABLE,
     ),
+    SectionRule::exact_section(
+        b"__swift5_typeref",
+        crate::output_section_id::SWIFT5_TYPEREF,
+    ),
+    SectionRule::exact_section(
+        b"__swift5_reflstr",
+        crate::output_section_id::SWIFT5_REFLSTR,
+    ),
+    SectionRule::exact_section(
+        b"__swift5_fieldmd",
+        crate::output_section_id::SWIFT5_FIELDMD,
+    ),
+    SectionRule::exact_section(
+        b"__swift5_assocty",
+        crate::output_section_id::SWIFT5_ASSOCTY,
+    ),
+    SectionRule::exact_section(
+        b"__swift5_capture",
+        crate::output_section_id::SWIFT5_CAPTURE,
+    ),
+    SectionRule::exact_section(
+        b"__swift5_builtin",
+        crate::output_section_id::SWIFT5_BUILTIN,
+    ),
+    SectionRule::exact_section(b"__swift5_proto", crate::output_section_id::SWIFT5_PROTO),
+    SectionRule::exact_section(b"__swift5_protos", crate::output_section_id::SWIFT5_PROTOS),
+    SectionRule::exact_section(b"__swift5_types", crate::output_section_id::SWIFT5_TYPES),
+    SectionRule::exact_section(b"__swift5_entry", crate::output_section_id::SWIFT5_ENTRY),
+    SectionRule::exact_section(b"__swift5_mpenum", crate::output_section_id::SWIFT5_MPENUM),
+    SectionRule::exact_section(
+        b"__swift5_replace",
+        crate::output_section_id::SWIFT5_REPLACE,
+    ),
+    SectionRule::exact_section(
+        b"__swift5_replac2",
+        crate::output_section_id::SWIFT5_REPLAC2,
+    ),
+    SectionRule::exact_section(
+        b"__swift5_acfuncs",
+        crate::output_section_id::SWIFT5_ACFUNCS,
+    ),
+    SectionRule::exact_section(b"__constg_swiftt", crate::output_section_id::SWIFT_CONSTG),
+    SectionRule::exact_section(b"__swift_modhash", crate::output_section_id::SWIFT_MODHASH),
     SectionRule::exact_section(b"__data", crate::output_section_id::DATA),
     SectionRule::exact_section(b"__thread_vars", crate::output_section_id::THREAD_VARS),
     SectionRule::exact_section(b"__thread_data", crate::output_section_id::TDATA),
@@ -3844,10 +3975,14 @@ impl<'data> File<'data> {
 }
 
 impl DynamicLayoutStateExt {
-    fn new(args: &MachOArgs) -> Self {
+    fn new(args: &MachOArgs, modifiers: crate::args::Modifiers) -> Self {
         Self {
             imported_symbols: Default::default(),
-            loaded: !args.dead_strip_dylibs,
+            // A library the command line named is recorded whether or not anything came from it;
+            // one an object named for itself has to earn its place, because an object lists every
+            // library it might need rather than the ones it does. Recording those unconditionally
+            // means depending on libraries that need not even exist at run time.
+            loaded: !args.dead_strip_dylibs && !modifiers.autolinked,
         }
     }
 }

@@ -163,7 +163,27 @@ pub(crate) const COMMON: OutputSectionId = OutputSectionId::regular(18);
 /// like any other section, because `__unwind_info` entries reach into it by offset.
 pub(crate) const MACHO_EH_FRAME: OutputSectionId = OutputSectionId::regular(19);
 
-pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 20;
+// Swift's metadata. The runtime finds these by segment and section name, so each keeps its own
+// name and they all live in `__TEXT` - a conformance recorded anywhere else is one the runtime
+// cannot see.
+pub(crate) const SWIFT5_TYPEREF: OutputSectionId = OutputSectionId::regular(20);
+pub(crate) const SWIFT5_REFLSTR: OutputSectionId = OutputSectionId::regular(21);
+pub(crate) const SWIFT5_FIELDMD: OutputSectionId = OutputSectionId::regular(22);
+pub(crate) const SWIFT5_ASSOCTY: OutputSectionId = OutputSectionId::regular(23);
+pub(crate) const SWIFT5_CAPTURE: OutputSectionId = OutputSectionId::regular(24);
+pub(crate) const SWIFT5_BUILTIN: OutputSectionId = OutputSectionId::regular(25);
+pub(crate) const SWIFT5_PROTO: OutputSectionId = OutputSectionId::regular(26);
+pub(crate) const SWIFT5_PROTOS: OutputSectionId = OutputSectionId::regular(27);
+pub(crate) const SWIFT5_TYPES: OutputSectionId = OutputSectionId::regular(28);
+pub(crate) const SWIFT5_ENTRY: OutputSectionId = OutputSectionId::regular(29);
+pub(crate) const SWIFT5_MPENUM: OutputSectionId = OutputSectionId::regular(30);
+pub(crate) const SWIFT5_REPLACE: OutputSectionId = OutputSectionId::regular(31);
+pub(crate) const SWIFT5_REPLAC2: OutputSectionId = OutputSectionId::regular(32);
+pub(crate) const SWIFT5_ACFUNCS: OutputSectionId = OutputSectionId::regular(33);
+pub(crate) const SWIFT_CONSTG: OutputSectionId = OutputSectionId::regular(34);
+pub(crate) const SWIFT_MODHASH: OutputSectionId = OutputSectionId::regular(35);
+
+pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 36;
 
 #[derive(Debug)]
 pub(crate) struct OutputSections<'data, P: Platform> {

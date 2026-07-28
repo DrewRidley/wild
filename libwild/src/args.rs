@@ -567,6 +567,12 @@ pub struct Modifiers {
     /// a missing one to zero rather than refusing to start.
     pub(crate) weak: bool,
 
+    /// Whether an object asked for this rather than the command line. A library named on the
+    /// command line is recorded whether or not anything came from it, because saying so was
+    /// deliberate; one an object named for itself is recorded only if it supplied something, since
+    /// an object names every library it might need rather than the ones it does.
+    pub(crate) autolinked: bool,
+
     /// Whether the file is known to be a temporary file that will be deleted when the linker
     /// exits, e.g. an output file from a linker plugin. This doesn't affect linking, but is
     /// stored in the layout file if written so that linker-diff knows not to error if the file
@@ -582,6 +588,7 @@ impl Default for Modifiers {
             whole_archive: false,
             archive_semantics: false,
             weak: false,
+            autolinked: false,
             temporary: false,
         }
     }
