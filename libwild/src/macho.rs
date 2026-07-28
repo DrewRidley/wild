@@ -111,11 +111,12 @@ pub(crate) const COMPACT_UNWIND_PERSONALITY_OFFSET: u64 = 16;
 /// Offset of the language-specific data area field within an entry.
 pub(crate) const COMPACT_UNWIND_LSDA_OFFSET: u64 = 24;
 
-/// What one function costs in `__unwind_info`: eight bytes for its second-level entry, and eight
-/// more for an LSDA index entry in case it has one. Reserving the LSDA entry for every function
-/// rather than counting them means the size is known from the entry count alone, which is what lets
-/// it be reserved before the table is built. The slack is at most eight bytes per function.
-pub(crate) const UNWIND_INFO_BYTES_PER_ENTRY: u64 = 16;
+/// What one function costs in `__unwind_info`, whichever way its page ends up being written.
+///
+/// A regular entry is eight bytes. A compressed one is four, and may bring a four-byte encoding
+/// with it if no other function on the page shares it - so eight covers the worse of the two. The
+/// landing pad index is counted separately, for the functions that actually have one.
+pub(crate) const UNWIND_INFO_BYTES_PER_ENTRY: u64 = 8;
 
 /// `unwind_info_section_header`: version, then a (offset, count) pair for each of the common
 /// encodings, the personalities and the index.
@@ -129,10 +130,20 @@ pub(crate) const UNWIND_INFO_INDEX_ENTRY_SIZE: u64 = 3 * size_of::<u32>() as u64
 /// `unwind_info_regular_second_level_page_header`: the kind, then where its entries start and how
 /// many there are.
 pub(crate) const UNWIND_INFO_PAGE_HEADER_SIZE: u64 = 2 * size_of::<u32>() as u64;
-/// How many functions one second-level page describes. The page is addressed by 16-bit offsets, so
-/// it can't exceed 64 KiB; ld64 uses 4 KiB pages and so do we.
-pub(crate) const UNWIND_INFO_PAGE_CAPACITY: u64 =
-    (4096 - UNWIND_INFO_PAGE_HEADER_SIZE) / UNWIND_INFO_ENTRY_SIZE;
+/// `unwind_info_compressed_second_level_page_header`: the same, and then where the encodings this
+/// page uses start and how many of them there are.
+pub(crate) const UNWIND_INFO_COMPRESSED_PAGE_HEADER_SIZE: u64 =
+    size_of::<u32>() as u64 + 4 * size_of::<u16>() as u64;
+/// How large a second-level page may be. ld64 uses 4 KiB and so do we.
+pub(crate) const UNWIND_INFO_PAGE_SIZE: u64 = 4096;
+/// How many functions one second-level page describes.
+///
+/// A compressed page is what we normally write, and in the worst case - no two functions sharing
+/// an encoding - it costs four bytes for the entry and four more for the encoding it names. That,
+/// plus the header, is what has to fit.
+pub(crate) const UNWIND_INFO_PAGE_CAPACITY: u64 = (UNWIND_INFO_PAGE_SIZE
+    - UNWIND_INFO_COMPRESSED_PAGE_HEADER_SIZE)
+    / (UNWIND_INFO_COMPRESSED_ENTRY_SIZE + size_of::<u32>() as u64);
 /// `unwind_info_regular_second_level_entry`: the function's address and how to unwind it.
 pub(crate) const UNWIND_INFO_ENTRY_SIZE: u64 = 2 * size_of::<u32>() as u64;
 /// `unwind_info_section_header_lsda_index_entry`: the function's address and its LSDA's.
@@ -142,6 +153,21 @@ pub(crate) const UNWIND_SECTION_VERSION: u32 = 1;
 /// A second-level page whose entries each carry their own encoding, as opposed to the compressed
 /// form, where they carry an index into the common encodings array instead.
 pub(crate) const UNWIND_SECOND_LEVEL_REGULAR: u32 = 2;
+/// A second-level page whose entries name their encoding by index and hold the function's address
+/// as an offset from the page's first, so that both fit in one word instead of two.
+pub(crate) const UNWIND_SECOND_LEVEL_COMPRESSED: u32 = 3;
+/// `unwind_info_compressed_second_level_entry`: the encoding index and the function offset, packed.
+pub(crate) const UNWIND_INFO_COMPRESSED_ENTRY_SIZE: u64 = size_of::<u32>() as u64;
+/// How far into the page's range a compressed entry can name, being the low 24 bits of its word.
+pub(crate) const UNWIND_INFO_COMPRESSED_FUNCTION_OFFSET_MASK: u32 = 0x00ff_ffff;
+/// Where the encoding index sits in a compressed entry.
+pub(crate) const UNWIND_INFO_COMPRESSED_ENCODING_SHIFT: u32 = 24;
+/// How many encodings the whole image may share. The index is eight bits and page-local encodings
+/// are numbered after the shared ones, so the shared table stops well short of 256; ld64 stops at
+/// 127 and so do we.
+pub(crate) const UNWIND_INFO_MAX_COMMON_ENCODINGS: usize = 127;
+/// How many encodings one entry can name at all, shared and page-local together.
+pub(crate) const UNWIND_INFO_MAX_ENCODINGS_PER_PAGE: usize = 256;
 /// Selects which of the four ways of describing a function an encoding uses.
 pub(crate) const UNWIND_ARM64_MODE_MASK: u32 = 0x0f00_0000;
 /// The function can't be described compactly, so the encoding names a DWARF frame in `__eh_frame`
@@ -2259,10 +2285,27 @@ impl platform::Platform for MachO {
                 [entry.relocations.start as usize..entry.relocations.end as usize]
                 .to_vec();
 
+            let relocations = object
+                .object
+                .relocations(frame_section_index, &object.relocations)?
+                .relocations;
+
             match entry.kind {
-                // A row of the table, whatever the entry says.
+                // A row of the table, whatever the entry says, plus a row of the landing pad
+                // index if it names one. Counting those here rather than reserving one for every
+                // function is most of what keeps the table the size ld64's is.
                 FrameKind::CompactUnwind => {
+                    let has_landing_pad = relocation_indices.iter().any(|&index| {
+                        u64::from(relocations[index as usize].info(LE).r_address)
+                            % COMPACT_UNWIND_ENTRY_SIZE
+                            == COMPACT_UNWIND_LSDA_OFFSET
+                    });
+
                     common.allocate(part_id::UNWIND_INFO, UNWIND_INFO_BYTES_PER_ENTRY);
+
+                    if has_landing_pad {
+                        common.allocate(part_id::UNWIND_INFO, UNWIND_INFO_LSDA_ENTRY_SIZE);
+                    }
                 }
 
                 // Copied through verbatim, so it costs exactly what it is. The bytes are only
@@ -2272,11 +2315,6 @@ impl platform::Platform for MachO {
                     object.format_specific.eh_frame_size += u64::from(size);
                 }
             }
-
-            let relocations = object
-                .object
-                .relocations(frame_section_index, &object.relocations)?
-                .relocations;
 
             let data = object
                 .object
@@ -2524,6 +2562,9 @@ impl platform::Platform for MachO {
         // The per-function part of `__unwind_info` was reserved as the input sections were read;
         // what's left is the part that depends on how many functions there are in total - the
         // header, and the index of the pages they're split across.
+        // An upper bound rather than the count: the reservation also holds the landing pad index,
+        // so dividing it by what one entry costs can only over-state how many there are, and an
+        // over-stated page count reserves an index row that goes unused.
         let unwind_entry_count =
             *current_sizes.get(part_id::UNWIND_INFO) / UNWIND_INFO_BYTES_PER_ENTRY;
 
@@ -2534,10 +2575,15 @@ impl platform::Platform for MachO {
                 part_id::UNWIND_INFO,
                 UNWIND_INFO_HEADER_SIZE
                     + UNWIND_INFO_MAX_PERSONALITIES * size_of::<u32>() as u64
+                    // The encodings shared across the whole image, which a compressed entry names
+                    // by index rather than carrying.
+                    + UNWIND_INFO_MAX_COMMON_ENCODINGS as u64 * size_of::<u32>() as u64
                     // One index entry per page, plus a sentinel that marks the end of the last
                     // function.
                     + (pages + 1) * UNWIND_INFO_INDEX_ENTRY_SIZE
-                    + pages * UNWIND_INFO_PAGE_HEADER_SIZE,
+                    // The larger of the two page headers, since which one a page gets is decided
+                    // when it is written.
+                    + pages * UNWIND_INFO_COMPRESSED_PAGE_HEADER_SIZE,
             );
         }
 

@@ -59,14 +59,21 @@ use crate::macho::SymtabCommand;
 use crate::macho::UNWIND_ARM64_DWARF_SECTION_OFFSET;
 use crate::macho::UNWIND_ARM64_MODE_DWARF;
 use crate::macho::UNWIND_ARM64_MODE_MASK;
+use crate::macho::UNWIND_INFO_COMPRESSED_ENCODING_SHIFT;
+use crate::macho::UNWIND_INFO_COMPRESSED_ENTRY_SIZE;
+use crate::macho::UNWIND_INFO_COMPRESSED_FUNCTION_OFFSET_MASK;
+use crate::macho::UNWIND_INFO_COMPRESSED_PAGE_HEADER_SIZE;
 use crate::macho::UNWIND_INFO_ENTRY_SIZE;
 use crate::macho::UNWIND_INFO_HEADER_SIZE;
 use crate::macho::UNWIND_INFO_INDEX_ENTRY_SIZE;
 use crate::macho::UNWIND_INFO_LSDA_ENTRY_SIZE;
+use crate::macho::UNWIND_INFO_MAX_COMMON_ENCODINGS;
+use crate::macho::UNWIND_INFO_MAX_ENCODINGS_PER_PAGE;
 use crate::macho::UNWIND_INFO_MAX_PERSONALITIES;
 use crate::macho::UNWIND_INFO_PAGE_CAPACITY;
 use crate::macho::UNWIND_INFO_PAGE_HEADER_SIZE;
 use crate::macho::UNWIND_PERSONALITY_SHIFT;
+use crate::macho::UNWIND_SECOND_LEVEL_COMPRESSED;
 use crate::macho::UNWIND_SECOND_LEVEL_REGULAR;
 use crate::macho::UNWIND_SECTION_VERSION;
 use crate::macho::UuidCommand;
@@ -1422,12 +1429,31 @@ fn write_unwind_info(layout: &MachOLayout<'_>, out: &mut [u8]) -> Result {
         }
     }
 
+    // The encoding an entry actually carries, personality index folded in. Everything downstream
+    // compares and shares these, so they are resolved once.
+    let encodings = entries
+        .iter()
+        .map(|entry| {
+            let personality_index = entry
+                .personality_got_address
+                .and_then(|address| personalities.iter().position(|p| *p == address))
+                // The index is stored one-based, so that zero can mean "no personality".
+                .map_or(0, |index| index as u32 + 1);
+
+            entry.encoding | (personality_index << UNWIND_PERSONALITY_SHIFT)
+        })
+        .collect_vec();
+
+    let common_encodings = common_encodings(&encodings);
+
     let pages = (entries.len() as u64).div_ceil(UNWIND_INFO_PAGE_CAPACITY);
     let lsda_count = entries.iter().filter(|e| e.lsda_address.is_some()).count() as u64;
 
     // Laid out in the order the header's offsets have to name: the personalities, then the index
     // over the pages, then the landing pads, then the pages themselves.
-    let personality_offset = UNWIND_INFO_HEADER_SIZE;
+    let common_encodings_offset = UNWIND_INFO_HEADER_SIZE;
+    let personality_offset =
+        common_encodings_offset + common_encodings.len() as u64 * size_of::<u32>() as u64;
     let index_offset = personality_offset + personalities.len() as u64 * size_of::<u32>() as u64;
     // One index entry per page, plus a sentinel that marks where the last function ends.
     let lsda_offset = index_offset + (pages + 1) * UNWIND_INFO_INDEX_ENTRY_SIZE;
@@ -1435,32 +1461,44 @@ fn write_unwind_info(layout: &MachOLayout<'_>, out: &mut [u8]) -> Result {
 
     let mut writer = UnwindInfoWriter { out, offset: 0 };
 
-    // Header. We emit no common encodings: they only save space for the compressed page format,
-    // and we use the regular one, where every entry carries its own encoding anyway. The offset
-    // still names where they would have begun, which is directly after the header, so that it
-    // stays right if any are ever added.
     writer.u32(UNWIND_SECTION_VERSION)?;
-    writer.u32(UNWIND_INFO_HEADER_SIZE as u32)?;
-    writer.u32(0)?;
+    writer.u32(common_encodings_offset as u32)?;
+    writer.u32(common_encodings.len() as u32)?;
     writer.u32(personality_offset as u32)?;
     writer.u32(personalities.len() as u32)?;
     writer.u32(index_offset as u32)?;
     writer.u32((pages + 1) as u32)?;
 
+    // The encodings worth sharing across the whole image. A compressed entry names one of these by
+    // index rather than carrying it, which is where the format's saving comes from.
+    for encoding in &common_encodings {
+        writer.u32(*encoding)?;
+    }
+
     for personality in &personalities {
         writer.u32(image_relative(*personality, image_base)?)?;
     }
+
+    // How each page will be written has to be settled before the index, which names where each one
+    // begins and so depends on how large the ones before it are.
+    let page_layouts = entries
+        .chunks(UNWIND_INFO_PAGE_CAPACITY as usize)
+        .map(|page| plan_page(page, &encodings, &common_encodings, &entries, image_base))
+        .collect::<Result<Vec<_>>>()?;
 
     // First level: one entry per page, then the sentinel.
     let mut page_offset = first_page_offset;
     let mut lsda_cursor = lsda_offset;
 
-    for page in entries.chunks(UNWIND_INFO_PAGE_CAPACITY as usize) {
+    for (page, layout) in entries
+        .chunks(UNWIND_INFO_PAGE_CAPACITY as usize)
+        .zip(&page_layouts)
+    {
         writer.u32(image_relative(page[0].function_address, image_base)?)?;
         writer.u32(page_offset as u32)?;
         writer.u32(lsda_cursor as u32)?;
 
-        page_offset += UNWIND_INFO_PAGE_HEADER_SIZE + page.len() as u64 * UNWIND_INFO_ENTRY_SIZE;
+        page_offset += layout.size(page.len());
         lsda_cursor += page.iter().filter(|e| e.lsda_address.is_some()).count() as u64
             * UNWIND_INFO_LSDA_ENTRY_SIZE;
     }
@@ -1484,24 +1522,167 @@ fn write_unwind_info(layout: &MachOLayout<'_>, out: &mut [u8]) -> Result {
     }
 
     // Second level: the functions themselves, one page at a time.
-    for page in entries.chunks(UNWIND_INFO_PAGE_CAPACITY as usize) {
-        writer.u32(UNWIND_SECOND_LEVEL_REGULAR)?;
-        writer.u16(UNWIND_INFO_PAGE_HEADER_SIZE as u16)?;
-        writer.u16(page.len() as u16)?;
+    let mut first = 0;
 
-        for entry in page {
-            let personality_index = entry
-                .personality_got_address
-                .and_then(|address| personalities.iter().position(|p| *p == address))
-                // The index is stored one-based, so that zero can mean "no personality".
-                .map_or(0, |index| index as u32 + 1);
+    for (page, layout) in entries
+        .chunks(UNWIND_INFO_PAGE_CAPACITY as usize)
+        .zip(&page_layouts)
+    {
+        let page_encodings = &encodings[first..first + page.len()];
 
-            writer.u32(image_relative(entry.function_address, image_base)?)?;
-            writer.u32(entry.encoding | (personality_index << UNWIND_PERSONALITY_SHIFT))?;
+        match layout {
+            PageLayout::Compressed { local_encodings } => {
+                let entries_offset =
+                    UNWIND_INFO_COMPRESSED_PAGE_HEADER_SIZE + local_encodings.len() as u64 * 4;
+
+                writer.u32(UNWIND_SECOND_LEVEL_COMPRESSED)?;
+                writer.u16(entries_offset as u16)?;
+                writer.u16(page.len() as u16)?;
+                writer.u16(UNWIND_INFO_COMPRESSED_PAGE_HEADER_SIZE as u16)?;
+                writer.u16(local_encodings.len() as u16)?;
+
+                // The encodings this page uses that aren't shared image-wide. They are numbered
+                // after the shared ones, which is how one index reaches either.
+                for encoding in local_encodings {
+                    writer.u32(*encoding)?;
+                }
+
+                let page_base = image_relative(page[0].function_address, image_base)?;
+
+                for (entry, encoding) in page.iter().zip(page_encodings) {
+                    let index = encoding_index(*encoding, &common_encodings, local_encodings)
+                        .context(
+                            "An encoding went missing between planning a page and writing it",
+                        )?;
+
+                    let offset = image_relative(entry.function_address, image_base)? - page_base;
+
+                    writer.u32((index << UNWIND_INFO_COMPRESSED_ENCODING_SHIFT) | offset)?;
+                }
+            }
+
+            PageLayout::Regular => {
+                writer.u32(UNWIND_SECOND_LEVEL_REGULAR)?;
+                writer.u16(UNWIND_INFO_PAGE_HEADER_SIZE as u16)?;
+                writer.u16(page.len() as u16)?;
+
+                for (entry, encoding) in page.iter().zip(page_encodings) {
+                    writer.u32(image_relative(entry.function_address, image_base)?)?;
+                    writer.u32(*encoding)?;
+                }
+            }
         }
+
+        first += page.len();
     }
 
     Ok(())
+}
+
+/// How one second-level page will be written.
+enum PageLayout {
+    /// Entries name their encoding by index and their function by an offset from the page's first,
+    /// so each costs one word instead of two.
+    Compressed {
+        /// The encodings this page uses that aren't shared image-wide, in index order.
+        local_encodings: Vec<u32>,
+    },
+
+    /// Every entry carries its own encoding and its own full offset. Twice the size, but it can say
+    /// things the compressed form can't.
+    Regular,
+}
+
+impl PageLayout {
+    fn size(&self, entry_count: usize) -> u64 {
+        match self {
+            PageLayout::Compressed { local_encodings } => {
+                UNWIND_INFO_COMPRESSED_PAGE_HEADER_SIZE
+                    + local_encodings.len() as u64 * size_of::<u32>() as u64
+                    + entry_count as u64 * UNWIND_INFO_COMPRESSED_ENTRY_SIZE
+            }
+            PageLayout::Regular => {
+                UNWIND_INFO_PAGE_HEADER_SIZE + entry_count as u64 * UNWIND_INFO_ENTRY_SIZE
+            }
+        }
+    }
+}
+
+/// Decides how a page will be written.
+///
+/// Compressed unless it can't be: an entry holds the distance from the page's first function in 24
+/// bits, and names its encoding with 8, so a page covering more than 16 MiB of code or wanting more
+/// encodings than an index can reach has to be written the long way instead. Both forms fit within
+/// what was reserved, so the choice is free.
+fn plan_page(
+    page: &[UnwindEntry],
+    encodings: &[u32],
+    common_encodings: &[u32],
+    all_entries: &[UnwindEntry],
+    image_base: u64,
+) -> Result<PageLayout> {
+    let first = page_start_index(page, all_entries);
+    let page_encodings = &encodings[first..first + page.len()];
+
+    let mut local_encodings = Vec::new();
+
+    for encoding in page_encodings {
+        if !common_encodings.contains(encoding) && !local_encodings.contains(encoding) {
+            local_encodings.push(*encoding);
+        }
+    }
+
+    if common_encodings.len() + local_encodings.len() > UNWIND_INFO_MAX_ENCODINGS_PER_PAGE {
+        return Ok(PageLayout::Regular);
+    }
+
+    let page_base = image_relative(page[0].function_address, image_base)?;
+    let last = page.last().expect("a page always has an entry");
+
+    if image_relative(last.function_address, image_base)? - page_base
+        > UNWIND_INFO_COMPRESSED_FUNCTION_OFFSET_MASK
+    {
+        return Ok(PageLayout::Regular);
+    }
+
+    Ok(PageLayout::Compressed { local_encodings })
+}
+
+/// Where a page's entries start within the whole run, found by pointer rather than tracked.
+fn page_start_index(page: &[UnwindEntry], all_entries: &[UnwindEntry]) -> usize {
+    (page.as_ptr() as usize - all_entries.as_ptr() as usize) / size_of::<UnwindEntry>()
+}
+
+/// The index an entry uses to name its encoding: shared ones first, then the page's own.
+fn encoding_index(encoding: u32, common: &[u32], local: &[u32]) -> Option<u32> {
+    if let Some(index) = common.iter().position(|e| *e == encoding) {
+        return Some(index as u32);
+    }
+
+    local
+        .iter()
+        .position(|e| *e == encoding)
+        .map(|index| (common.len() + index) as u32)
+}
+
+/// Picks the encodings worth sharing across the whole image.
+///
+/// An encoding used by many functions costs four bytes once here instead of four in every page that
+/// mentions it. There is room for a limited number, so the most used win.
+fn common_encodings(encodings: &[u32]) -> Vec<u32> {
+    let mut counts: HashMap<u32, usize> = HashMap::new();
+
+    for encoding in encodings {
+        *counts.entry(*encoding).or_default() += 1;
+    }
+
+    counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .sorted_unstable_by_key(|(encoding, count)| (std::cmp::Reverse(*count), *encoding))
+        .take(UNWIND_INFO_MAX_COMMON_ENCODINGS)
+        .map(|(encoding, _)| encoding)
+        .collect()
 }
 
 /// Returns an address as an offset from the mach header, which is how `__unwind_info` names
