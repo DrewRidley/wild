@@ -13,7 +13,6 @@
 use crate::ensure;
 use crate::error;
 use crate::error::Result;
-use itertools::Itertools;
 use serde::Deserialize;
 use std::collections::HashSet;
 
@@ -467,24 +466,21 @@ pub fn parse_defined_library<'data>(
         ),
     };
 
-    // Main libraries commonly reexport symbols from child libraries. This parser
-    // currently supports only a flat tree: one main library with leaf children.
-    let exported_libraries = if let Some(exported_libraries) = main_library
-        .reexported_libraries
+    // What the whole file passes on, gathered from every document in it rather than from the first.
+    //
+    // An umbrella framework is a tree, not a list: `ApplicationServices` is eight documents deep
+    // enough that `ATSUI` is re-exported by one of the children rather than by the umbrella itself.
+    // Reading only the first document's list makes every deeper library look like it wandered in
+    // uninvited, and the file is refused - which is what stopped a Dioxus desktop build linking.
+    //
+    // A document may also state its re-exports in several entries, one per group of targets, so
+    // the entries for our architecture are taken together rather than being required to be one.
+    let exported_libraries: HashSet<&str> = library_definitions
         .iter()
-        .at_most_one()
-        .map_err(|_| error!("expected just a single exported library"))?
-    {
-        ensure!(
-            exported_libraries.targets.contains(&ARM64_LIB_ARCH),
-            "Exported library only supports {:?}, but we need {ARM64_LIB_ARCH}",
-            exported_libraries.targets
-        );
-        let exported_libraries: HashSet<_> = exported_libraries.libraries.iter().copied().collect();
-        exported_libraries
-    } else {
-        HashSet::new()
-    };
+        .flat_map(|lib| lib.reexported_libraries.iter())
+        .filter(|entry| entry.targets.contains(&ARM64_LIB_ARCH))
+        .flat_map(|entry| entry.libraries.iter().copied())
+        .collect();
 
     // A library named here that isn't also a document in this file is a separate file to go and
     // read. The two cases look the same in the format and are told apart by what turns up.
