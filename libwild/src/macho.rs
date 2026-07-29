@@ -3210,6 +3210,36 @@ pub(crate) fn debug_map_info(
     crate::macho_debug_map::read_object_debug_info(object)
 }
 
+/// Reads the libraries a dylib passes on the exports of, from its `LC_REEXPORT_DYLIB` commands.
+///
+/// dyld looks through such a library when resolving a symbol against the one naming it, so a
+/// program can bind to something an umbrella library never defined. We have to look through it at
+/// link time for the same reason - otherwise the symbol is undefined here and the program that
+/// `ld` links fine doesn't link at all.
+///
+/// This is the same relationship a `.tbd` states with `reexported-libraries`; the difference is
+/// only that a real dylib states it in a load command.
+pub(crate) fn reexported_dylibs(data: &[u8]) -> Result<Vec<&str>> {
+    let header = macho::MachHeader64::<Endianness>::parse(data, 0)?;
+    let mut commands = header.load_commands(LE, data, 0)?;
+    let mut names = Vec::new();
+
+    while let Some(command) = commands.next()? {
+        if command.cmd() != object::macho::LC_REEXPORT_DYLIB {
+            continue;
+        }
+
+        let dylib = command
+            .dylib()?
+            .context("LC_REEXPORT_DYLIB without a library")?;
+        let name = command.string(LE, dylib.dylib.name)?;
+
+        names.push(std::str::from_utf8(name).context("LC_REEXPORT_DYLIB name is not valid UTF-8")?);
+    }
+
+    Ok(names)
+}
+
 /// Reads the libraries an object says it needs, from its `LC_LINKER_OPTION` commands.
 ///
 /// A compiler that knows which library provides what it just emitted records the linker flags for
@@ -3267,6 +3297,22 @@ pub(crate) fn is_weak_library(
     match symbol_db.file(file_id) {
         SequencedInput::StubLibrary(stub) => stub.input.file.modifiers.weak,
         SequencedInput::Object(obj) => obj.parsed.input.file.modifiers.weak,
+        _ => false,
+    }
+}
+
+/// Whether what a dependency exports is passed on as though we exported it ourselves.
+///
+/// Recorded with `LC_REEXPORT_DYLIB`. dyld looks through such a library when resolving a symbol
+/// against us, so nothing has to be copied into our own export trie for it to be found - which is
+/// how an umbrella library offers what its children define without defining any of it.
+pub(crate) fn is_reexported_library(
+    file_id: FileId,
+    symbol_db: &crate::symbol_db::SymbolDb<'_, MachO>,
+) -> bool {
+    match symbol_db.file(file_id) {
+        SequencedInput::StubLibrary(stub) => stub.input.file.modifiers.reexport,
+        SequencedInput::Object(obj) => obj.parsed.input.file.modifiers.reexport,
         _ => false,
     }
 }

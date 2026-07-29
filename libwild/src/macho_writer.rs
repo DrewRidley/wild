@@ -479,8 +479,16 @@ fn write_prelude<'data>(
         let path = crate::macho::install_name(file_id, &layout.symbol_db);
         let versions = crate::macho::dylib_versions(file_id, &layout.symbol_db);
         let is_weak = crate::macho::is_weak_library(file_id, &layout.symbol_db);
+        let is_reexported = crate::macho::is_reexported_library(file_id, &layout.symbol_db);
 
-        write_dylib_command(dylib_command, command_buffer, path, versions, is_weak);
+        write_dylib_command(
+            dylib_command,
+            command_buffer,
+            path,
+            versions,
+            is_weak,
+            is_reexported,
+        );
     }
 
     for rpath in &layout.args().rpaths {
@@ -709,7 +717,7 @@ fn write_id_dylib_command(layout: &MachOLayout<'_>, buffer: &mut &mut [u8]) -> R
             .map_or(zero, |version| version.get()),
     };
 
-    write_dylib_command(command, path_buffer, name, versions, false);
+    write_dylib_command(command, path_buffer, name, versions, false, false);
     // Same shape as a load command, differing only in which question it answers: this names the
     // library itself rather than one it depends on.
     command.cmd.set(LE, object::macho::LC_ID_DYLIB);
@@ -2602,11 +2610,16 @@ fn write_dylib_command(
     path: &[u8],
     versions: crate::macho::DylibVersions,
     is_weak: bool,
+    is_reexported: bool,
 ) {
-    // Same command either way, differing only in whether dyld insists on finding the library.
+    // The same command whichever it is, naming the same library in the same way. Which one it is
+    // says what dyld does besides load it: insist on finding it, or look through it when resolving
+    // a symbol against us.
     command.cmd.set(
         LE,
-        if is_weak {
+        if is_reexported {
+            object::macho::LC_REEXPORT_DYLIB
+        } else if is_weak {
             object::macho::LC_LOAD_WEAK_DYLIB
         } else {
             LC_LOAD_DYLIB

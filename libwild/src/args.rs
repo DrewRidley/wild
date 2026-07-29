@@ -567,6 +567,11 @@ pub struct Modifiers {
     /// a missing one to zero rather than refusing to start.
     pub(crate) weak: bool,
 
+    /// Whether what a dependency exports is passed on as though we exported it ourselves. Mach-O
+    /// records such a library with `LC_REEXPORT_DYLIB`, and dyld looks through it when resolving
+    /// a symbol against us - which is how an umbrella library offers what its children define.
+    pub(crate) reexport: bool,
+
     /// Whether an object asked for this rather than the command line. A library named on the
     /// command line is recorded whether or not anything came from it, because saying so was
     /// deliberate; one an object named for itself is recorded only if it supplied something, since
@@ -588,6 +593,7 @@ impl Default for Modifiers {
             whole_archive: false,
             archive_semantics: false,
             weak: false,
+            reexport: false,
             autolinked: false,
             temporary: false,
         }

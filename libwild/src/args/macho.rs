@@ -160,10 +160,6 @@ const UNSUPPORTED_FLAGS: &[(&str, &str)] = &[
     ),
     ("order_file", "we don't order functions by a supplied list"),
     ("sectcreate", "we don't add sections from a file"),
-    (
-        "reexport_library",
-        "we don't pass on what a dependency exports as though it were ours",
-    ),
     ("sub_library", "we don't record sub-library relationships"),
     ("segprot", "we don't override segment protections"),
 ];
@@ -751,6 +747,25 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
                 search_first: None,
                 modifiers,
             });
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("reexport_library")
+        .help("Link with a library by path and pass on what it exports as though it were ours")
+        .execute(|args, modifier_stack, value| {
+            args.common_mut().save_dir.handle_file(value);
+
+            let mut modifiers = *modifier_stack.last().unwrap();
+            modifiers.reexport = true;
+
+            args.common_mut().inputs.push(Input {
+                spec: InputSpec::File(Box::from(Path::new(value))),
+                search_first: None,
+                modifiers,
+            });
+
             Ok(())
         });
 

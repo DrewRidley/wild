@@ -830,11 +830,51 @@ impl<'data, P: Platform> TemporaryState<'data, P> {
 
                 Ok(LoadedFileState::Object(input_file, parsed, file_indexes))
             }
+            FileKind::MachODylib => {
+                // A dylib can pass on what another one exports, and dyld looks through it when
+                // resolving a symbol against this one - so we have to look through it too, or a
+                // program binding to something an umbrella library never defined has nowhere to
+                // find it. Same relationship a `.tbd` states with `reexported-libraries`; a real
+                // dylib states it in a load command instead.
+                let file_indexes = crate::macho::reexported_dylibs(input_file.data())?
+                    .iter()
+                    .filter_map(|install_name| {
+                        let path = self.reexported_dylib_path(install_name)?;
+
+                        Some(self.load_input(
+                            &Input {
+                                spec: InputSpec::File(path.into_boxed_path()),
+                                search_first: None,
+                                modifiers: input_file.modifiers,
+                            },
+                            scope,
+                            Some(input_file.filename.clone()),
+                        ))
+                    })
+                    .collect::<Result<Vec<FileLoadIndex>>>()?;
+
+                let parsed = self.process_input(input_ref, &Arc::new(file), kind)?;
+
+                Ok(LoadedFileState::Object(input_file, parsed, file_indexes))
+            }
             _ => {
                 let parsed = self.process_input(input_ref, &Arc::new(file), kind)?;
                 Ok(LoadedFileState::Loaded(input_file, parsed))
             }
         }
+    }
+
+    /// Where to find a library a dylib says it passes on the exports of.
+    ///
+    /// The name is what the library calls itself, which is a path but not necessarily one that
+    /// exists here: an SDK holds a stub beside the others rather than the library the name points
+    /// at. So the stub is looked for first and the name used as written only if there isn't one.
+    fn reexported_dylib_path(&self, install_name: &str) -> Option<PathBuf> {
+        self.stub_library_path(install_name).or_else(|| {
+            Path::new(install_name)
+                .exists()
+                .then(|| install_name.into())
+        })
     }
 
     /// Sends a request to load `input` unless it has already been requested. In either case, return
