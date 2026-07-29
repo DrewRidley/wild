@@ -47,6 +47,7 @@ pub struct MachOArgs {
     pub(crate) exported_symbols: Vec<String>,
     /// Whether every archive member is to be loaded, referenced or not.
     pub(crate) all_load: bool,
+    pub(crate) objc_load: bool,
     /// Whether to leave out the debug map, from `-S`.
     pub(crate) strip_debug: bool,
     /// Emit a bundle: like a dylib, but loaded by `dlopen` rather than named as a dependency, so
@@ -151,11 +152,6 @@ const UNSUPPORTED_FLAGS: &[(&str, &str)] = &[
     ),
     ("bundle_loader", "we only produce executables and dylibs"),
     (
-        "ObjC",
-        "we don't yet load archive members for the Objective-C metadata they define, and \
-         quietly leaving them out would break categories at run time rather than at link time",
-    ),
-    (
         "undefined",
         "we always treat an unresolved symbol as an error",
     ),
@@ -205,6 +201,7 @@ impl Default for MachOArgs {
             undefined: Vec::new(),
             exported_symbols: Vec::new(),
             all_load: false,
+            objc_load: false,
             strip_debug: false,
             bundle: false,
             stack_size: None,
@@ -233,6 +230,9 @@ impl MachOArgs {
 }
 
 impl platform::Args for MachOArgs {
+    fn loads_objc_archive_members(&self) -> bool {
+        self.objc_load
+    }
     fn parse<S, I>(&mut self, input: I) -> Result
     where
         S: AsRef<str>,
@@ -609,6 +609,15 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
         .help("Leave the debug map out of the output")
         .execute(|args, _modifier_stack| {
             args.strip_debug = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("ObjC")
+        .help("Load archive members that define an Objective-C class or category")
+        .execute(|args, _modifier_stack| {
+            args.objc_load = true;
             Ok(())
         });
 

@@ -193,10 +193,19 @@ impl<'data, P: Platform> ParsedInputObject<'data, P> {
         let object = P::File::parse(input, args)
             .with_context(|| format!("Failed to parse object file `{input}`"))?;
 
+        // `-ObjC` takes an archive member for what it defines rather than for what refers to it.
+        // A category adds methods to a class it doesn't itself define, so nothing in the program
+        // names the member carrying it and the usual archive rule leaves it out - to be discovered
+        // as a missing selector at run time rather than as a missing symbol at link time.
+        let mut modifiers = input.modifiers;
+        if args.loads_objc_archive_members() && object.defines_objc_metadata() {
+            modifiers.whole_archive = true;
+        }
+
         Ok(Box::new(Self {
             input: input.input,
             object,
-            modifiers: input.modifiers,
+            modifiers,
         }))
     }
 

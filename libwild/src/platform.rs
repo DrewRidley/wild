@@ -1001,6 +1001,11 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
         &<Self::Platform as Platform>::SectionHeader,
     )>;
 
+    /// Whether the object defines an Objective-C class or category.
+    fn defines_objc_metadata(&self) -> bool {
+        false
+    }
+
     fn symbol_section(
         &self,
         symbol: &<Self::Platform as Platform>::SymtabEntry,
@@ -1406,6 +1411,12 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
     /// the list only ever adds. Mach-O has no version scripts: `-exported_symbols_list` is the way
     /// to narrow a dylib, and a dylib that ignored it would offer everything it defines.
     fn export_list_restricts_exports(&self) -> bool {
+        false
+    }
+
+    /// Whether an archive member that defines Objective-C metadata is to be loaded whether or not
+    /// anything refers to it.
+    fn loads_objc_archive_members(&self) -> bool {
         false
     }
 

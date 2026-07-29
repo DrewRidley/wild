@@ -1099,6 +1099,17 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
             .map(|index| (object::SectionIndex(index), &self.file_sections()[index]))
     }
 
+    /// A class is listed in `__objc_classlist` and a category in `__objc_catlist`, and those lists
+    /// are what the runtime walks when the image loads.
+    fn defines_objc_metadata(&self) -> bool {
+        self.file_sections().iter().any(|section| {
+            matches!(
+                section.name(),
+                b"__objc_classlist" | b"__objc_catlist" | b"__objc_nlclslist" | b"__objc_nlcatlist"
+            )
+        })
+    }
+
     fn symbol_section(
         &self,
         symbol: &<Self::Platform as platform::Platform>::SymtabEntry,
