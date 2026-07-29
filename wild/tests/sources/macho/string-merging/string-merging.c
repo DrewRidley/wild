@@ -18,19 +18,37 @@ extern const char *a_shared1, *a_shared2, *a_unique;
 extern const char *b_shared1, *b_shared2, *b_unique;
 
 int main(void) {
-  if (strcmp(a_shared1, "a string in both objects")) { return 1; }
-  if (strcmp(b_shared1, "a string in both objects")) { return 2; }
-  if (strcmp(a_shared2, "another shared string")) { return 3; }
-  if (strcmp(b_shared2, "another shared string")) { return 4; }
-  if (strcmp(a_unique, "only in a")) { return 5; }
-  if (strcmp(b_unique, "only in b")) { return 6; }
+  if (strcmp(a_shared1, "a string in both objects")) {
+    return 1;
+  }
+  if (strcmp(b_shared1, "a string in both objects")) {
+    return 2;
+  }
+  if (strcmp(a_shared2, "another shared string")) {
+    return 3;
+  }
+  if (strcmp(b_shared2, "another shared string")) {
+    return 4;
+  }
+  if (strcmp(a_unique, "only in a")) {
+    return 5;
+  }
+  if (strcmp(b_unique, "only in b")) {
+    return 6;
+  }
 
   // Folded, so the two objects' references have to name one copy.
-  if (a_shared1 != b_shared1) { return 7; }
-  if (a_shared2 != b_shared2) { return 8; }
+  if (a_shared1 != b_shared1) {
+    return 7;
+  }
+  if (a_shared2 != b_shared2) {
+    return 8;
+  }
 
   // And distinct strings must not have been folded together.
-  if (a_unique == b_unique) { return 9; }
+  if (a_unique == b_unique) {
+    return 9;
+  }
 
   return 42;
 }

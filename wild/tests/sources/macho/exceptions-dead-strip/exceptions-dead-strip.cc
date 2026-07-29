@@ -21,30 +21,33 @@
 #include <string>
 
 __attribute__((noinline)) int deep(int n) {
-    if (n > 2) throw std::runtime_error("boom " + std::to_string(n));
-    return n;
+  if (n > 2) throw std::runtime_error("boom " + std::to_string(n));
+  return n;
 }
 
 __attribute__((noinline)) int mid(int n) { return deep(n) + 1; }
 
-int never_called(int n) { throw std::logic_error("never"); return n; }
+int never_called(int n) {
+  throw std::logic_error("never");
+  return n;
+}
 
-int main(int argc, char **) {
-    int caught = 0;
+int main(int argc, char**) {
+  int caught = 0;
 
-    try {
-        mid(argc + 4);
-    } catch (const std::exception &e) {
-        printf("caught: %s\n", e.what());
-        caught = 1;
-    }
+  try {
+    mid(argc + 4);
+  } catch (const std::exception& e) {
+    printf("caught: %s\n", e.what());
+    caught = 1;
+  }
 
-    try {
-        throw 7;
-    } catch (int v) {
-        printf("caught int %d\n", v);
-        caught += v;
-    }
+  try {
+    throw 7;
+  } catch (int v) {
+    printf("caught int %d\n", v);
+    caught += v;
+  }
 
-    return caught == 8 ? 42 : 1;
+  return caught == 8 ? 42 : 1;
 }

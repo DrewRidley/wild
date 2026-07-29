@@ -14,8 +14,12 @@ extern int anchor[4];
 
 int main(void) {
   // `_target_b` is one four-byte instruction past `_target_a`.
-  if (distance != 4) { return 1; }
+  if (distance != 4) {
+    return 1;
+  }
   // `displaced` was formed as `anchor + 8`, expressed as an addend on the anchor symbol.
-  if (displaced != (long)(anchor + 2)) { return 2; }
+  if (displaced != (long)(anchor + 2)) {
+    return 2;
+  }
   return 42;
 }

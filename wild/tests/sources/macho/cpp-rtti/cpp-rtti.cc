@@ -15,8 +15,8 @@
 // bind's own addend field.
 
 #include <iostream>
-#include <typeinfo>
 #include <string>
+#include <typeinfo>
 
 struct Base {
   virtual ~Base() = default;
@@ -29,7 +29,7 @@ struct Derived : Base {
 
 int main() {
   Derived d;
-  Base *b = &d;
+  Base* b = &d;
 
   // Forces the typeinfo comparison path that reads the tagged name pointer.
   if (typeid(*b) != typeid(Derived)) {
@@ -40,7 +40,7 @@ int main() {
     return 2;
   }
 
-  Base *plain = new Base();
+  Base* plain = new Base();
   int total = b->value() + plain->value();
   delete plain;
 

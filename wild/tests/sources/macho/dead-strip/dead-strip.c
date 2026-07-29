@@ -20,6 +20,4 @@
 
 int actually_called(int n);
 
-int main(void) {
-  return actually_called(21);
-}
+int main(void) { return actually_called(21); }

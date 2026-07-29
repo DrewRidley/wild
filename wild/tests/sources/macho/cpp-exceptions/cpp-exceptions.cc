@@ -34,7 +34,7 @@ int main() {
   try {
     deep(4);
     return 1;
-  } catch (const std::exception &e) {
+  } catch (const std::exception& e) {
     // Every frame between the throw and here must have been unwound, running each destructor.
     if (Tracked::live != 0) {
       std::cout << "leaked " << Tracked::live << " frames\n";
@@ -52,7 +52,7 @@ int main() {
     } catch (...) {
       throw;
     }
-  } catch (const std::logic_error &) {
+  } catch (const std::logic_error&) {
     return 42;
   }
 

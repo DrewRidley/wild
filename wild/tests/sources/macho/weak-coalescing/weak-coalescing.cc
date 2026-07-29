@@ -33,15 +33,20 @@ extern Fn address_from_a();
 extern Fn address_from_b();
 
 int main() {
-  if (from_a() != 30) { return 1; }
-  if (from_b() != 70) { return 2; }
+  if (from_a() != 30) {
+    return 1;
+  }
+  if (from_b() != 70) {
+    return 2;
+  }
 
   if (address_from_a() != address_from_b()) {
-    std::printf("not coalesced: %p vs %p\n", (void *)address_from_a(),
-                (void *)address_from_b());
+    std::printf("not coalesced: %p vs %p\n", (void*)address_from_a(), (void*)address_from_b());
     return 3;
   }
 
-  if (shared_template(1, 2) != 3) { return 4; }
+  if (shared_template(1, 2) != 3) {
+    return 4;
+  }
   return 42;
 }

@@ -22,8 +22,8 @@ int lib_uses_hidden(int n);
 extern int lib_value;
 
 int main(void) {
-    if (lib_value != 40) return 1;
-    if (lib_add(2) != 42) return 2;
-    if (lib_uses_hidden(21) != 42) return 3;
-    return 42;
+  if (lib_value != 40) return 1;
+  if (lib_add(2) != 42) return 2;
+  if (lib_uses_hidden(21) != 42) return 3;
+  return 42;
 }

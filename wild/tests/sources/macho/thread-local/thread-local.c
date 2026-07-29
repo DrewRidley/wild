@@ -20,7 +20,7 @@ _Thread_local int zeroed;
 extern _Thread_local int elsewhere;
 int bump_elsewhere(void);
 
-static void *worker(void *arg) {
+static void* worker(void* arg) {
   (void)arg;
   // A second thread gets its own copy of each of these. If it doesn't, the checks in `main` below
   // see the worker's writes and fail.
@@ -31,11 +31,11 @@ static void *worker(void *arg) {
 }
 
 // Declared rather than included so that the test doesn't depend on the SDK headers.
-int pthread_create(void **thread, const void *attr, void *(*start)(void *), void *arg);
-int pthread_join(void *thread, void **retval);
+int pthread_create(void** thread, const void* attr, void* (*start)(void*), void* arg);
+int pthread_join(void* thread, void** retval);
 
 int main(void) {
-  void *thread;
+  void* thread;
   if (pthread_create(&thread, 0, worker, 0) != 0) {
     return 1;
   }

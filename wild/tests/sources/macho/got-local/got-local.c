@@ -23,7 +23,11 @@ int main(void) {
 
   // Reaching the function through the slot and calling it directly must agree - the two paths must
   // not have been handed different addresses.
-  if (via_got != target) { return 1; }
-  if (via_got() != 7) { return 2; }
+  if (via_got != target) {
+    return 1;
+  }
+  if (via_got() != 7) {
+    return 2;
+  }
   return 42;
 }

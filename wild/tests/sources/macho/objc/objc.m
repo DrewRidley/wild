@@ -12,7 +12,8 @@
 // full, so a linker that reads only the `symbols` key finds nothing - and every Objective-C
 // program failed to link, whatever it did.
 //
-// Instance variables are listed the same way, as `Class.ivar`, and become `_OBJC_IVAR_$_Class.ivar`.
+// Instance variables are listed the same way, as `Class.ivar`, and become
+// `_OBJC_IVAR_$_Class.ivar`.
 
 #import <Foundation/Foundation.h>
 

@@ -5,7 +5,7 @@
 
 #include <stdio.h>
 
-int (*fn)(const char *, ...) = printf;
+int (*fn)(const char*, ...) = printf;
 
 int main(void) {
   fn("via pointer\n");

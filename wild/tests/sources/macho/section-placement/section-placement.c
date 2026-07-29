@@ -17,10 +17,18 @@ extern long long zeroed;
 extern long long common_value;
 
 int main(void) {
-  if (literal16[0] != 0x1122334455667788LL) { return 1; }
-  if (mystuff != 0x0f0f0f0f0f0f0f0fLL) { return 2; }
+  if (literal16[0] != 0x1122334455667788LL) {
+    return 1;
+  }
+  if (mystuff != 0x0f0f0f0f0f0f0f0fLL) {
+    return 2;
+  }
   // A zerofill section takes up no space in the file but must still be readable and zeroed.
-  if (zeroed != 0) { return 3; }
-  if (common_value != 0) { return 4; }
+  if (zeroed != 0) {
+    return 3;
+  }
+  if (common_value != 0) {
+    return 4;
+  }
   return 42;
 }
