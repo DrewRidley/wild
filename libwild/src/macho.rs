@@ -341,6 +341,23 @@ pub(crate) fn atom_relocation_range(
     None
 }
 
+/// Whether `-unexported_symbols_list` withholds this symbol.
+///
+/// A withheld symbol becomes local to the image rather than disappearing: it still names its own
+/// code for a debugger and for anything that walks the symbol table, it just stops being something
+/// another image can bind to. That is one decision, and it has to be made the same way when the
+/// symbol table is measured as when it is written, or the two runs `LC_DYSYMTAB` names would not
+/// be the sizes it was told.
+pub(crate) fn is_unexported<'data>(
+    symbol_db: &crate::symbol_db::SymbolDb<'data, MachO>,
+    name: &[u8],
+) -> bool {
+    symbol_db
+        .unexport_list
+        .as_ref()
+        .is_some_and(|list| list.contains(&crate::symbol::UnversionedSymbolName::prehashed(name)))
+}
+
 /// Returns the section holding the function a `__compact_unwind` entry describes.
 ///
 /// The answer is an atom rather than one of the object's own sections, because atoms are what the
@@ -2846,7 +2863,7 @@ impl platform::Platform for MachO {
                 flags.get(),
                 &state.sections,
             ) {
-                if platform::Symbol::is_local(sym) {
+                if platform::Symbol::is_local(sym) || is_unexported(symbol_db, info.name) {
                     num_locals += 1;
                 } else {
                     num_globals += 1;

@@ -93,6 +93,8 @@ pub struct SymbolDb<'data, P: Platform> {
 
     pub(crate) version_script: VersionScript<'data>,
     pub(crate) export_list: Option<ExportList<'data>>,
+    /// Symbols to withhold from what the output offers, from `-unexported_symbols_list`.
+    pub(crate) unexport_list: Option<ExportList<'data>>,
 
     /// The name of the entry symbol if overridden by a linker script.
     entry: Option<&'data [u8]>,
@@ -344,6 +346,17 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
             .transpose()?
             .unwrap_or_default();
 
+        let unexport_list = auxiliary
+            .unexport_list_data
+            .map(|data| {
+                if P::EXPORT_LIST_IS_PLAIN_LINES {
+                    ExportList::parse_lines(data)
+                } else {
+                    ExportList::parse(data)
+                }
+            })
+            .transpose()?;
+
         let export_list = auxiliary
             .export_list_data
             .map(|data| {
@@ -373,6 +386,7 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
             start_stop_symbol_names: Default::default(),
             version_script,
             export_list,
+            unexport_list,
             entry: None,
             output_kind,
             herd,
@@ -383,6 +397,13 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
         for symbol in args.force_export_symbol_names() {
             symbol_db
                 .export_list
+                .get_or_insert_default()
+                .add_symbol(symbol, true)?;
+        }
+
+        for symbol in args.force_unexport_symbol_names() {
+            symbol_db
+                .unexport_list
                 .get_or_insert_default()
                 .add_symbol(symbol, true)?;
         }

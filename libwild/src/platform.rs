@@ -1414,6 +1414,11 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
         false
     }
 
+    /// Names given one at a time rather than in a file, to withhold from what the output offers.
+    fn force_unexport_symbol_names(&self) -> &[String] {
+        &[]
+    }
+
     /// Whether an archive member that defines Objective-C metadata is to be loaded whether or not
     /// anything refers to it.
     fn loads_objc_archive_members(&self) -> bool {
@@ -1450,6 +1455,14 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
     fn common_mut(&mut self) -> &mut crate::args::CommonArgs;
 
     fn sysroot(&self) -> Option<&Path> {
+        None
+    }
+
+    /// A list of symbols to withhold, rather than one of symbols to offer.
+    ///
+    /// The two are alternatives: a list of what to keep says nothing about the rest by implication,
+    /// and a list of what to drop says nothing about the rest either.
+    fn unexport_list_path(&self) -> Option<&Path> {
         None
     }
 

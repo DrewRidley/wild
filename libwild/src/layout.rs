@@ -4786,6 +4786,16 @@ fn can_export_symbol<'data, P: Platform>(
         return false;
     }
 
+    // A list of what to withhold applies whatever else would have offered the symbol, which is the
+    // whole of what it is for: everything is exported by default, so a list that only had a say
+    // when something else had already decided to export would never have one.
+    if let Some(unexport_list) = &resources.symbol_db.unexport_list
+        && let Ok(symbol_name) = resources.symbol_db.symbol_name(symbol_id)
+        && unexport_list.contains(&UnversionedSymbolName::prehashed(symbol_name.bytes()))
+    {
+        return false;
+    }
+
     true
 }
 

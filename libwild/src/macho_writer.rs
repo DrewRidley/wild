@@ -3623,7 +3623,10 @@ fn write_symbols<'data>(
                     ),
                 };
                 let primary_id = layout.output_sections.primary_output_section(section_id);
-                let n_type = sym.n_type.with_type(N_SECT);
+                let mut n_type = sym.n_type.with_type(N_SECT);
+                if crate::macho::is_unexported(&layout.symbol_db, info.name) {
+                    n_type = object::macho::SymbolFlags(n_type.0 & !macho::N_EXT.0);
+                }
                 let n_sect = *symbol_writer.section_indices.get(primary_id);
                 ensure!(
                     n_sect != 0,

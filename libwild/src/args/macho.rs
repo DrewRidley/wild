@@ -33,6 +33,7 @@ pub struct MachOArgs {
     pub(crate) install_name: Option<Box<str>>,
     /// A file naming the symbols to export, one per line, instead of exporting everything visible.
     pub(crate) exported_symbols_list: Option<Box<Path>>,
+    pub(crate) unexported_symbols_list: Option<Box<Path>>,
     /// Directories dyld searches for `@rpath`-relative dependencies, in the order given.
     pub(crate) rpaths: Vec<Box<str>>,
     /// Where to look for frameworks, `-F` directories first and the system ones after.
@@ -45,6 +46,8 @@ pub struct MachOArgs {
     pub(crate) undefined: Vec<String>,
     /// Symbols to export whatever else says otherwise, from `-exported_symbol`.
     pub(crate) exported_symbols: Vec<String>,
+    /// Symbols to withhold whatever else says otherwise, from `-unexported_symbol`.
+    pub(crate) unexported_symbols: Vec<String>,
     /// Whether every archive member is to be loaded, referenced or not.
     pub(crate) all_load: bool,
     pub(crate) objc_load: bool,
@@ -158,10 +161,6 @@ const UNSUPPORTED_FLAGS: &[(&str, &str)] = &[
     ("order_file", "we don't order functions by a supplied list"),
     ("sectcreate", "we don't add sections from a file"),
     (
-        "unexported_symbols_list",
-        "we don't yet hide symbols by list; use -exported_symbols_list to say what to keep",
-    ),
-    (
         "reexport_library",
         "we don't pass on what a dependency exports as though it were ours",
     ),
@@ -194,12 +193,14 @@ impl Default for MachOArgs {
             dylib: false,
             install_name: None,
             exported_symbols_list: None,
+            unexported_symbols_list: None,
             rpaths: Vec::new(),
             framework_search_path: Vec::new(),
             current_version: None,
             compatibility_version: None,
             undefined: Vec::new(),
             exported_symbols: Vec::new(),
+            unexported_symbols: Vec::new(),
             all_load: false,
             objc_load: false,
             strip_debug: false,
@@ -270,6 +271,10 @@ impl platform::Args for MachOArgs {
         &self.exported_symbols
     }
 
+    fn force_unexport_symbol_names(&self) -> &[String] {
+        &self.unexported_symbols
+    }
+
     fn export_list_restricts_exports(&self) -> bool {
         true
     }
@@ -314,6 +319,10 @@ impl platform::Args for MachOArgs {
 
     fn export_list_path(&self) -> Option<&Path> {
         self.exported_symbols_list.as_deref()
+    }
+
+    fn unexport_list_path(&self) -> Option<&Path> {
+        self.unexported_symbols_list.as_deref()
     }
 
     fn should_gc_sections(&self) -> bool {
@@ -528,6 +537,15 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
 
     parser
         .declare_with_param()
+        .long("unexported_symbols_list")
+        .help("Read a list of symbols to withhold from what the output offers")
+        .execute(|args, _modifier_stack, value| {
+            args.unexported_symbols_list = Some(Path::new(value).into());
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
         .long("exported_symbols_list")
         .help("Export only the symbols named in this file")
         .execute(|args, _modifier_stack, value| {
@@ -600,6 +618,15 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
         .help("Export this symbol")
         .execute(|args, _modifier_stack, value| {
             args.exported_symbols.push(value.to_owned());
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("unexported_symbol")
+        .help("Withhold this symbol from what the output offers")
+        .execute(|args, _modifier_stack, value| {
+            args.unexported_symbols.push(value.to_owned());
             Ok(())
         });
 
