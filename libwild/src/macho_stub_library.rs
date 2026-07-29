@@ -89,6 +89,12 @@ struct Exports<'a> {
     #[serde(default)]
     #[serde(borrow)]
     objc_eh_types: Vec<&'a str>,
+    /// Variables with one instance per thread. They are named and referred to exactly as any other
+    /// symbol is - what makes them thread-local is how the defining image lays them out, not
+    /// anything the referring image says - so they are simply more of what the library defines.
+    #[serde(default)]
+    #[serde(borrow)]
+    thread_local_symbols: Vec<&'a str>,
 }
 // TODO: remove
 #[allow(unused)]
@@ -264,6 +270,9 @@ fn scan_tbd(input: &str) -> Option<Vec<TextBasedDefinition<'_>>> {
                     "objc-classes" => item.objc_classes = parse_flow_sequence(value)?,
                     "objc-ivars" => item.objc_ivars = parse_flow_sequence(value)?,
                     "objc-eh-types" => item.objc_eh_types = parse_flow_sequence(value)?,
+                    "thread-local-symbols" => {
+                        item.thread_local_symbols = parse_flow_sequence(value)?;
+                    }
                     _ => {}
                 }
             }
@@ -510,6 +519,9 @@ pub fn parse_defined_library<'data>(
                 defined_library
                     .weak_symbols
                     .extend(export.weak_symbols.iter());
+                defined_library
+                    .symbols
+                    .extend(export.thread_local_symbols.iter());
 
                 // An Objective-C class is listed by its bare name and stands for several symbols:
                 // the class itself, the metaclass behind it, and - if it can cross an image
