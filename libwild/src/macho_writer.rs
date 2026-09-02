@@ -1875,12 +1875,15 @@ fn read_compact_unwind_section(
             });
 
         if u64::from(info.r_address) % COMPACT_UNWIND_ENTRY_SIZE == 0 {
+            // When a symbol is named, the stored value is a displacement from it; when a section
+            // is, the stored value is the whole address in the object's own numbering.
             let input_address = if info.r_extern {
                 object
                     .object
                     .symbol(SymbolIndex(info.r_symbolnum as usize))?
                     .n_value
                     .get(LE)
+                    .wrapping_add(stored)
             } else {
                 stored
             };
@@ -2011,6 +2014,8 @@ fn eh_frame_plan(
 
     let by_record = relocations_by_record(&records, relocations);
 
+    let section_address = object.object.section(section_index)?.addr.get(LE);
+
     let mut functions = vec![None; records.len()];
     let mut any_fde = false;
 
@@ -2019,7 +2024,8 @@ fn eh_frame_plan(
             continue;
         }
 
-        functions[index] = live_fde_function(object, record, bucket, relocations)?;
+        functions[index] =
+            live_fde_function(object, record, data, section_address, bucket, relocations)?;
         any_fde |= functions[index].is_some();
     }
 
@@ -2097,6 +2103,8 @@ fn eh_frame_output_offsets(
 fn live_fde_function(
     object: &ObjectLayout<'_, MachO>,
     record: &EhFrameRecord,
+    data: &[u8],
+    section_address: u64,
     bucket: &[u32],
     relocations: &[MachORelocation],
 ) -> Result<Option<u64>> {
@@ -2127,7 +2135,54 @@ fn live_fde_function(
         .is_some()
         && object.object.section(function_section)?.size.get(LE) != 0;
 
-    Ok(is_live.then(|| symbol.n_value.get(LE)))
+    if !is_live {
+        return Ok(None);
+    }
+
+    // The symbol alone isn't the address. Hand-written assembly covers one symbol with several
+    // FDEs, one per region it unwinds differently, and every one of them names that same symbol -
+    // where its region starts is carried in the field's stored bytes instead.
+    let stored = stored_addend(data, pc_begin, info.r_length)?;
+
+    let mut function = (symbol.n_value.get(LE) as i64).wrapping_add(stored);
+
+    // A subtractor makes the field a distance from an anchor in `__eh_frame` rather than an
+    // absolute address, so the anchor comes back out before the field can say where the function
+    // is.
+    let subtractor = bucket
+        .iter()
+        .map(|&index| relocations[index as usize].info(LE))
+        .find(|sub| {
+            sub.r_address == pc_begin
+                && sub.r_type == object::macho::ARM64_RELOC_SUBTRACTOR
+                && sub.r_extern
+        });
+
+    if let Some(sub) = subtractor {
+        let anchor = object.object.symbol(SymbolIndex(sub.r_symbolnum as usize))?;
+
+        function = function
+            .wrapping_sub(anchor.n_value.get(LE) as i64)
+            .wrapping_add((section_address + u64::from(pc_begin)) as i64);
+    }
+
+    Ok(Some(function as u64))
+}
+
+/// Reads the addend a relocation left in its slot, at `offset` of `data`.
+fn stored_addend(data: &[u8], offset: u32, r_length: u8) -> Result<i64> {
+    let offset = offset as usize;
+    let size = 1_usize << r_length;
+
+    let slot = data
+        .get(offset..offset + size)
+        .with_context(|| format!("Relocation addend at offset {offset:#x} is outside its section"))?;
+
+    match size {
+        4 => Ok(i64::from(i32::from_le_bytes(slot.try_into()?))),
+        8 => Ok(i64::from_le_bytes(slot.try_into()?)),
+        other => bail!("Unsupported relocation addend size: {other}"),
+    }
 }
 
 /// Applies the relocations of one `__eh_frame` record that has been copied into the output.
