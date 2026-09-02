@@ -4630,6 +4630,7 @@ impl Assertions {
 
             if linker_used.is_wild() {
                 verify_uuid(obj, bytes)?;
+                verify_unwind_info_covers_frames(obj)?;
             }
         }
         Ok(())
@@ -5489,6 +5490,196 @@ fn verify_macho_pie(obj: &object::File) -> Result {
     );
 
     Ok(())
+}
+
+/// Checks that every FDE in `__eh_frame` belongs to a function `__unwind_info` has an entry for.
+///
+/// The table has no gaps: an entry's reach ends where the next entry begins, so a function the
+/// table doesn't mention is claimed by its neighbour's entry, and unwinding through it restores
+/// registers by the wrong function's rules. A compiler that describes unwinding only in DWARF -
+/// Cranelift emits no `__compact_unwind` at all - contributes exactly such functions, so the
+/// linker has to synthesize an entry per otherwise-uncovered FDE, the way ld64 does. Every FDE
+/// having an entry at its function's address is the invariant that keeps that true.
+fn verify_unwind_info_covers_frames(obj: &object::File) -> Result {
+    use object::ObjectSection as _;
+    use object::ObjectSegment as _;
+
+    let Some(unwind_info) = obj.section_by_name_bytes(b"__unwind_info") else {
+        return Ok(());
+    };
+    let Some(eh_frame) = obj.section_by_name_bytes(b"__eh_frame") else {
+        return Ok(());
+    };
+
+    let text_base = obj
+        .segments()
+        .find(|segment| segment.name_bytes() == Ok(Some(b"__TEXT")))
+        .context("Mach-O output has no __TEXT segment")?
+        .address();
+
+    let u = unwind_info.data()?;
+    let read_u32 = |offset: usize| -> Result<u32> {
+        Ok(u32::from_le_bytes(u[offset..offset + 4].try_into()?))
+    };
+    let read_u16 = |offset: usize| -> Result<u16> {
+        Ok(u16::from_le_bytes(u[offset..offset + 2].try_into()?))
+    };
+
+    // Collect the address of every function the table describes. Layout details are in
+    // <mach-o/compact_unwind_encoding.h>.
+    let index_offset = read_u32(20)? as usize;
+    let index_count = read_u32(24)? as usize;
+
+    let mut covered = std::collections::HashSet::new();
+
+    for index in 0..index_count.saturating_sub(1) {
+        let entry = index_offset + index * 12;
+        let page_function = u64::from(read_u32(entry)?);
+        let second_level = read_u32(entry + 4)? as usize;
+
+        if second_level == 0 {
+            continue;
+        }
+
+        match read_u32(second_level)? {
+            // UNWIND_SECOND_LEVEL_REGULAR
+            2 => {
+                let entries_offset = read_u16(second_level + 4)? as usize;
+                let count = read_u16(second_level + 6)? as usize;
+                for i in 0..count {
+                    let function = read_u32(second_level + entries_offset + i * 8)?;
+                    covered.insert(text_base + u64::from(function));
+                }
+            }
+            // UNWIND_SECOND_LEVEL_COMPRESSED
+            3 => {
+                let entries_offset = read_u16(second_level + 4)? as usize;
+                let count = read_u16(second_level + 6)? as usize;
+                for i in 0..count {
+                    let entry = read_u32(second_level + entries_offset + i * 4)?;
+                    covered.insert(text_base + page_function + u64::from(entry & 0x00FF_FFFF));
+                }
+            }
+            other => bail!("Unknown __unwind_info second-level page kind {other}"),
+        }
+    }
+
+    // Walk `__eh_frame` and hold every FDE against the table.
+    let eh = eh_frame.data()?;
+    let eh_address = eh_frame.address();
+    let mut offset = 0;
+
+    while offset + 8 <= eh.len() {
+        let length = u32::from_le_bytes(eh[offset..offset + 4].try_into()?) as usize;
+        if length == 0 {
+            break;
+        }
+
+        let record_end = offset + 4 + length;
+        ensure!(
+            record_end <= eh.len(),
+            "__eh_frame record at {offset:#x} runs past the end of the section"
+        );
+
+        let cie_id = u32::from_le_bytes(eh[offset + 4..offset + 8].try_into()?);
+
+        if cie_id != 0 {
+            // An FDE. Its CIE's `R` augmentation says how pc-begin is stored; everything emitted
+            // on this platform uses a pcrel form, so the field width is all that's read from it.
+            let cie_start = (offset + 4)
+                .checked_sub(cie_id as usize)
+                .context("FDE names a CIE before the start of __eh_frame")?;
+            let encoding = fde_pointer_encoding(&eh[cie_start..])
+                .with_context(|| format!("Unreadable CIE at {cie_start:#x} of __eh_frame"))?;
+            ensure!(
+                encoding & 0x10 != 0,
+                "CIE at {cie_start:#x} of __eh_frame stores pc-begin as something other than \
+                 pcrel, which nothing on this platform emits"
+            );
+
+            let field = offset + 8;
+            let pc_begin = match encoding & 0x0F {
+                // DW_EH_PE_absptr / DW_EH_PE_sdata8 (pcrel)
+                0x00 | 0x0C => (eh_address + field as u64)
+                    .wrapping_add(i64::from_le_bytes(eh[field..field + 8].try_into()?) as u64),
+                // DW_EH_PE_sdata4 (pcrel)
+                0x0B => (eh_address + field as u64).wrapping_add(i64::from(i32::from_le_bytes(
+                    eh[field..field + 4].try_into()?,
+                )) as u64),
+                other => bail!("Unsupported FDE pointer encoding 0x1{other:x} in __eh_frame"),
+            };
+
+            ensure!(
+                covered.contains(&pc_begin),
+                "__eh_frame FDE at {offset:#x} describes the function at {pc_begin:#x}, which \
+                 __unwind_info has no entry for - its addresses fall to a neighbouring entry, and \
+                 unwinding through it follows the wrong function's rules"
+            );
+        }
+
+        offset = record_end;
+    }
+
+    Ok(())
+}
+
+/// Reads the `R` augmentation of a CIE: how the FDEs that extend it store their pointers.
+fn fde_pointer_encoding(cie: &[u8]) -> Result<u8> {
+    // length(4) + id(4) + version(1), then the augmentation string.
+    let augmentation_start = 9;
+    let augmentation_end = augmentation_start
+        + cie[augmentation_start..]
+            .iter()
+            .position(|&b| b == 0)
+            .context("CIE augmentation string is unterminated")?;
+    let augmentation = &cie[augmentation_start..augmentation_end];
+
+    ensure!(
+        augmentation.first() == Some(&b'z'),
+        "CIE has no augmentation data, so its FDE pointer encoding is unknowable"
+    );
+
+    let mut cursor = augmentation_end + 1;
+    let mut read_uleb = |cie: &[u8]| -> Result<u64> {
+        let mut value = 0u64;
+        let mut shift = 0;
+        loop {
+            let byte = *cie.get(cursor).context("CIE ends inside a ULEB128")?;
+            cursor += 1;
+            value |= u64::from(byte & 0x7F) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+            shift += 7;
+        }
+    };
+
+    read_uleb(cie)?; // code alignment factor
+    // Data alignment factor, an SLEB128: the same wire shape as a ULEB128.
+    read_uleb(cie)?;
+    read_uleb(cie)?; // return address register
+    read_uleb(cie)?; // augmentation data length
+
+    for &kind in &augmentation[1..] {
+        match kind {
+            b'R' => return Ok(*cie.get(cursor).context("CIE ends before its R encoding")?),
+            b'L' => cursor += 1,
+            b'P' => {
+                let encoding = *cie.get(cursor).context("CIE ends before its P encoding")?;
+                cursor += 1;
+                // The personality pointer itself, sized by its encoding's low nibble.
+                cursor += match encoding & 0x0F {
+                    0x00 | 0x04 | 0x0C => 8,
+                    0x03 | 0x0B => 4,
+                    0x02 | 0x0A => 2,
+                    other => bail!("Unsupported personality pointer encoding low nibble {other}"),
+                };
+            }
+            other => bail!("Unsupported CIE augmentation {:?}", other as char),
+        }
+    }
+
+    bail!("CIE has no R augmentation, so its FDE pointer encoding is unknowable")
 }
 
 fn verify_uuid(obj: &object::File, bytes: &[u8]) -> Result {

@@ -2396,6 +2396,13 @@ impl platform::Platform for MachO {
                 // CIEs that this record has now earned.
                 FrameKind::Fde { size, .. } => {
                     object.format_specific.eh_frame_size += u64::from(size);
+
+                    // A function that only DWARF describes - everything Cranelift emits - still
+                    // needs a `__unwind_info` entry deferring to its frame, or the neighbouring
+                    // entry claims its addresses. Whether this FDE's function also has a
+                    // `__compact_unwind` entry isn't known yet, so this over-reserves by one row
+                    // for the functions described both ways.
+                    common.allocate(part_id::UNWIND_INFO, UNWIND_INFO_BYTES_PER_ENTRY);
                 }
             }
 

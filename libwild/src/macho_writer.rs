@@ -124,6 +124,7 @@ use crate::timing_phase;
 use crate::value_flags::ValueFlags;
 use crate::verbose_timing_phase;
 use hashbrown::HashMap;
+use hashbrown::HashSet;
 use itertools::Itertools;
 use linker_utils::elf::RelocationKind;
 use linker_utils::elf::RelocationKindInfo;
@@ -1813,6 +1814,17 @@ fn collect_unwind_entries(layout: &MachOLayout<'_>) -> Result<Vec<UnwindEntry>> 
         .map(|object| -> Result<Vec<UnwindEntry>> {
             let mut entries = Vec::new();
 
+            // An entry that can't be described compactly names a DWARF frame instead, by its
+            // offset within `__eh_frame`. That offset is into *this object's* `__eh_frame`, and
+            // the output holds only the frames whose functions survived, from every object at
+            // once - so the entry has to be told where its frame ended up rather than shifted by
+            // any one amount.
+            let eh_frame = eh_frame_output_offsets(object, layout)?;
+
+            // The functions this object's `__compact_unwind` entries describe, in the object's own
+            // numbering. An FDE for anything else stands alone and gets its own entry below.
+            let mut covered = HashSet::new();
+
             for slot in &object.sections {
                 let SectionSlot::FrameData(section_index) = slot else {
                     continue;
@@ -1822,8 +1834,47 @@ fn collect_unwind_entries(layout: &MachOLayout<'_>) -> Result<Vec<UnwindEntry>> 
                     continue;
                 }
 
-                read_compact_unwind_section(object, *section_index, layout, &mut entries)
-                    .with_context(|| format!("Failed to read __compact_unwind from {object}"))?;
+                read_compact_unwind_section(
+                    object,
+                    *section_index,
+                    layout,
+                    eh_frame.as_ref(),
+                    &mut covered,
+                    &mut entries,
+                )
+                .with_context(|| format!("Failed to read __compact_unwind from {object}"))?;
+            }
+
+            // Whatever `__unwind_info` doesn't cover isn't merely unknown: an entry's reach ends
+            // where the next entry begins, so a function without one is claimed by its
+            // neighbour's, and unwinding through it restores registers by the wrong function's
+            // rules. A compiler that describes unwinding only in DWARF - Cranelift, notably -
+            // emits no `__compact_unwind` at all, so every FDE whose function no compact entry
+            // names gets an entry that defers to it, which is also what ld64 does.
+            if let Some(eh_frame) = &eh_frame {
+                for fde in &eh_frame.live_fdes {
+                    if covered.contains(&fde.input_address) {
+                        continue;
+                    }
+
+                    let frame_offset = eh_frame.base + fde.output_offset;
+
+                    ensure!(
+                        frame_offset <= UNWIND_ARM64_DWARF_SECTION_OFFSET,
+                        "__eh_frame is too large for a DWARF unwind entry to reach into"
+                    );
+
+                    entries.push(UnwindEntry {
+                        function_address: fde.output_address,
+                        function_length: u32::try_from(fde.length)
+                            .context("An FDE describes more than 4GiB of code")?,
+                        // The personality and landing pad live in the frame itself, so the entry
+                        // carries neither.
+                        encoding: UNWIND_ARM64_MODE_DWARF | frame_offset,
+                        personality_got_address: None,
+                        lsda_address: None,
+                    });
+                }
             }
 
             Ok(entries)
@@ -1840,16 +1891,12 @@ fn read_compact_unwind_section(
     object: &ObjectLayout<'_, MachO>,
     section_index: object::SectionIndex,
     layout: &MachOLayout<'_>,
+    eh_frame: Option<&EhFramePlan>,
+    covered: &mut HashSet<u64>,
     entries: &mut Vec<UnwindEntry>,
 ) -> Result {
     let section = object.object.section(section_index)?;
     let data = object.object.raw_section_data(section)?;
-
-    // An entry that can't be described compactly names a DWARF frame instead, by its offset within
-    // `__eh_frame`. That offset is into *this object's* `__eh_frame`, and the output holds only the
-    // frames whose functions survived, from every object at once - so the entry has to be told
-    // where its frame ended up rather than shifted by any one amount.
-    let eh_frame = eh_frame_output_offsets(object, layout)?;
 
     // A relocation names the target; the bytes it applies to hold the displacement from it. Both
     // are needed, and which field of which entry they belong to follows from the offset, so the
@@ -1889,6 +1936,7 @@ fn read_compact_unwind_section(
             };
 
             input_functions.insert(offset as u64, input_address);
+            covered.insert(input_address);
         }
 
         let Some(address) = resolve_compact_unwind_target(object, layout, info, stored)? else {
@@ -1929,7 +1977,6 @@ fn read_compact_unwind_section(
             // function survived - so a missing frame means the two disagreed about that, and the
             // entry would otherwise send the unwinder to whatever now sits at that offset.
             let frame_offset = eh_frame
-                .as_ref()
                 .and_then(|eh_frame| eh_frame.fde_offset(input_function))
                 .with_context(|| {
                     format!(
@@ -1979,6 +2026,12 @@ struct EhFramePlan {
     /// the only thing the two have in common - the entry carries no usable offset of its own.
     fde_by_function: HashMap<u64, u32>,
 
+    /// Every FDE being emitted, with the function it describes. `__unwind_info` needs one entry
+    /// per function whichever way the function's unwinding is described, and a compiler that only
+    /// writes DWARF - Cranelift, notably - contributes functions that appear here and nowhere
+    /// else.
+    live_fdes: Vec<LiveFde>,
+
     /// What the object contributes, which is what layout was asked to allocate for it.
     total: u32,
 }
@@ -1988,6 +2041,22 @@ impl EhFramePlan {
     fn fde_offset(&self, function_input_address: u64) -> Option<u32> {
         Some(self.base + self.fde_by_function.get(&function_input_address)?)
     }
+}
+
+/// An FDE that is being emitted, and the function it describes.
+struct LiveFde {
+    /// The function's address in the object's own numbering, which is how a `__compact_unwind`
+    /// entry for the same function names it.
+    input_address: u64,
+
+    /// Where the function landed in the output.
+    output_address: u64,
+
+    /// How much code the FDE covers.
+    length: u64,
+
+    /// The FDE's offset within this object's block of the output section.
+    output_offset: u32,
 }
 
 /// Decides what this object contributes to `__eh_frame`.
@@ -2016,7 +2085,9 @@ fn eh_frame_plan(
 
     let section_address = object.object.section(section_index)?.addr.get(LE);
 
-    let mut functions = vec![None; records.len()];
+    let mut functions: Vec<Option<FdeFunction>> = std::iter::repeat_with(|| None)
+        .take(records.len())
+        .collect();
     let mut any_fde = false;
 
     for (index, (record, bucket)) in records.iter().zip(&by_record).enumerate() {
@@ -2031,15 +2102,22 @@ fn eh_frame_plan(
 
     let mut output_offsets = HashMap::new();
     let mut fde_by_function = HashMap::new();
+    let mut live_fdes = Vec::new();
     let mut total = 0;
 
     for (index, record) in records.iter().enumerate() {
         // A CIE is kept for the object rather than for any one FDE: they share it, it's small, and
         // an FDE without the CIE it names is unreadable. An object that lost all its FDEs keeps
         // none of them.
-        match functions[index] {
+        match &functions[index] {
             Some(function) => {
-                fde_by_function.insert(function, total);
+                fde_by_function.insert(function.input_address, total);
+                live_fdes.push(LiveFde {
+                    input_address: function.input_address,
+                    output_address: function.output_address,
+                    length: function.length,
+                    output_offset: total,
+                });
             }
             None if record.cie_offset.is_none() && any_fde => {}
             None => continue,
@@ -2071,6 +2149,7 @@ fn eh_frame_plan(
         base,
         output_offsets,
         fde_by_function,
+        live_fdes,
         total,
     })
 }
@@ -2093,10 +2172,17 @@ fn eh_frame_output_offsets(
     Ok(None)
 }
 
-/// Returns the address the function an FDE describes has in this object, if it's in the output.
+/// The function an FDE describes, in both the object's numbering and the output's.
+struct FdeFunction {
+    input_address: u64,
+    output_address: u64,
+    length: u64,
+}
+
+/// Returns the function an FDE describes, if it's in the output.
 ///
-/// The address is in the object's own numbering rather than the image's, because it is only used to
-/// pair the FDE with the `__compact_unwind` entry for the same function, and that entry names it
+/// The input address is in the object's own numbering rather than the image's, because it is used
+/// to pair the FDE with the `__compact_unwind` entry for the same function, and that entry names it
 /// the same way. An empty section is the odd case: it can be loaded and still have no code in it,
 /// and layout only hangs unwind data off sections that turned out to be non-empty, so an FDE for
 /// one was never paid for.
@@ -2107,7 +2193,7 @@ fn live_fde_function(
     section_address: u64,
     bucket: &[u32],
     relocations: &[MachORelocation],
-) -> Result<Option<u64>> {
+) -> Result<Option<FdeFunction>> {
     let pc_begin = record.offset + FDE_PC_BEGIN_OFFSET;
 
     let Some(info) = bucket
@@ -2128,14 +2214,17 @@ fn live_fde_function(
         return Ok(None);
     };
 
-    let is_live = object
+    let Some(atom_output_address) = object
         .section_resolutions
         .get(function_section.0)
         .and_then(|resolution| resolution.address())
-        .is_some()
-        && object.object.section(function_section)?.size.get(LE) != 0;
+    else {
+        return Ok(None);
+    };
 
-    if !is_live {
+    let atom = object.object.section(function_section)?;
+
+    if atom.size.get(LE) == 0 {
         return Ok(None);
     }
 
@@ -2159,14 +2248,30 @@ fn live_fde_function(
         });
 
     if let Some(sub) = subtractor {
-        let anchor = object.object.symbol(SymbolIndex(sub.r_symbolnum as usize))?;
+        let anchor = object
+            .object
+            .symbol(SymbolIndex(sub.r_symbolnum as usize))?;
 
         function = function
             .wrapping_sub(anchor.n_value.get(LE) as i64)
             .wrapping_add((section_address + u64::from(pc_begin)) as i64);
     }
 
-    Ok(Some(function as u64))
+    let input_address = function as u64;
+
+    // The field after pc-begin says how much code the FDE covers, stored the same width.
+    let length = stored_addend(data, pc_begin + (1 << info.r_length), info.r_length)? as u64;
+
+    let output_address = atom_output_address
+        + input_address
+            .checked_sub(atom.addr.get(LE))
+            .context("An FDE describes a function before the atom that holds it")?;
+
+    Ok(Some(FdeFunction {
+        input_address,
+        output_address,
+        length,
+    }))
 }
 
 /// Reads the addend a relocation left in its slot, at `offset` of `data`.
@@ -2174,9 +2279,9 @@ fn stored_addend(data: &[u8], offset: u32, r_length: u8) -> Result<i64> {
     let offset = offset as usize;
     let size = 1_usize << r_length;
 
-    let slot = data
-        .get(offset..offset + size)
-        .with_context(|| format!("Relocation addend at offset {offset:#x} is outside its section"))?;
+    let slot = data.get(offset..offset + size).with_context(|| {
+        format!("Relocation addend at offset {offset:#x} is outside its section")
+    })?;
 
     match size {
         4 => Ok(i64::from(i32::from_le_bytes(slot.try_into()?))),
@@ -3141,8 +3246,8 @@ fn write_fixup_chains(
         // belong, and applies this segment's (empty) fixup view to a file page the next segment
         // also owns, losing that page's fixups. Only the file-backed pages may be counted; a fixup
         // can't live in zerofill anyway, because a fixup is file content.
-        let page_count = (last_offset / page_size + 1)
-            .max((segment.sizes.file_size as u64).div_ceil(page_size));
+        let page_count =
+            (last_offset / page_size + 1).max((segment.sizes.file_size as u64).div_ceil(page_size));
         segment.page_starts = vec![DYLD_CHAINED_PTR_START_NONE; usize::try_from(page_count)?];
 
         for (i, site) in segment.sites.iter().enumerate() {
