@@ -747,6 +747,35 @@ pub(crate) trait Platform:
         symbol_db: &SymbolDb<Self>,
     ) -> Result;
 
+    /// A symbol the linker defines itself when an object refers to `name` and nothing defines it:
+    /// which kind, or `None` if the name is simply undefined. Mach-O's `_objc_msgSend$selector`
+    /// trampolines are the case - clang emits the call and leaves the callee to the linker.
+    fn synthetic_symbol_for_undefined(_name: &[u8]) -> Option<Self::PlatformSpecificSymbol> {
+        None
+    }
+
+    /// A symbol that a reference to the undefined `name` is also a reference to, so it has to be
+    /// loaded and given a GOT slot although nothing names it directly.
+    fn dependency_of_undefined(_name: &[u8]) -> Option<&'static [u8]> {
+        None
+    }
+
+    /// Resolves a platform-specific linker symbol, claiming whatever room it needs as it goes.
+    /// Paired with `finalise_sizes_for_symbol`, which reserved that room.
+    fn platform_symbol_resolution(
+        _symbol: Self::PlatformSpecificSymbol,
+        _name: &[u8],
+        flags: ValueFlags,
+        _memory_offsets: &mut OutputSectionPartMap<u64>,
+    ) -> layout::Resolution<Self> {
+        layout::Resolution {
+            raw_value: 0,
+            dynamic_symbol_index: None,
+            flags,
+            format_specific: Default::default(),
+        }
+    }
+
     fn allocate_prelude(common: &mut CommonGroupState<Self>, symbol_db: &SymbolDb<Self>);
 
     fn finalise_prelude_layout<'data>(

@@ -117,6 +117,8 @@ pub(crate) const INDIRECT_SYMTAB: OutputSectionId = part_id::INDIRECT_SYMTAB.out
 pub(crate) const UNWIND_INFO: OutputSectionId = part_id::UNWIND_INFO.output_section_id();
 pub(crate) const EXPORT_TRIE: OutputSectionId = part_id::EXPORT_TRIE.output_section_id();
 pub(crate) const CODE_SIGNATURE: OutputSectionId = part_id::CODE_SIGNATURE.output_section_id();
+pub(crate) const OBJC_STUBS: OutputSectionId = part_id::OBJC_STUBS.output_section_id();
+pub(crate) const OBJC_METHNAME: OutputSectionId = part_id::OBJC_METHNAME.output_section_id();
 
 // Wasm specific sections.
 pub(crate) const WASM_TYPE: OutputSectionId = part_id::WASM_TYPE.output_section_id();
@@ -182,8 +184,12 @@ pub(crate) const SWIFT5_REPLAC2: OutputSectionId = OutputSectionId::regular(32);
 pub(crate) const SWIFT5_ACFUNCS: OutputSectionId = OutputSectionId::regular(33);
 pub(crate) const SWIFT_CONSTG: OutputSectionId = OutputSectionId::regular(34);
 pub(crate) const SWIFT_MODHASH: OutputSectionId = OutputSectionId::regular(35);
+/// Mach-O `__DATA,__objc_selrefs`: selector references, from the inputs and from the
+/// `_objc_msgSend$selector` trampolines the linker synthesizes. One section, because the runtime
+/// finds it by name and would only uniquify the selectors in the first.
+pub(crate) const OBJC_SELREFS: OutputSectionId = OutputSectionId::regular(36);
 
-pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 36;
+pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 37;
 
 #[derive(Debug)]
 pub(crate) struct OutputSections<'data, P: Platform> {

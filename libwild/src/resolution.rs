@@ -1061,13 +1061,21 @@ fn canonicalise_undefined_symbols<'data, P: Platform>(
             PreHashedSymbolName::Unversioned(pre_hashed) => {
                 match name_to_id.entry(pre_hashed) {
                     hashbrown::hash_map::Entry::Vacant(entry) => {
-                        let symbol_id = allocate_start_stop_symbol_id(
+                        let symbol_id = allocate_platform_symbol_id(
                             pre_hashed,
                             symbol_db,
                             per_symbol_flags,
                             custom_start_stop_defs,
-                            output_sections,
-                        );
+                        )
+                        .or_else(|| {
+                            allocate_start_stop_symbol_id(
+                                pre_hashed,
+                                symbol_db,
+                                per_symbol_flags,
+                                custom_start_stop_defs,
+                                output_sections,
+                            )
+                        });
 
                         // We either make our undefined symbol dynamic, allowing the possibility
                         // that it might end up being defined at runtime, or we make it
@@ -1146,6 +1154,27 @@ fn canonicalise_undefined_symbols<'data, P: Platform>(
             }
         }
     }
+}
+
+/// Defines an undefined symbol that the platform says is the linker's to define, if it is one.
+fn allocate_platform_symbol_id<'data, P: Platform>(
+    name: PreHashed<UnversionedSymbolName<'data>>,
+    symbol_db: &mut SymbolDb<'data, P>,
+    per_symbol_flags: &mut PerSymbolFlags,
+    custom_start_stop_defs: &mut ResolvedSyntheticSymbols<'data, P>,
+) -> Option<SymbolId> {
+    let platform_symbol = P::synthetic_symbol_for_undefined(name.bytes())?;
+
+    let def_info = InternalSymDefInfo::new(
+        SymbolPlacement::PlatformSpecific(platform_symbol),
+        name.bytes(),
+    );
+
+    let symbol_id = symbol_db.add_synthetic_symbol(per_symbol_flags, name, custom_start_stop_defs);
+
+    custom_start_stop_defs.symbol_definitions.push(def_info);
+
+    Some(symbol_id)
 }
 
 fn allocate_start_stop_symbol_id<'data, P: Platform>(
@@ -1608,6 +1637,16 @@ pub(crate) fn resolve_symbol<'data, 'scope, P: Platform>(
             }
         }
         None => {
+            // Some undefined names are the linker's to define, and what it defines them as refers
+            // to something else - a Mach-O `_objc_msgSend$selector` trampoline tail-calls
+            // `_objc_msgSend`. Nothing in the inputs names that something, so the file defining it
+            // is asked for here, while files can still be brought in; layout makes the reference.
+            if let PreHashedSymbolName::Unversioned(unversioned) = &prehashed_name
+                && let Some(dependency) = P::dependency_of_undefined(unversioned.bytes())
+            {
+                load_symbol_named(resources, &mut SymbolId::undefined(), dependency, scope);
+            }
+
             resources.outputs.undefined_symbols.push(UndefinedSymbol {
                 ignore_if_loaded: None,
                 name: prehashed_name,

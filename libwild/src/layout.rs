@@ -1215,11 +1215,32 @@ impl<'data, P: Platform> SymbolRequestHandler<'data, P> for SyntheticSymbolsLayo
         _common: &mut CommonGroupState<'data, P>,
         symbol_id: SymbolId,
         resources: &'scope GraphResources<'data, 'scope, P>,
-        _queue: &mut LocalWorkQueue,
+        queue: &mut LocalWorkQueue,
         scope: &Scope<'scope>,
     ) -> Result {
         let def_info =
             &self.internal_symbols.symbol_definitions[self.symbol_id_range.id_to_offset(symbol_id)];
+
+        // A platform-specific symbol can stand for code that refers to another symbol - a Mach-O
+        // `_objc_msgSend$selector` trampoline tail-calls `_objc_msgSend` through the GOT - so
+        // loading it is a reference to that one too, which nothing in the inputs makes. The
+        // request is what has the library it comes from record the import and bind the slot.
+        if let SymbolPlacement::PlatformSpecific(_) = def_info.placement
+            && let Some(dependency) = P::dependency_of_undefined(def_info.name)
+            && let Some(dependency_id) = resources
+                .symbol_db
+                .get_unversioned(&UnversionedSymbolName::prehashed(dependency))
+        {
+            let dependency_id = resources.symbol_db.definition(dependency_id);
+            let previous_flags = resources
+                .per_symbol_flags
+                .get_atomic(dependency_id)
+                .fetch_or(ValueFlags::GOT | ValueFlags::GOT_ENTRY_REQUIRED);
+
+            if !previous_flags.has_resolution() {
+                queue.send_symbol_request::<A>(dependency_id, resources, scope);
+            }
+        }
 
         if let Some(output_section_id) = def_info.section_id() {
             // We've gotten a request to load a __start_ / __stop_ symbol, sent requests to load all
@@ -3728,6 +3749,21 @@ fn create_internal_symbol_resolution<'data, P: Platform>(
         return None;
     }
 
+    let flags = resources
+        .symbol_db
+        .flags_for_symbol(resources.per_symbol_flags, symbol_id);
+
+    // A platform-specific symbol is the platform's to resolve: its address is wherever the
+    // platform puts the thing it stands for, which nothing generic can know.
+    if let SymbolPlacement::PlatformSpecific(symbol) = def_info.placement {
+        return Some(P::platform_symbol_resolution(
+            symbol,
+            def_info.name,
+            flags,
+            memory_offsets,
+        ));
+    }
+
     let raw_value = match def_info.placement {
         SymbolPlacement::Undefined
         | SymbolPlacement::ForceUndefined
@@ -3773,9 +3809,7 @@ fn create_internal_symbol_resolution<'data, P: Platform>(
     };
 
     Some(P::create_resolution(
-        resources
-            .symbol_db
-            .flags_for_symbol(resources.per_symbol_flags, symbol_id),
+        flags,
         raw_value,
         None,
         memory_offsets,

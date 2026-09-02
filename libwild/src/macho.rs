@@ -103,6 +103,31 @@ pub(crate) const GOT_ENTRY_SIZE: u64 = 8;
 pub(crate) const INDIRECT_SYMTAB_ENTRY_SIZE: u64 = size_of::<u32>() as u64;
 pub(crate) const PLT_ENTRY_SIZE: u64 = 12;
 
+/// The name clang gives a call it wants the linker to turn into a selector-loading trampoline: the
+/// selector follows the `$`, and the linker writes the callee.
+pub(crate) const OBJC_MSGSEND_STUB_PREFIX: &[u8] = b"_objc_msgSend$";
+
+/// What every such trampoline tail-calls.
+pub(crate) const OBJC_MSGSEND: &[u8] = b"_objc_msgSend";
+
+/// The size of one `__objc_stubs` entry: the "fast" form ld64 defaults to, which reaches
+/// `_objc_msgSend` through the GOT rather than through `__stubs`. Five instructions and three
+/// `brk` of padding.
+pub(crate) const OBJC_STUB_SIZE: u64 = 32;
+
+/// Returns the selector a `_objc_msgSend$selector` symbol names, or `None` for any other name.
+pub(crate) fn objc_stub_selector(name: &[u8]) -> Option<&[u8]> {
+    name.strip_prefix(OBJC_MSGSEND_STUB_PREFIX)
+}
+
+/// The symbols the linker defines for itself on this platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkerSymbol {
+    /// A `_objc_msgSend$selector` trampoline: loads the selector reference into x1 and tail-calls
+    /// `_objc_msgSend`, so that a call site can name the selector as a callee.
+    ObjcMsgSendStub,
+}
+
 /// One `compact_unwind_entry`: the function's address, its length, how to unwind it, and where its
 /// personality routine and language-specific data are.
 pub(crate) const COMPACT_UNWIND_ENTRY_SIZE: u64 = 32;
@@ -1686,7 +1711,9 @@ fn mapped_segment_type(section_id: crate::output_section_id::OutputSectionId) ->
         | output_section_id::GCC_EXCEPT_TABLE
         | output_section_id::UNWIND_INFO
         | output_section_id::MACHO_EH_FRAME
-        | output_section_id::PLT_GOT => SegmentType::TextSections,
+        | output_section_id::PLT_GOT
+        | output_section_id::OBJC_STUBS
+        | output_section_id::OBJC_METHNAME => SegmentType::TextSections,
         // Swift's metadata, which the runtime locates by segment and section name.
         _ if is_swift_metadata_section(section_id) => SegmentType::TextSections,
         // `__const` holds constants, but constants include pointers, and a pointer has to be
@@ -1703,7 +1730,8 @@ fn mapped_segment_type(section_id: crate::output_section_id::OutputSectionId) ->
         | output_section_id::TDATA
         | output_section_id::TBSS
         | output_section_id::COMMON
-        | output_section_id::BSS => SegmentType::DataSections,
+        | output_section_id::BSS
+        | output_section_id::OBJC_SELREFS => SegmentType::DataSections,
         output_section_id::GOT => SegmentType::DataConstSections,
         output_section_id::CHAINED_FIXUP_TABLE
         | output_section_id::SYMTAB_LOCAL
@@ -1886,7 +1914,7 @@ impl platform::Platform for MachO {
     type File<'data> = File<'data>;
     type FileFlags = u32;
     type SymtabEntry = SymtabEntry;
-    type PlatformSpecificSymbol = core::convert::Infallible;
+    type PlatformSpecificSymbol = LinkerSymbol;
     type SectionHeader = SectionHeader;
     type SectionFlags = SectionFlags;
     type SectionAttributes = SectionAttributes;
@@ -2824,11 +2852,24 @@ impl platform::Platform for MachO {
     }
 
     fn finalise_sizes_for_symbol<'data>(
-        _common: &mut crate::layout::CommonGroupState<'data, Self>,
-        _symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
-        _symbol_id: crate::symbol_db::SymbolId,
-        _flags: crate::value_flags::ValueFlags,
+        common: &mut crate::layout::CommonGroupState<'data, Self>,
+        symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
+        symbol_id: crate::symbol_db::SymbolId,
+        flags: crate::value_flags::ValueFlags,
     ) -> crate::error::Result {
+        // A `_objc_msgSend$selector` trampoline is three pieces the linker writes: the code, the
+        // selector reference it loads, and the selector name that reference points at. Reserved
+        // here, claimed in `platform_symbol_resolution` - the two have to agree, and both skip a
+        // symbol nothing ended up referring to.
+        if flags.has_resolution()
+            && let Ok(name) = symbol_db.symbol_name(symbol_id)
+            && let Some(selector) = objc_stub_selector(name.bytes())
+        {
+            common.allocate(part_id::OBJC_STUBS, OBJC_STUB_SIZE);
+            common.allocate(objc_selrefs_part_id(), GOT_ENTRY_SIZE);
+            common.allocate(part_id::OBJC_METHNAME, selector.len() as u64 + 1);
+        }
+
         Ok(())
     }
 
@@ -2951,6 +2992,52 @@ impl platform::Platform for MachO {
         Ok(())
     }
 
+    fn synthetic_symbol_for_undefined(name: &[u8]) -> Option<Self::PlatformSpecificSymbol> {
+        objc_stub_selector(name).map(|_| LinkerSymbol::ObjcMsgSendStub)
+    }
+
+    fn dependency_of_undefined(name: &[u8]) -> Option<&'static [u8]> {
+        objc_stub_selector(name).map(|_| OBJC_MSGSEND)
+    }
+
+    fn platform_symbol_resolution(
+        symbol: Self::PlatformSpecificSymbol,
+        name: &[u8],
+        flags: crate::value_flags::ValueFlags,
+        memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
+    ) -> Resolution<Self> {
+        let mut resolution = Resolution {
+            raw_value: 0,
+            dynamic_symbol_index: None,
+            flags,
+            format_specific: ResolutionExt::default(),
+        };
+
+        match symbol {
+            LinkerSymbol::ObjcMsgSendStub => {
+                // Sized by `finalise_sizes_for_symbol`, which skipped what has no resolution - and
+                // so does the caller, so nothing is claimed here that wasn't reserved.
+                let Some(selector) = objc_stub_selector(name) else {
+                    return resolution;
+                };
+
+                let stub = *memory_offsets.get(part_id::OBJC_STUBS);
+                memory_offsets.increment(part_id::OBJC_STUBS, OBJC_STUB_SIZE);
+
+                let selref = *memory_offsets.get(objc_selrefs_part_id());
+                memory_offsets.increment(objc_selrefs_part_id(), GOT_ENTRY_SIZE);
+
+                memory_offsets.increment(part_id::OBJC_METHNAME, selector.len() as u64 + 1);
+
+                // Callers branch to the trampoline, so that is the symbol's value.
+                resolution.raw_value = stub;
+                resolution.format_specific.selref_address = NonZeroU64::new(selref);
+            }
+        }
+
+        resolution
+    }
+
     fn allocate_prelude(
         common: &mut crate::layout::CommonGroupState<Self>,
         symbol_db: &crate::symbol_db::SymbolDb<Self>,
@@ -2985,6 +3072,7 @@ impl platform::Platform for MachO {
             format_specific: ResolutionExt {
                 got_address: None,
                 plt_address: None,
+                selref_address: None,
             },
             flags,
         };
@@ -3045,6 +3133,7 @@ impl platform::Platform for MachO {
         // Content of the sections (e.g. __text, __data).
         builder.add_section(output_section_id::TEXT);
         builder.add_section(output_section_id::CSTRING);
+        builder.add_section(output_section_id::OBJC_METHNAME);
         builder.add_section(output_section_id::GCC_EXCEPT_TABLE);
         builder.add_section(output_section_id::UNWIND_INFO);
         builder.add_section(output_section_id::MACHO_EH_FRAME);
@@ -3065,12 +3154,14 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::SWIFT_CONSTG);
         builder.add_section(output_section_id::SWIFT_MODHASH);
         builder.add_section(output_section_id::PLT_GOT);
+        builder.add_section(output_section_id::OBJC_STUBS);
         // The `__DATA_CONST` sections go before `__DATA`'s: the zerofill at the end of `__DATA`
         // must not sit between the file's start and any segment carrying chained fixups - see
         // `SegmentType` for what goes wrong when it does.
         builder.add_section(output_section_id::GOT);
         builder.add_section(output_section_id::CONST);
         builder.add_section(output_section_id::DATA);
+        builder.add_section(output_section_id::OBJC_SELREFS);
         builder.add_section(output_section_id::INIT_ARRAY);
         builder.add_section(output_section_id::FINI_ARRAY);
         // Sections we have no built-in ID for are mapped to `__DATA` by `mapped_segment_type`, so
@@ -3471,6 +3562,21 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         min_alignment: Alignment { exponent: 2 },
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::OBJC_STUBS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__objc_stubs")),
+        section_flags: macho::S_REGULAR
+            .to_flags()
+            .with(macho::S_ATTR_PURE_INSTRUCTIONS)
+            .with(macho::S_ATTR_SOME_INSTRUCTIONS),
+        // Each trampoline is 32 bytes, and ld64 keeps them on 32-byte boundaries.
+        min_alignment: Alignment { exponent: 5 },
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::OBJC_METHNAME.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__objc_methname")),
+        section_flags: macho::S_CSTRING_LITERALS.to_flags(),
+        ..DEFAULT_DEFS
+    };
     // Multi-part generated sections
     // Start of regular sections
     defs[output_section_id::TEXT.as_usize()] = BuiltInSectionDetails {
@@ -3499,6 +3605,17 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
     defs[output_section_id::DATA.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"__data")),
         section_flags: macho::S_REGULAR.to_flags(),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::OBJC_SELREFS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__objc_selrefs")),
+        // The runtime rewrites these to the uniqued selectors when the image loads, so they must
+        // stay writable and must all be kept - a reference nothing else names is still the one the
+        // runtime uniques through.
+        section_flags: macho::S_LITERAL_POINTERS
+            .to_flags()
+            .with(macho::S_ATTR_NO_DEAD_STRIP),
+        min_alignment: alignment::USIZE,
         ..DEFAULT_DEFS
     };
     defs[output_section_id::THREAD_VARS.as_usize()] = BuiltInSectionDetails {
@@ -3644,6 +3761,9 @@ pub(crate) struct DynamicLayoutExt {
 pub(crate) struct ResolutionExt {
     pub(crate) got_address: Option<NonZeroU64>,
     pub(crate) plt_address: Option<NonZeroU64>,
+
+    /// For a `_objc_msgSend$selector` trampoline, the selector reference it loads into x1.
+    pub(crate) selref_address: Option<NonZeroU64>,
 }
 
 /// Which pieces of indirection a symbol gets: a `__stubs` (PLT) entry and/or a `__got` entry.
@@ -3678,6 +3798,12 @@ impl Indirection {
     }
 }
 
+/// The part of `__objc_selrefs` that the linker's own selector references go in. The section is a
+/// regular one, so that the inputs' references merge into it, and pointers want pointer alignment.
+pub(crate) fn objc_selrefs_part_id() -> part_id::PartId {
+    output_section_id::OBJC_SELREFS.part_id_with_alignment(alignment::USIZE)
+}
+
 fn allocate_got(memory_offsets: &mut OutputSectionPartMap<u64>) -> NonZeroU64 {
     let got_address = NonZeroU64::new(*memory_offsets.get(part_id::GOT)).unwrap();
     memory_offsets.increment(part_id::GOT, GOT_ENTRY_SIZE);
@@ -3700,6 +3826,9 @@ const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
     SectionRule::exact_section(b"__cstring", crate::output_section_id::CSTRING),
     SectionRule::exact_section(b"__ustring", crate::output_section_id::CONST),
     SectionRule::prefix_section(b"__objc_meth", crate::output_section_id::CSTRING),
+    // Kept as one section with the references the linker synthesizes for its `_objc_msgSend$`
+    // trampolines: the runtime finds `__objc_selrefs` by name, once.
+    SectionRule::exact_section(b"__objc_selrefs", crate::output_section_id::OBJC_SELREFS),
     SectionRule::exact_section(b"__objc_classname", crate::output_section_id::CSTRING),
     SectionRule::exact_section(b"__const", crate::output_section_id::CONST),
     SectionRule::exact_section(

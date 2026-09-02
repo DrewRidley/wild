@@ -42,10 +42,13 @@ use crate::macho::FDE_PC_BEGIN_OFFSET;
 use crate::macho::FileHeader;
 use crate::macho::GOT_ENTRY_SIZE;
 use crate::macho::INDIRECT_SYMTAB_ENTRY_SIZE;
+use crate::macho::LinkerSymbol;
 use crate::macho::MACHO_COMMAND_ALIGNMENT;
 use crate::macho::MACHO_START_MEM_ADDRESS;
 use crate::macho::MAX_SEGMENT_COUNT;
 use crate::macho::MachO;
+use crate::macho::OBJC_MSGSEND;
+use crate::macho::OBJC_STUB_SIZE;
 use crate::macho::PLT_ENTRY_SIZE;
 use crate::macho::PROGRAM_SEGMENT_DEFS;
 use crate::macho::Relocation as MachORelocation;
@@ -83,6 +86,7 @@ use crate::macho::eh_frame_records;
 use crate::macho::get_segment_sections;
 use crate::macho::is_no_bits_section_type;
 use crate::macho::load_dylib_command_size;
+use crate::macho::objc_stub_selector;
 use crate::macho::relocations_by_record;
 use crate::macho::rpath_command_size;
 use crate::macho_debug_map::N_BNSYM;
@@ -113,12 +117,15 @@ use crate::output_section_map::OutputSectionMap;
 use crate::output_section_part_map::OutputSectionPartMap;
 use crate::output_trace::HexU64;
 use crate::output_trace::TraceOutput;
+use crate::parsing::SymbolPlacement;
 use crate::part_id;
 use crate::platform::Arch;
 use crate::platform::Args;
 use crate::platform::ObjectFile;
 use crate::platform::Symbol;
 use crate::resolution::SectionSlot;
+use crate::sharding::ShardKey;
+use crate::symbol::UnversionedSymbolName;
 use crate::symbol_db::SymbolId;
 use crate::timing_phase;
 use crate::value_flags::ValueFlags;
@@ -243,6 +250,7 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
         &mut fixup_sites,
     )?;
     write_plt_entries::<A>(layout, section_buffers.get_mut(output_section_id::PLT_GOT))?;
+    write_objc_stubs(layout, &mut section_buffers, &mut fixup_sites)?;
     write_indirect_symtab(
         layout,
         section_buffers.get_mut(output_section_id::INDIRECT_SYMTAB),
@@ -4146,4 +4154,184 @@ fn build_section_index_map(layout: &MachOLayout<'_>) -> Result<OutputSectionMap<
     }
 
     Ok(map)
+}
+
+/// Writes the `_objc_msgSend$selector` trampolines, and the two things each one needs.
+///
+/// clang compiles `[obj sel]` as a call to `_objc_msgSend$sel` and leaves the callee to the
+/// linker: a stub that loads the selector reference into x1 and tail-calls `_objc_msgSend`, the
+/// reference itself in `__objc_selrefs` - which the runtime rewrites to the uniqued selector on
+/// load, so it's a rebased pointer in writable memory - and the selector's name for it to point
+/// at. Layout reserved and placed all three per trampoline; the symbol's resolution says where the
+/// stub and its reference landed, and the names are laid end to end in the order the symbols are
+/// defined.
+fn write_objc_stubs(
+    layout: &MachOLayout<'_>,
+    section_buffers: &mut OutputSectionMap<&mut [u8]>,
+    fixup_sites: &mut Vec<FixupSite>,
+) -> Result {
+    let stubs_layout = layout.section_layouts.get(output_section_id::OBJC_STUBS);
+    if stubs_layout.mem_size == 0 {
+        return Ok(());
+    }
+
+    let selrefs_layout = layout.section_layouts.get(output_section_id::OBJC_SELREFS);
+    let methname_layout = layout.section_layouts.get(output_section_id::OBJC_METHNAME);
+
+    // What every trampoline tail-calls, through the GOT slot that resolution reserved for it when
+    // the first trampoline was asked for.
+    let msgsend_got = layout
+        .symbol_db
+        .get_unversioned(&UnversionedSymbolName::prehashed(OBJC_MSGSEND))
+        .and_then(|symbol_id| layout.merged_symbol_resolution(symbol_id))
+        .and_then(|resolution| resolution.format_specific.got_address)
+        .context("_objc_msgSend$ trampolines are needed, but _objc_msgSend has no GOT slot")?
+        .get();
+
+    let mut methname_cursor = 0usize;
+
+    for group in &layout.group_layouts {
+        for file in &group.files {
+            let FileLayout::SyntheticSymbols(synthetic) = file else {
+                continue;
+            };
+
+            let symbols = &synthetic.internal_symbols;
+
+            for (index, def_info) in symbols.symbol_definitions.iter().enumerate() {
+                if !matches!(
+                    def_info.placement,
+                    SymbolPlacement::PlatformSpecific(LinkerSymbol::ObjcMsgSendStub)
+                ) {
+                    continue;
+                }
+
+                let symbol_id = symbols.start_symbol_id.add_usize(index);
+
+                if !layout.symbol_db.is_canonical(symbol_id) {
+                    continue;
+                }
+
+                // No resolution means nothing referred to it, and layout gave it no room.
+                let Some(resolution) = layout.merged_symbol_resolution(symbol_id) else {
+                    continue;
+                };
+
+                let stub_address = resolution.raw_value;
+                let selref_address = resolution
+                    .format_specific
+                    .selref_address
+                    .context("A _objc_msgSend$ trampoline has no selector reference")?
+                    .get();
+
+                let selector = objc_stub_selector(def_info.name)
+                    .context("A _objc_msgSend$ trampoline isn't named like one")?;
+
+                // The selector's name, NUL-terminated, where the reference will point.
+                let methname_address = methname_layout.mem_offset + methname_cursor as u64;
+                let methname = section_buffers
+                    .get_mut(output_section_id::OBJC_METHNAME)
+                    .get_mut(methname_cursor..methname_cursor + selector.len() + 1)
+                    .context("Selector name is outside __objc_methname")?;
+                methname[..selector.len()].copy_from_slice(selector);
+                methname[selector.len()] = 0;
+                methname_cursor += selector.len() + 1;
+
+                // The reference: a pointer into the image, so a rebase.
+                let selref_offset = selref_address
+                    .checked_sub(selrefs_layout.mem_offset)
+                    .context("Selector reference is before __objc_selrefs")?
+                    as usize;
+                section_buffers
+                    .get_mut(output_section_id::OBJC_SELREFS)
+                    .get_mut(selref_offset..selref_offset + GOT_ENTRY_SIZE as usize)
+                    .context("Selector reference is outside __objc_selrefs")?
+                    .copy_from_slice(&methname_address.to_le_bytes());
+                fixup_sites.push(FixupSite {
+                    address: selref_address,
+                    is_bind: false,
+                });
+
+                // The trampoline itself.
+                let stub_offset = stub_address
+                    .checked_sub(stubs_layout.mem_offset)
+                    .context("Trampoline is before __objc_stubs")?
+                    as usize;
+                let stub = section_buffers
+                    .get_mut(output_section_id::OBJC_STUBS)
+                    .get_mut(stub_offset..stub_offset + OBJC_STUB_SIZE as usize)
+                    .context("Trampoline is outside __objc_stubs")?;
+
+                write_objc_stub(stub, stub_address, selref_address, msgsend_got)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Encodes one `__objc_stubs` entry, in the form ld64 emits by default:
+///
+/// ```text
+/// adrp x1, selref@PAGE
+/// ldr  x1, [x1, selref@PAGEOFF]
+/// adrp x16, _objc_msgSend@GOTPAGE
+/// ldr  x16, [x16, _objc_msgSend@GOTPAGEOFF]
+/// br   x16
+/// brk  #1 (x3)
+/// ```
+fn write_objc_stub(out: &mut [u8], stub: u64, selref: u64, msgsend_got: u64) -> Result {
+    const X1: u32 = 1;
+    const X16: u32 = 16;
+    const BR_X16: u32 = 0xd61f_0200;
+    const BRK_1: u32 = 0xd420_0020;
+
+    let words = [
+        aarch64_adrp(X1, stub, selref)?,
+        aarch64_ldr_x_uimm12(X1, X1, selref)?,
+        aarch64_adrp(X16, stub + 8, msgsend_got)?,
+        aarch64_ldr_x_uimm12(X16, X16, msgsend_got)?,
+        BR_X16,
+        BRK_1,
+        BRK_1,
+        BRK_1,
+    ];
+
+    for (slot, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+        slot.copy_from_slice(&word.to_le_bytes());
+    }
+
+    Ok(())
+}
+
+/// `adrp xd, target@PAGE`, for an instruction at `pc`.
+fn aarch64_adrp(rd: u32, pc: u64, target: u64) -> Result<u32> {
+    const PAGE: u64 = 4096;
+
+    let delta = i64::try_from(
+        (i128::from(target & !(PAGE - 1)) - i128::from(pc & !(PAGE - 1))) / i128::from(PAGE),
+    )?;
+
+    ensure!(
+        (-(1 << 20)..(1 << 20)).contains(&delta),
+        "__objc_stubs entry is more than 4GiB from what it addresses"
+    );
+
+    let imm = delta as u32 & 0x1f_ffff;
+    let immlo = imm & 0b11;
+    let immhi = imm >> 2;
+
+    Ok(0x9000_0000 | (immlo << 29) | (immhi << 5) | rd)
+}
+
+/// `ldr xt, [xn, target@PAGEOFF]`, where the offset is a multiple of eight.
+fn aarch64_ldr_x_uimm12(rt: u32, rn: u32, target: u64) -> Result<u32> {
+    let offset = target & 0xfff;
+
+    ensure!(
+        offset.is_multiple_of(8),
+        "__objc_stubs entry addresses a pointer that isn't 8-byte aligned"
+    );
+
+    Ok(0xf940_0000 | ((offset as u32 / 8) << 10) | (rn << 5) | rt)
 }
