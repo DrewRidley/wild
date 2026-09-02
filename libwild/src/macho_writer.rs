@@ -798,36 +798,6 @@ fn write_segment_commands(layout: &MachOLayout, load_commands: &mut &mut [u8]) -
         &text_segment_sections,
     )?;
 
-    if let Some(data_segment_info) = get_segment_sections(layout, SegmentType::DataSections) {
-        let data_segment_sections = data_segment_info.segment_sections;
-        let data_segment_size = data_segment_info.segment_size;
-        let command_size =
-            size_of::<SegmentCommand>() + size_of::<SectionEntry>() * data_segment_sections.len();
-        let (data_segment, data_sections) = split_segment_command_buffer(
-            load_commands
-                .split_off_mut(..command_size)
-                .ok_or_else(|| load_cmd_err(()))?,
-            data_segment_sections.len(),
-        )?;
-        write_segment(
-            SEG_DATA,
-            macho::VM_PROT_READ | macho::VM_PROT_WRITE,
-            data_segment,
-            data_segment_size.file_offset as u64,
-            data_segment_size.file_size as u64,
-            data_segment_size.mem_offset,
-            data_segment_size.mem_size,
-            data_segment_sections.len(),
-            SegmentFlags::default(),
-        );
-        write_sections(
-            SEG_DATA,
-            num_stub_slots,
-            data_sections,
-            &data_segment_sections,
-        )?;
-    }
-
     if let Some(data_const_segment_info) =
         get_segment_sections(layout, SegmentType::DataConstSections)
     {
@@ -857,6 +827,36 @@ fn write_segment_commands(layout: &MachOLayout, load_commands: &mut &mut [u8]) -
             num_stub_slots,
             data_const_sections,
             &data_const_segment_sections,
+        )?;
+    }
+
+    if let Some(data_segment_info) = get_segment_sections(layout, SegmentType::DataSections) {
+        let data_segment_sections = data_segment_info.segment_sections;
+        let data_segment_size = data_segment_info.segment_size;
+        let command_size =
+            size_of::<SegmentCommand>() + size_of::<SectionEntry>() * data_segment_sections.len();
+        let (data_segment, data_sections) = split_segment_command_buffer(
+            load_commands
+                .split_off_mut(..command_size)
+                .ok_or_else(|| load_cmd_err(()))?,
+            data_segment_sections.len(),
+        )?;
+        write_segment(
+            SEG_DATA,
+            macho::VM_PROT_READ | macho::VM_PROT_WRITE,
+            data_segment,
+            data_segment_size.file_offset as u64,
+            data_segment_size.file_size as u64,
+            data_segment_size.mem_offset,
+            data_segment_size.mem_size,
+            data_segment_sections.len(),
+            SegmentFlags::default(),
+        );
+        write_sections(
+            SEG_DATA,
+            num_stub_slots,
+            data_sections,
+            &data_segment_sections,
         )?;
     }
 
@@ -3133,10 +3133,16 @@ fn write_fixup_chains(
         let last_offset =
             segment.sites.last().expect("checked above").address - segment.sizes.mem_offset;
 
-        // `page_count` is just the length of the `page_start` array, so it has to reach the last
-        // page that has a fixup on it. Covering the whole segment as well matches what ld64 does.
-        let page_count =
-            (last_offset / page_size + 1).max(segment.sizes.mem_size.div_ceil(page_size));
+        // `page_count` is more than the length of the `page_start` array: dyld sizes the segment's
+        // kernel page-in linking region as `page_count * page_size` of *file* content ("in case
+        // some pages don't have fixups, don't use segment size" - Loader.cpp). Counting the
+        // segment's memory pages instead claims file bytes past the segment's own - zerofill takes
+        // up memory but no file - so the kernel pages the next segment's bytes in where zeroes
+        // belong, and applies this segment's (empty) fixup view to a file page the next segment
+        // also owns, losing that page's fixups. Only the file-backed pages may be counted; a fixup
+        // can't live in zerofill anyway, because a fixup is file content.
+        let page_count = (last_offset / page_size + 1)
+            .max((segment.sizes.file_size as u64).div_ceil(page_size));
         segment.page_starts = vec![DYLD_CHAINED_PTR_START_NONE; usize::try_from(page_count)?];
 
         for (i, site) in segment.sites.iter().enumerate() {
@@ -4019,8 +4025,8 @@ fn build_section_index_map(layout: &MachOLayout<'_>) -> Result<OutputSectionMap<
 
     for segment_type in [
         SegmentType::TextSections,
-        SegmentType::DataSections,
         SegmentType::DataConstSections,
+        SegmentType::DataSections,
     ] {
         let Some(info) = get_segment_sections(layout, segment_type) else {
             continue;

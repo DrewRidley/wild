@@ -1652,8 +1652,15 @@ pub(crate) enum SegmentType {
     Text,
     LoadCommands,
     TextSections,
-    DataSections,
+    // `__DATA_CONST` comes before `__DATA`, as ld64 places it. The order matters for more than
+    // fidelity: `__DATA` ends in zerofill, which occupies memory but not file, so any segment
+    // after it sits at a file offset lower than its memory offset says. dyld's kernel page-in
+    // linking sizes each segment's file claim by its *memory* footprint, so the segment after the
+    // zerofill starts inside the file range the kernel attributes to `__DATA` - and the fixups on
+    // the contested page are silently never applied. Keeping every fixup-bearing segment ahead of
+    // the zerofill keeps file and memory offsets congruent where it counts.
     DataConstSections,
+    DataSections,
     LinkeditSections,
     // The other ELF-specific (or unused) parts/sections will be collected here.
     #[default]
@@ -3051,6 +3058,11 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::SWIFT_CONSTG);
         builder.add_section(output_section_id::SWIFT_MODHASH);
         builder.add_section(output_section_id::PLT_GOT);
+        // The `__DATA_CONST` sections go before `__DATA`'s: the zerofill at the end of `__DATA`
+        // must not sit between the file's start and any segment carrying chained fixups - see
+        // `SegmentType` for what goes wrong when it does.
+        builder.add_section(output_section_id::GOT);
+        builder.add_section(output_section_id::CONST);
         builder.add_section(output_section_id::DATA);
         builder.add_section(output_section_id::INIT_ARRAY);
         builder.add_section(output_section_id::FINI_ARRAY);
@@ -3072,8 +3084,6 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::TBSS);
         builder.add_section(output_section_id::COMMON);
         builder.add_section(output_section_id::BSS);
-        builder.add_section(output_section_id::GOT);
-        builder.add_section(output_section_id::CONST);
         // The rest (e.g. symbol table, string table).
         builder.add_section(output_section_id::STRTAB);
         builder.add_section(output_section_id::CHAINED_FIXUP_TABLE);
@@ -3796,11 +3806,11 @@ pub(crate) const PROGRAM_SEGMENT_DEFS: &[ProgramSegmentDef] = &[
         count_as_segment: false,
     },
     ProgramSegmentDef {
-        segment_type: SegmentType::DataSections,
+        segment_type: SegmentType::DataConstSections,
         count_as_segment: true,
     },
     ProgramSegmentDef {
-        segment_type: SegmentType::DataConstSections,
+        segment_type: SegmentType::DataSections,
         count_as_segment: true,
     },
     ProgramSegmentDef {
