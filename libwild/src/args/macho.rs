@@ -8,6 +8,7 @@ use crate::bail;
 use crate::ensure;
 use crate::error::Context;
 use crate::error::Result;
+use crate::file_writer::FileWriteMode;
 use crate::platform;
 use crate::platform::Args;
 use itertools::Itertools;
@@ -370,6 +371,15 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
             .join("\n");
 
         bail!("{described}");
+    }
+
+    // A signed image written through a mapping has to be flushed with `msync(MS_INVALIDATE)` once
+    // its signature is in (see `write_code_signature_hashes`), and that call costs more than the
+    // hashing it follows - 8-19ms on a 65MB output, against 1.5ms to hash it. Building the image in
+    // memory and writing it out once needs no flush, so that's the default on macOS. An explicit
+    // `--mmap-output-file` still gets a mapping.
+    if cfg!(target_os = "macos") && args.common.file_write_mode.is_none() {
+        args.common.file_write_mode = Some(FileWriteMode::BufferThenWrite);
     }
 
     // `-all_load` isn't positional the way `--whole-archive` is - it says every archive in the
