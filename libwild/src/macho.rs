@@ -2936,7 +2936,7 @@ impl platform::Platform for MachO {
                 + 1
                 + debug_info.file_name.len()
                 + 1
-                + state.input.debug_map_path().as_os_str().len()
+                + crate::macho_debug_map::object_path(&state.input, symbol_db.args).len()
                 + 1;
 
             for ((sym_index, sym), flags) in state

@@ -3885,12 +3885,12 @@ fn write_debug_map<'data>(
 
     // The object itself, and when it was written. `dsymutil` opens this path to read the DWARF, and
     // compares the timestamp against the file it finds to know whether it is still the right one.
-    let object_path = object.input.debug_map_path();
+    let object_path = crate::macho_debug_map::object_path(&object.input, layout.args());
     stab(
         symbol_writer,
         buffers,
         N_OSO,
-        object_path.as_os_str().as_encoded_bytes(),
+        &object_path,
         0,
         1,
         object.input.modification_time_seconds(),

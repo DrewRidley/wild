@@ -60,6 +60,9 @@ pub struct MachOArgs {
     pub(crate) stack_size: Option<u64>,
     /// Where to write an account of what ended up where, from `-map`.
     pub(crate) map_path: Option<Box<Path>>,
+    /// A directory to strip from the front of each object path in the debug map, from
+    /// `-oso_prefix`, so the map doesn't depend on where the build happened.
+    pub(crate) oso_prefix: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +206,7 @@ impl Default for MachOArgs {
             bundle: false,
             stack_size: None,
             map_path: None,
+            oso_prefix: None,
         }
     }
 }
@@ -707,6 +711,24 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
 
     parser
         .declare_with_param()
+        .long("oso_prefix")
+        .help("Strip a directory from the object paths in the debug map")
+        .execute(|args, _modifier_stack, value| {
+            // `.` is ld64's spelling for the directory the link is run from, and with a trailing
+            // separator so what's left of a path under it is relative.
+            let prefix = if value == "." {
+                std::env::current_dir()
+                    .context("-oso_prefix . needs the current directory")?
+                    .join("")
+            } else {
+                PathBuf::from(value)
+            };
+            args.oso_prefix = Some(prefix);
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
         .long("map")
         .help("Write an account of what ended up where")
         .execute(|args, _modifier_stack, value| {
@@ -958,6 +980,23 @@ mod tests {
                 .any(|p| p.as_ref() == Path::new("/bar/lib"))
         );
         assert_eq!(args.plugin_path, Some("/foo/bar/libLTO.dylib".to_owned()));
+    }
+
+    #[test]
+    fn test_oso_prefix() {
+        let mut args = MachOArgs::new().unwrap();
+        args.parse(["-oso_prefix", "/build/root", "-o", "a.out"].iter())
+            .unwrap();
+        assert_eq!(args.oso_prefix.as_deref(), Some(Path::new("/build/root")));
+
+        // `.` means the directory the link runs from.
+        let mut args = MachOArgs::new().unwrap();
+        args.parse(["-oso_prefix", ".", "-o", "a.out"].iter())
+            .unwrap();
+        assert_eq!(
+            args.oso_prefix.as_deref(),
+            Some(std::env::current_dir().unwrap().join("").as_path())
+        );
     }
 
     #[test]

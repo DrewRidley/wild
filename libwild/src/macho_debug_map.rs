@@ -103,6 +103,24 @@ pub(crate) fn read_object_debug_info<'data>(
     }))
 }
 
+/// The bytes to write in an object's `N_OSO` stab: where the object is, less the `-oso_prefix` if
+/// the path starts with it. Like ld64 this is a plain prefix match on the text, not on path
+/// components, so `-oso_prefix /a/b` turns `/a/b/c.o` into `/c.o` and only `/a/b/` gives `c.o`. One
+/// function, because the writer and the symbol table sizing have to produce the same bytes.
+pub(crate) fn object_path(
+    input: &crate::input_data::InputRef<'_>,
+    args: &crate::args::macho::MachOArgs,
+) -> Vec<u8> {
+    let path = input.debug_map_path().into_os_string().into_encoded_bytes();
+    match &args.oso_prefix {
+        Some(prefix) => match path.strip_prefix(prefix.as_os_str().as_encoded_bytes()) {
+            Some(rest) => rest.to_vec(),
+            None => path,
+        },
+        None => path,
+    }
+}
+
 /// Translates a DWARF section name to the way Mach-O spells it: `.debug_info` is `__debug_info`,
 /// and the segment it sits in isn't part of the name we match on.
 fn debug_section_name(id: gimli::SectionId) -> &'static str {
