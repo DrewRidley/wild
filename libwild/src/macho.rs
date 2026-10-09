@@ -46,6 +46,7 @@ use crate::value_flags::ValueFlags;
 use crate::verbose_timing_phase;
 use anyhow::Context;
 use itertools::Itertools;
+use linker_utils::elf::RelocationKind;
 use object::Endianness;
 use object::SymbolIndex;
 use object::macho;
@@ -4083,6 +4084,14 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
 
         let relocation = A::relocation_from_raw(rel_info)?;
         let mut flags_to_add = layout::resolution_flags(relocation.kind);
+
+        // The low half of an `adrp`/`add` pair addresses the symbol as surely as the high half
+        // does, but its kind asks for nothing, so it would send a load request without marking the
+        // symbol as requested - and the high half would send another. Loading a section twice is
+        // harmless; allocating a common symbol twice is not.
+        if relocation.kind == RelocationKind::AbsoluteLowPart {
+            flags_to_add |= ValueFlags::DIRECT;
+        }
 
         // The GOT-load relocations are written in a GOT-addressing form but don't require the slot
         // to exist - if the symbol's address is known at link time, `relax_got_load` rewrites the
