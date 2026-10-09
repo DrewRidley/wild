@@ -3795,9 +3795,9 @@ fn write_symbols<'data>(
         };
 
         let mut value = 0;
-        let (section, symbol_type, desc) =
+        let defining_section =
             if let Some(section_index) = object.object.symbol_section(sym, sym_index)? {
-                let section_id = match &object.sections[section_index.0] {
+                Some(match &object.sections[section_index.0] {
                     // A symbol in a merged section still belongs to the section it came from; only
                     // its offset within the output moved, and the resolution already accounts for
                     // that.
@@ -3808,27 +3808,41 @@ fn write_symbols<'data>(
                         "Tried to copy a symbol in a section we didn't load. {}",
                         layout.symbol_debug(symbol_id)
                     ),
-                };
-                let primary_id = layout.output_sections.primary_output_section(section_id);
-                let mut n_type = sym.n_type.with_type(N_SECT);
-                if crate::macho::is_unexported(&layout.symbol_db, info.name) {
-                    n_type = object::macho::SymbolFlags(n_type.0 & !macho::N_EXT.0);
-                }
-                let n_sect = *symbol_writer.section_indices.get(primary_id);
-                ensure!(
-                    n_sect != 0,
-                    "No Mach-O section index for {} while writing {}",
-                    primary_id,
-                    layout.symbol_debug(symbol_id)
-                );
-                let n_desc = sym.n_desc.get(LE);
-                (n_sect, n_type, n_desc)
-            } else if sym.is_absolute() {
-                let n_desc = sym.n_desc.get(LE);
-                (0, sym.n_type.with_type(N_ABS), n_desc)
+                })
+            } else if sym.as_common().is_some() {
+                // No section in the input, but the output gave it room in `__common`.
+                Some(output_section_id::COMMON)
             } else {
-                bail!("Attempted to output a Mach-O symtab entry with an unexpected section type")
+                None
             };
+
+        let (section, symbol_type, desc) = if let Some(section_id) = defining_section {
+            let primary_id = layout.output_sections.primary_output_section(section_id);
+            let mut n_type = sym.n_type.with_type(N_SECT);
+            if crate::macho::is_unexported(&layout.symbol_db, info.name) {
+                n_type = object::macho::SymbolFlags(n_type.0 & !macho::N_EXT.0);
+            }
+            let n_sect = *symbol_writer.section_indices.get(primary_id);
+            ensure!(
+                n_sect != 0,
+                "No Mach-O section index for {} while writing {}",
+                primary_id,
+                layout.symbol_debug(symbol_id)
+            );
+            // The descriptor of a common symbol holds its alignment, which means something
+            // else for a defined one.
+            let n_desc = if sym.as_common().is_some() {
+                object::macho::SymbolDesc(0)
+            } else {
+                sym.n_desc.get(LE)
+            };
+            (n_sect, n_type, n_desc)
+        } else if sym.is_absolute() {
+            let n_desc = sym.n_desc.get(LE);
+            (0, sym.n_type.with_type(N_ABS), n_desc)
+        } else {
+            bail!("Attempted to output a Mach-O symtab entry with an unexpected section type")
+        };
 
         if let Some(res) = layout.local_symbol_resolution(symbol_id) {
             value = res.value_for_symbol_table();

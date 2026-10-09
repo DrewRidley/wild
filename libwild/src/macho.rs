@@ -54,6 +54,7 @@ use object::macho::N_ABS;
 use object::macho::N_EXT;
 use object::macho::N_PEXT;
 use object::macho::N_SECT;
+use object::macho::N_UNDF;
 use object::macho::N_WEAK_DEF;
 use object::macho::SEG_LINKEDIT;
 use object::macho::Section64;
@@ -1504,12 +1505,31 @@ impl platform::SectionFlags for SectionFlags {
 // Documentation link for Nlist64 type: https://leopard-adc.pepas.com/documentation/DeveloperTools/Conceptual/MachORuntime/Reference/reference.html
 impl platform::Symbol for SymtabEntry {
     fn as_common(&self) -> Option<platform::CommonSymbol> {
-        // TODO
-        None
+        // A common symbol is an external undefined one with a value, which is its size - an
+        // undefined symbol has no use for a value otherwise. Its alignment is a power of two held
+        // in four bits of the descriptor.
+        let size = self.n_value.get(LE);
+        if self.n_type.is_stab()
+            || self.n_type.typ() != N_UNDF
+            || !self.n_type.contains(N_EXT)
+            || size == 0
+        {
+            return None;
+        }
+
+        let alignment =
+            Alignment::from_exponent(u32::from(self.n_desc.get(LE).common_alignment())).ok()?;
+
+        Some(platform::CommonSymbol {
+            size: alignment.align_up(size),
+            part_id: output_section_id::COMMON.part_id_with_alignment(alignment),
+        })
     }
 
     fn is_undefined(&self) -> bool {
-        Nlist::is_undefined(self)
+        // A common symbol is spelled as an undefined one, but it is a definition: nothing needs
+        // to be imported to find it.
+        Nlist::is_undefined(self) && self.as_common().is_none()
     }
 
     fn is_local(&self) -> bool {
@@ -1539,8 +1559,13 @@ impl platform::Symbol for SymtabEntry {
     fn size(&self) -> u64 {
         // An nlist entry records where a symbol starts but not how far it extends - the size is
         // implied by where the next symbol begins. Nothing needs it yet; dead stripping will, since
-        // it is what bounds the region a symbol keeps alive.
-        0
+        // it is what bounds the region a symbol keeps alive. A common symbol is the exception: it
+        // has no start, and says how big it is instead.
+        if self.as_common().is_some() {
+            self.n_value.get(LE)
+        } else {
+            0
+        }
     }
 
     fn has_name(&self) -> bool {
