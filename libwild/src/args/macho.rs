@@ -65,6 +65,7 @@ pub struct MachOArgs {
     /// A directory to strip from the front of each object path in the debug map, from
     /// `-oso_prefix`, so the map doesn't depend on where the build happened.
     pub(crate) oso_prefix: Option<PathBuf>,
+    pub(crate) allow_multiple_definitions: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +210,7 @@ impl Default for MachOArgs {
             stack_size: None,
             map_path: None,
             oso_prefix: None,
+            allow_multiple_definitions: false,
         }
     }
 }
@@ -343,6 +345,10 @@ impl platform::Args for MachOArgs {
     fn is_ignored_flag(&self, flag: &str) -> bool {
         IGNORED_FLAGS.contains(&flag)
     }
+
+    fn allow_multiple_definitions(&self) -> bool {
+        self.allow_multiple_definitions
+    }
 }
 
 // Parse the supplied input arguments, which should not include the program name.
@@ -401,6 +407,16 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
 // variants.
 fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
     let mut parser = ArgumentParser::<MachOArgs>::new();
+
+    parser
+        .declare()
+        .long("allow-multiple-definition")
+        .short("allow-multiple-definition")
+        .help("Allow multiple definitions")
+        .execute(|args, _modifier_stack| {
+            args.allow_multiple_definitions = true;
+            Ok(())
+        });
 
     parser
         .declare_with_param()
