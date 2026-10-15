@@ -3987,6 +3987,69 @@ where
         timing_phase!("Finalize Wasm indirect function table");
         finalize_indirect_function_table(&mut layout, &layout_inputs)?;
     }
+    if let Ok(map_path) = std::env::var("WILD_HOTPATCH_MAP") {
+        for mem in &mut layout.memories {
+            mem.initial = mem.initial.max(1024);
+        }
+        if !layout.tables.is_empty() && !export_name_exists(&layout.exports, "__indirect_function_table") {
+            layout.exports.push(OutputExport {
+                name: "__indirect_function_table",
+                kind: wasmparser::ExternalKind::Table,
+                index: 0,
+            });
+        }
+        if let Some(sp_global) = indices.stack_pointer_global {
+            push_global_export(&mut layout.exports, "__stack_pointer", sp_global);
+        }
+        let mut table_slots_json = Vec::new();
+        let mut data_addrs_json = Vec::new();
+        for (obj_idx, input) in layout_inputs.iter().enumerate() {
+            let index_map = &layout.object_index_maps[obj_idx];
+            for (sym_idx, sym) in input.symbols.iter().enumerate() {
+                if sym.is_undefined() || sym.is_local() {
+                    continue;
+                }
+                let symbol_id = input.symbol_id_range.offset_to_id(sym_idx);
+                if symbol_db.definition(symbol_id) != symbol_id {
+                    continue;
+                }
+                let Ok(sym_name_bytes) = symbol_db.symbol_name(symbol_id) else {
+                    continue;
+                };
+                let Ok(name) = core::str::from_utf8(sym_name_bytes.bytes()) else {
+                    continue;
+                };
+                if sym.kind == WasmSymbolKind::Func {
+                    if let Ok(func_out) =
+                        remap_wasm_index(&index_map.function_indices, sym.index, "function")
+                    {
+                        if let Some(orig) = name.strip_prefix("__rustd_impl_") {
+                            if let Some(&slot) = layout.function_table_slots.get(func_out as usize)
+                                && slot != u32::MAX
+                            {
+                                table_slots_json.push(format!("\"{orig}\":{slot}"));
+                            }
+                        } else if !name.contains("wbindgen")
+                            && !name.contains("wasm_bindgen")
+                            && !name.contains("__wbg")
+                        {
+                            push_function_export(&mut layout.exports, name, func_out);
+                        }
+                    }
+                } else if sym.kind == WasmSymbolKind::Data
+                    && let Some(&addr) = index_map.data_addresses.get(sym_idx)
+                {
+                    data_addrs_json.push(format!("\"{name}\":{addr}"));
+                }
+            }
+        }
+        let json = format!(
+            "{{\"table_slots\":{{{}}},\"data_addrs\":{{{}}}}}\n",
+            table_slots_json.join(","),
+            data_addrs_json.join(",")
+        );
+        let _ = std::fs::write(map_path, json);
+    }
     layout.encode_metadata_sections(
         &layout_inputs,
         &indices,
