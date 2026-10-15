@@ -3570,6 +3570,8 @@ fn ensure_entry_export<'data>(
 /// Export symbols requested via `--export`.
 fn ensure_force_exports<'data>(
     exports: &mut Vec<OutputExport<'data>>,
+    globals: &mut Vec<OutputGlobal<'data>>,
+    num_imported_globals: u32,
     layout_inputs: &[WasmObjectLayoutInput<'data>],
     object_index_maps: &[WasmObjectIndexMap],
     symbol_db: &SymbolDb<'data, Wasm>,
@@ -3592,7 +3594,8 @@ fn ensure_force_exports<'data>(
             bail!("symbol exported via --export not found: {name}");
         };
         let def_input = &layout_inputs[def_obj_idx];
-        let def_sym = &def_input.symbols[def_input.symbol_id_range.id_to_offset(def_id)];
+        let sym_offset = def_input.symbol_id_range.id_to_offset(def_id);
+        let def_sym = &def_input.symbols[sym_offset];
         if def_sym.is_undefined() {
             bail!("symbol exported via --export not found: {name}");
         }
@@ -3617,6 +3620,27 @@ fn ensure_force_exports<'data>(
             }
             WasmSymbolKind::Global => {
                 let index = remap_wasm_index(&index_map.global_indices, def_sym.index, "global")?;
+                push_global_export(exports, export_name, index);
+            }
+            WasmSymbolKind::Data => {
+                if export_name_exists(exports, export_name) {
+                    continue;
+                }
+                let address = *index_map
+                    .data_addresses
+                    .get(sym_offset)
+                    .context("missing Wasm data address for --export symbol definition")?;
+                let index = num_imported_globals
+                    .checked_add(u32::try_from(globals.len()).context("too many Wasm globals")?)
+                    .context("Wasm global index overflow")?;
+                globals.push(OutputGlobal {
+                    ty: GlobalType {
+                        content_type: wasmparser::ValType::I32,
+                        mutable: false,
+                        shared: false,
+                    },
+                    init_expr_body: Cow::Owned(encode_i32_const_body(address as i32)),
+                });
                 push_global_export(exports, export_name, index);
             }
             _ => {
@@ -3833,8 +3857,15 @@ where
             entry.as_ref(),
             indices.entry_wrapper_func,
         );
+        let num_imported_globals = layout
+            .imports
+            .iter()
+            .filter(|imp| matches!(imp.entity, crate::wasm_writer::OutputImportEntity::Global(_)))
+            .count() as u32;
         ensure_force_exports(
             &mut layout.exports,
+            &mut layout.globals,
+            num_imported_globals,
             &layout_inputs,
             &layout.object_index_maps,
             symbol_db,
