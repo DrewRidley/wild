@@ -1779,6 +1779,7 @@ impl<'data> WasmLayout<'data> {
         &mut self,
         layout_inputs: &[WasmObjectLayoutInput<'data>],
         indices: &LinkerDefinedIndices,
+        strip_all: bool,
     ) -> Result {
         timing_phase!("Encode Wasm metadata sections");
         let type_section = crate::wasm_writer::build_type_section(&self.output_types)?;
@@ -1823,8 +1824,36 @@ impl<'data> WasmLayout<'data> {
             self.encoded_sections.element = Some(encode_wasm_section(&element_section));
         }
 
-        if let Some(name_section) = build_name_section(self, layout_inputs, indices) {
-            self.encoded_sections.name = Some(encode_wasm_section(&name_section));
+        let mut trailing_custom_bytes = Vec::new();
+        if !strip_all
+            && let Some(name_section) = build_name_section(self, layout_inputs, indices)
+        {
+            wasm_encoder::Section::append_to(&name_section, &mut trailing_custom_bytes);
+        }
+
+        let mut custom_order: Vec<&'data str> = Vec::new();
+        let mut custom_payloads: HashMap<&'data str, Vec<u8>> = HashMap::new();
+        for input in layout_inputs {
+            for &(name, payload) in &input.custom_sections {
+                if let Some(buf) = custom_payloads.get_mut(name) {
+                    buf.extend_from_slice(payload);
+                } else {
+                    custom_order.push(name);
+                    custom_payloads.insert(name, payload.to_vec());
+                }
+            }
+        }
+        for name in custom_order {
+            if let Some(data) = custom_payloads.get(name) {
+                let custom = wasm_encoder::CustomSection {
+                    name: Cow::Borrowed(name),
+                    data: Cow::Borrowed(data),
+                };
+                wasm_encoder::Section::append_to(&custom, &mut trailing_custom_bytes);
+            }
+        }
+        if !trailing_custom_bytes.is_empty() {
+            self.encoded_sections.name = Some(trailing_custom_bytes);
         }
 
         self.code_section_size = compute_code_section_size(&self.function_bodies);
@@ -2278,6 +2307,7 @@ struct WasmObjectLayoutInput<'data> {
     data_relocations: Vec<WasmRelocation>,
     symbols: Vec<WasmSymbol>,
     init_funcs: Vec<WasmInitFunc>,
+    custom_sections: Vec<(&'data str, &'data [u8])>,
     symbol_id_range: crate::symbol_db::SymbolIdRange,
     file_id: crate::input_data::FileId,
 }
@@ -2451,6 +2481,40 @@ impl<'data> WasmObjectLayoutInput<'data> {
             }
         }
 
+        let mut custom_sections = Vec::new();
+        for header in &file.sections {
+            if !header.is_custom() {
+                continue;
+            }
+            let Some(name_range) = &header.name_range else {
+                continue;
+            };
+            let Some(name_bytes) = file
+                .data
+                .get(name_range.start as usize..name_range.end as usize)
+            else {
+                continue;
+            };
+            let Ok(name) = core::str::from_utf8(name_bytes) else {
+                continue;
+            };
+            if name == LINKING_SECTION_NAME
+                || name.starts_with(RELOC_SECTION_PREFIX)
+                || name == TARGET_FEATURES_SECTION_NAME
+                || name == "name"
+                || name == "producers"
+                || is_debug_section_name(name_bytes)
+            {
+                continue;
+            }
+            if let Some(payload) = file
+                .data
+                .get(name_range.end as usize..header.payload_range.end as usize)
+            {
+                custom_sections.push((name, payload));
+            }
+        }
+
         Ok(Self {
             data: file.data,
             types,
@@ -2470,6 +2534,7 @@ impl<'data> WasmObjectLayoutInput<'data> {
             data_relocations,
             symbols: file.symbols.clone(),
             init_funcs: file.init_funcs.clone(),
+            custom_sections,
             symbol_id_range,
             file_id,
         })
@@ -2535,6 +2600,9 @@ impl<'data> WasmObjectLayoutInput<'data> {
                         },
                     });
                 }
+                ImportResolution::SharedImport(output_function_index) => {
+                    index_map.function_indices.push(output_function_index);
+                }
                 ImportResolution::LinkerDefined(known) => {
                     let index = indices.function_index(known).ok_or_else(|| {
                         crate::error!("missing reserved Wasm function for {known:?}")
@@ -2578,6 +2646,9 @@ impl<'data> WasmObjectLayoutInput<'data> {
                         name: import.name,
                         entity: OutputImportEntity::Global(import.ty),
                     });
+                }
+                ImportResolution::SharedImport(output_global_index) => {
+                    index_map.global_indices.push(output_global_index);
                 }
                 ImportResolution::LinkerDefined(known) => {
                     let index = indices.global_index(known).ok_or_else(|| {
@@ -2676,6 +2747,8 @@ impl<'data> WasmObjectLayoutInput<'data> {
 enum ImportResolution {
     /// The import was not resolved; keep it in the output import section.
     Unresolved,
+    /// Deduplicated to an earlier unresolved import at the given output import index.
+    SharedImport(u32),
     /// The import was resolved to a defined function in `object_index` at local defined-function
     /// position `local_defined_index`.
     ResolvedFunction {
@@ -2722,7 +2795,7 @@ fn resolve_cross_object_imports<'data>(
         .map(|(i, input)| (input.file_id, i))
         .collect();
 
-    inputs
+    let mut resolutions: Vec<ObjectImportResolutions> = inputs
         .par_iter()
         .map(|input| {
             verbose_timing_phase!("Resolve Wasm object imports");
@@ -2749,7 +2822,44 @@ fn resolve_cross_object_imports<'data>(
                 unresolved_global_count,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut seen_func_imports: HashMap<(&'data str, &'data str, &FuncType), u32> = HashMap::new();
+    let mut next_func_import = 0u32;
+    let mut seen_global_imports: HashMap<(&'data str, &'data str, GlobalType), u32> = HashMap::new();
+    let mut next_global_import = 0u32;
+
+    for (input, res) in inputs.iter().zip(resolutions.iter_mut()) {
+        for (i, r) in res.function_resolutions.iter_mut().enumerate() {
+            if !matches!(r, ImportResolution::Unresolved) {
+                continue;
+            }
+            let imp = &input.function_imports[i];
+            let sig = &input.types[imp.type_index as usize];
+            if let Some(&existing) = seen_func_imports.get(&(imp.module, imp.name, sig)) {
+                *r = ImportResolution::SharedImport(existing);
+                res.unresolved_function_count -= 1;
+            } else {
+                seen_func_imports.insert((imp.module, imp.name, sig), next_func_import);
+                next_func_import += 1;
+            }
+        }
+        for (i, r) in res.global_resolutions.iter_mut().enumerate() {
+            if !matches!(r, ImportResolution::Unresolved) {
+                continue;
+            }
+            let imp = &input.global_imports[i];
+            if let Some(&existing) = seen_global_imports.get(&(imp.module, imp.name, imp.ty)) {
+                *r = ImportResolution::SharedImport(existing);
+                res.unresolved_global_count -= 1;
+            } else {
+                seen_global_imports.insert((imp.module, imp.name, imp.ty), next_global_import);
+                next_global_import += 1;
+            }
+        }
+    }
+
+    Ok(resolutions)
 }
 
 fn resolve_import_symbols<'data>(
@@ -3877,7 +3987,11 @@ where
         timing_phase!("Finalize Wasm indirect function table");
         finalize_indirect_function_table(&mut layout, &layout_inputs)?;
     }
-    layout.encode_metadata_sections(&layout_inputs, &indices)?;
+    layout.encode_metadata_sections(
+        &layout_inputs,
+        &indices,
+        symbol_db.args.should_strip_all(),
+    )?;
     Ok(layout)
 }
 

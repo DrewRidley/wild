@@ -44,6 +44,8 @@ pub struct WasmArgs {
     pub(crate) stack_first: bool,
     // Entry symbol name. Defaults to `DEFAULT_ENTRY`.
     pub(crate) entry: Option<String>,
+    pub(crate) strip_all: bool,
+    pub(crate) strip_debug: bool,
 }
 
 impl WasmArgs {
@@ -64,6 +66,8 @@ impl Default for WasmArgs {
             z_stack_size: DEFAULT_STACK_SIZE,
             stack_first: true,
             entry: Some(DEFAULT_ENTRY.to_owned()),
+            strip_all: false,
+            strip_debug: false,
         }
     }
 }
@@ -78,11 +82,11 @@ impl platform::Args for WasmArgs {
     }
 
     fn should_strip_debug(&self) -> bool {
-        todo!()
+        self.strip_debug || self.strip_all
     }
 
     fn should_strip_all(&self) -> bool {
-        false
+        self.strip_all
     }
 
     fn entry_point<'a>(
@@ -270,6 +274,26 @@ fn setup_argument_parser() -> ArgumentParser<WasmArgs> {
         .help("Place stack at the end of linear memory after data")
         .execute(|args, _modifier_stack| {
             args.stack_first = false;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("strip-all")
+        .short("s")
+        .help("Strip all symbols")
+        .execute(|args, _modifier_stack| {
+            args.strip_all = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("strip-debug")
+        .short("S")
+        .help("Strip debug symbols")
+        .execute(|args, _modifier_stack| {
+            args.strip_debug = true;
             Ok(())
         });
 
