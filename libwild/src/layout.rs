@@ -614,6 +614,11 @@ fn update_dynamic_symbol_resolutions<'data, P: Platform>(
 ) {
     timing_phase!("Update dynamic symbol resolutions");
 
+    // Nothing to number where exports aren't reached by index.
+    if !P::HAS_DYNAMIC_SYMBOL_TABLE {
+        return;
+    }
+
     let Some(FileLayout::Epilogue(epilogue)) = layouts.last().and_then(|g| g.files.last()) else {
         panic!("Epilogue should be the last file");
     };
@@ -775,6 +780,16 @@ pub(crate) struct SymbolResolutions<P: Platform> {
 impl<P: Platform> SymbolResolutions<P> {
     pub(crate) fn get(&self, symbol_id: SymbolId) -> Option<&Resolution<P>> {
         self.resolutions[symbol_id.as_usize()].as_ref()
+    }
+
+    /// Returns every symbol that got a resolution, paired with its ID.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (SymbolId, &Resolution<P>)> {
+        self.resolutions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, resolution)| {
+                Some((SymbolId::from_usize(index), resolution.as_ref()?))
+            })
     }
 }
 
@@ -1201,11 +1216,32 @@ impl<'data, P: Platform> SymbolRequestHandler<'data, P> for SyntheticSymbolsLayo
         _common: &mut CommonGroupState<'data, P>,
         symbol_id: SymbolId,
         resources: &'scope GraphResources<'data, 'scope, P>,
-        _queue: &mut LocalWorkQueue,
+        queue: &mut LocalWorkQueue,
         scope: &Scope<'scope>,
     ) -> Result {
         let def_info =
             &self.internal_symbols.symbol_definitions[self.symbol_id_range.id_to_offset(symbol_id)];
+
+        // A platform-specific symbol can stand for code that refers to another symbol - a Mach-O
+        // `_objc_msgSend$selector` trampoline tail-calls `_objc_msgSend` through the GOT - so
+        // loading it is a reference to that one too, which nothing in the inputs makes. The
+        // request is what has the library it comes from record the import and bind the slot.
+        if let SymbolPlacement::PlatformSpecific(_) = def_info.placement
+            && let Some(dependency) = P::dependency_of_undefined(def_info.name)
+            && let Some(dependency_id) = resources
+                .symbol_db
+                .get_unversioned(&UnversionedSymbolName::prehashed(dependency))
+        {
+            let dependency_id = resources.symbol_db.definition(dependency_id);
+            let previous_flags = resources
+                .per_symbol_flags
+                .get_atomic(dependency_id)
+                .fetch_or(ValueFlags::GOT | ValueFlags::GOT_ENTRY_REQUIRED);
+
+            if !previous_flags.has_resolution() {
+                queue.send_symbol_request::<A>(dependency_id, resources, scope);
+            }
+        }
 
         if let Some(output_section_id) = def_info.section_id() {
             // We've gotten a request to load a __start_ / __stop_ symbol, sent requests to load all
@@ -2566,6 +2602,28 @@ impl LocalWorkQueue {
         );
     }
 
+    /// Requests that a section be loaded, for a reference that names the section itself rather than
+    /// a symbol in it.
+    ///
+    /// Mach-O reaches a landing pad this way: a `__compact_unwind` entry names its
+    /// language-specific data area by section and offset, there being no symbol there to name.
+    /// Without this the table would be dropped as unreachable and unwinding would run off the
+    /// end of it.
+    pub(crate) fn send_section_request<'data, 'scope, A: Arch>(
+        &mut self,
+        file_id: FileId,
+        section_index: SectionIndex,
+        resources: &'scope GraphResources<'data, '_, A::Platform>,
+        scope: &Scope<'scope>,
+    ) {
+        self.send_work::<A>(
+            resources,
+            file_id,
+            WorkItem::LoadSection(SectionLoadRequest::new(file_id, section_index)),
+            scope,
+        );
+    }
+
     pub(crate) fn send_copy_relocation_request<'data, 'scope, A: Arch>(
         &mut self,
         symbol_id: SymbolId,
@@ -3664,6 +3722,21 @@ fn create_internal_symbol_resolution<'data, P: Platform>(
         return None;
     }
 
+    let flags = resources
+        .symbol_db
+        .flags_for_symbol(resources.per_symbol_flags, symbol_id);
+
+    // A platform-specific symbol is the platform's to resolve: its address is wherever the
+    // platform puts the thing it stands for, which nothing generic can know.
+    if let SymbolPlacement::PlatformSpecific(symbol) = def_info.placement {
+        return Some(P::platform_symbol_resolution(
+            symbol,
+            def_info.name,
+            flags,
+            memory_offsets,
+        ));
+    }
+
     let raw_value = match def_info.placement {
         SymbolPlacement::Undefined
         | SymbolPlacement::ForceUndefined
@@ -3709,9 +3782,7 @@ fn create_internal_symbol_resolution<'data, P: Platform>(
     };
 
     Some(P::create_resolution(
-        resources
-            .symbol_db
-            .flags_for_symbol(resources.per_symbol_flags, symbol_id),
+        flags,
         raw_value,
         None,
         memory_offsets,
@@ -3984,6 +4055,38 @@ fn new_dynamic_object_layout_state<'data, P: Platform>(
 }
 
 impl<'data, P: Platform> ObjectLayoutState<'data, P> {
+    /// Returns, for each section, whether every symbol it defines lost to a definition elsewhere.
+    ///
+    /// Such a section is a duplicate copy of something already being emitted, so its content is
+    /// dead however it was reached. A section defining no symbols at all is not one of these: it
+    /// has nothing to have lost with, and is reached section-relatively.
+    fn sections_defining_only_losers(&self, symbol_db: &SymbolDb<'data, P>) -> Result<Vec<bool>> {
+        let mut defines_any = vec![false; self.sections.len()];
+        let mut defines_winner = vec![false; self.sections.len()];
+
+        for (local_index, symbol) in self.object.enumerate_symbols() {
+            let Some(section_index) = self.object.symbol_section(symbol, local_index)? else {
+                continue;
+            };
+
+            let Some(defines_any) = defines_any.get_mut(section_index.0) else {
+                continue;
+            };
+            *defines_any = true;
+
+            let symbol_id = self.symbol_id_range.input_to_id(local_index);
+            if symbol_db.is_canonical(symbol_id) {
+                defines_winner[section_index.0] = true;
+            }
+        }
+
+        Ok(defines_any
+            .into_iter()
+            .zip(defines_winner)
+            .map(|(any, winner)| any && !winner)
+            .collect())
+    }
+
     #[inline(always)]
     fn activate<'scope, A: Arch<Platform = P>>(
         &mut self,
@@ -3997,6 +4100,19 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
         let mut riscv_attributes_section = None;
 
         let no_gc = !resources.symbol_db.args.should_gc_sections();
+
+        // With unreachable code being removed, a losing definition falls away on its own: nothing
+        // refers to it, so nothing loads it. With that turned off everything loads regardless, so
+        // on a format where the duplicates are ordinary content this is where they are dropped.
+        //
+        // A section is kept if any symbol it defines is the definition we settled on, and also if
+        // it defines none at all - content nothing names is reached by section-relative references
+        // rather than by symbol, and dropping it would take those with it.
+        let losing_sections = if no_gc && P::COALESCES_LOSING_DEFINITIONS {
+            Some(self.sections_defining_only_losers(resources.symbol_db)?)
+        } else {
+            None
+        };
 
         for (i, section) in self.sections.iter().enumerate() {
             match section {
@@ -4012,12 +4128,14 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
                 }
                 SectionSlot::Unloaded(sec) => {
                     if no_gc {
-                        queue
-                            .local_work
-                            .push(WorkItem::LoadSection(SectionLoadRequest::new(
-                                self.file_id,
-                                object::SectionIndex(i),
-                            )));
+                        if losing_sections.as_ref().is_none_or(|losers| !losers[i]) {
+                            queue
+                                .local_work
+                                .push(WorkItem::LoadSection(SectionLoadRequest::new(
+                                    self.file_id,
+                                    object::SectionIndex(i),
+                                )));
+                        }
                     } else if sec.start_stop_eligible {
                         let part_id = self.section_part_id(
                             object::SectionIndex(i),
@@ -4070,14 +4188,21 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
             .context("Cannot parse .riscv.attributes section")?;
         }
 
-        let export_all_dynamic = resources.symbol_db.output_kind == OutputKind::SharedObject
-            && (!self.input.has_archive_semantics()
-                || resources
-                    .symbol_db
-                    .args
-                    .should_export_dynamic(self.input.lib_name()))
-            || resources.symbol_db.output_kind.needs_dynsym()
-                && resources.symbol_db.args.should_export_all_dynamic_symbols();
+        // A list of symbols to export is a statement about what the output offers, and on formats
+        // where it narrows rather than adds, saying "export everything" over the top of it would
+        // hand out exactly what the list was written to withhold.
+        let restricted_by_export_list = resources.symbol_db.export_list.is_some()
+            && resources.symbol_db.args.export_list_restricts_exports();
+
+        let export_all_dynamic = !restricted_by_export_list
+            && (resources.symbol_db.output_kind == OutputKind::SharedObject
+                && (!self.input.has_archive_semantics()
+                    || resources
+                        .symbol_db
+                        .args
+                        .should_export_dynamic(self.input.lib_name()))
+                || resources.symbol_db.output_kind.needs_dynsym()
+                    && resources.symbol_db.args.should_export_all_dynamic_symbols());
         if export_all_dynamic
             || resources.symbol_db.output_kind.needs_dynsym()
                 && resources.symbol_db.export_list.is_some()
@@ -4664,6 +4789,16 @@ fn can_export_symbol<'data, P: Platform>(
         && let Some(export_list) = &resources.symbol_db.export_list
         && let Ok(symbol_name) = resources.symbol_db.symbol_name(symbol_id)
         && !&export_list.contains(&UnversionedSymbolName::prehashed(symbol_name.bytes()))
+    {
+        return false;
+    }
+
+    // A list of what to withhold applies whatever else would have offered the symbol, which is the
+    // whole of what it is for: everything is exported by default, so a list that only had a say
+    // when something else had already decided to export would never have one.
+    if let Some(unexport_list) = &resources.symbol_db.unexport_list
+        && let Ok(symbol_name) = resources.symbol_db.symbol_name(symbol_id)
+        && unexport_list.contains(&UnversionedSymbolName::prehashed(symbol_name.bytes()))
     {
         return false;
     }

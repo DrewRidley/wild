@@ -58,6 +58,16 @@ pub(crate) const LINK_EDIT_SEGMENT: PartId = PartId(34);
 pub(crate) const LOAD_COMMANDS: PartId = PartId(35);
 pub(crate) const CODE_SIGNATURE: PartId = PartId(36);
 pub(crate) const CHAINED_FIXUP_TABLE: PartId = PartId(37);
+pub(crate) const INDIRECT_SYMTAB: PartId = PartId(51);
+/// Mach-O `__TEXT,__unwind_info`, which we build from the `__LD,__compact_unwind` sections in the
+/// input rather than copying from them.
+pub(crate) const UNWIND_INFO: PartId = PartId(52);
+/// Mach-O `LC_DYLD_EXPORTS_TRIE`: the table dyld searches to find what a dylib exports.
+pub(crate) const EXPORT_TRIE: PartId = PartId(53);
+/// Mach-O `__TEXT,__objc_stubs`: the `_objc_msgSend$selector` trampolines the linker synthesizes.
+pub(crate) const OBJC_STUBS: PartId = PartId(54);
+/// Mach-O `__TEXT,__objc_methname`: the selector names those references point at.
+pub(crate) const OBJC_METHNAME: PartId = PartId(55);
 // Wasm specific sections. Each one corresponds to a single standard Wasm section.
 pub(crate) const WASM_TYPE: PartId = PartId(38);
 pub(crate) const WASM_IMPORT: PartId = PartId(39);
@@ -73,7 +83,7 @@ pub(crate) const WASM_CODE: PartId = PartId(48);
 pub(crate) const WASM_DATA: PartId = PartId(49);
 pub(crate) const WASM_NAME: PartId = PartId(50);
 
-pub(crate) const NUM_SINGLE_PART_SECTIONS: u32 = 51;
+pub(crate) const NUM_SINGLE_PART_SECTIONS: u32 = 56;
 
 #[cfg(test)]
 pub(crate) const NUM_BUILT_IN_PARTS: usize = NUM_SINGLE_PART_SECTIONS as usize

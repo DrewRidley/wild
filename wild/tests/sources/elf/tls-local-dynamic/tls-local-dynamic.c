@@ -23,6 +23,7 @@
 //#Config:malfunction-no-movzx0lsl16:gcc
 //#Arch:aarch64
 //#Malfunction:no-movzx0lsl16
+//#MalfunctionExpectKey:rel.R_AARCH64_NONE.R_AARCH64_TLSLE_MOVW_TPREL_G1
 
 _Thread_local long foo = 42;
 

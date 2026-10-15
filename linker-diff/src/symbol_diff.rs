@@ -6,6 +6,12 @@ use object::ObjectSection as _;
 use object::ObjectSymbol as _;
 
 pub(crate) fn report_diffs(report: &mut crate::Report, bins: &[crate::Binary]) {
+    // `dynamic_symbols()` yields nothing for Mach-O - exported symbols live in the
+    // LC_DYLD_EXPORTS_TRIE, not in a symbol table section - so this pass would compare two empty
+    // sets and declare them equal.
+    if !report.require_format("dynsym", bins, &["elf"]) {
+        return;
+    }
     report.add_diffs(crate::header_diff::diff_fields(
         bins,
         read_dynsym,

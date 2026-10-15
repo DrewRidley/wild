@@ -112,6 +112,13 @@
 //!
 //! RunEnabled:{bool} Defaults to true. Set to false to disable execution of the resulting binary.
 //!
+//! KnownFailure:{description} Marks the test as currently failing because of a known bug in wild.
+//! The description is mandatory and should say what is broken. While the test keeps failing it is
+//! reported as ignored (with the description and the real error), so the suite stays green. If the
+//! test *passes*, the test is reported as FAILED, telling you to delete the directive. That way a
+//! `KnownFailure` can never silently hide a test that has started working. Nothing else about the
+//! test is weakened: it is still built, linked, asserted, diffed and run exactly as normal.
+//!
 //! RunDynSym:{string} If set and RunEnabled:true, then, instead of executing the binary normally,
 //! the binary is loaded as a shared library and the function specified by the string is called. The
 //! function must return an integer to indicate status (status != 42 is an error). Such run is
@@ -142,7 +149,32 @@
 //! ExpectErrorWild:{error regex} As for ExpectError, but only checks Wild's error output.
 //!
 //! Malfunction:{malfunction-id} Run with the specified malfunction enabled. Linking should still
-//! succeed, but linker-diff should report a diff. That diff will be snapshot tested.
+//! succeed, but linker-diff must report a diff that is *caused by that malfunction*. Requires at
+//! least one `MalfunctionExpectKey` directive; see there for how detection is established. For ELF
+//! the resulting diff is additionally snapshot tested.
+//!
+//! MalfunctionExpectKey:{linker-diff-key} Mandatory for, and only meaningful with, `Malfunction`.
+//! May be repeated. Names a linker-diff key that must *change* as a result of the malfunction.
+//!
+//! This exists because "the report is non-empty" proves nothing when the report was already
+//! non-empty. The Mach-O malfunction configs sat in exactly that state: `linker-diff-macho.c`
+//! contains `int *pg = &g;`, which trips a real, unfixed rebase bug, so every malfunction config
+//! passed on the strength of a diff it had not caused - including `macho-wrong-entry-point`, whose
+//! corruption nothing in linker-diff could see at all.
+//!
+//! So the harness links the program twice: once with the malfunction and once without, diffs both
+//! against the same reference binaries, and requires each named key to be
+//!   1. present in the malfunctioning report, and
+//!   2. rendered differently there than in the clean report (where "absent" counts as a rendering).
+//!
+//! Property (2) is what makes the check independent of whatever else happens to be broken. If the
+//! rebase bug is fixed tomorrow, the clean report goes empty, the malfunction report still contains
+//! the named key, and the assertion means precisely what it meant before. If instead the *checker*
+//! for a key is deleted or broken, the key stops changing and the config fails - which is the whole
+//! point of a malfunction test.
+//!
+//! Both links use identical inputs and flags and produce identical layouts, so any difference in a
+//! key's rendering is attributable to the malfunction.
 //!
 //! SecEquiv:{sec-name}={sec-name} Tells linker-diff that the two section names should be considered
 //! as equivalent.
@@ -196,6 +228,14 @@
 //! This testing runs wild twice with the second run having the --update-in-place and the file
 //! having been pre-filled with random data. It then compares the output of the two runs to verify
 //! that they're the same.
+//!
+//! TestRelinkAfterExec:{bool} Whether to check that relinking over a binary that has already been
+//! executed produces a binary that can still be executed. Unlike `TestUpdateInPlace`, which
+//! compares the bytes of two runs, this one actually runs the binary either side of the relink.
+//! That distinction matters on macOS: the bytes wild writes are correct, but if the output reuses
+//! the inode of a binary the kernel has already execed, the kernel's cached code signature for
+//! that vnode no longer describes the file and the next exec dies with SIGKILL. Requires
+//! RunEnabled.
 //!
 //! AssertOutputFileMatches:{filename}:{regex} Verifies that a file in the output directory contains
 //! at least one line matching the specified regex. Such output files are generally written by
@@ -1179,6 +1219,11 @@ struct Config {
     expect_stderr: Vec<ErrorMatcher>,
     expect_stdout: Vec<ErrorMatcher>,
     active_malfunction: Option<String>,
+
+    /// linker-diff keys that `active_malfunction` must change. See the `MalfunctionExpectKey`
+    /// directive docs at the top of this file. Mandatory whenever `active_malfunction` is set.
+    malfunction_expect_keys: Vec<String>,
+
     support_architectures: Vec<Architecture>,
     requires_glibc: bool,
     requires_glibc_version: Option<String>,
@@ -1194,11 +1239,18 @@ struct Config {
     requires_rust_musl: bool,
     requires_linker_plugin: bool,
     test_update_in_place: bool,
+    test_relink_after_exec: bool,
     test_config: TestConfig,
     tracked_files: Vec<PathBuf>,
     so_single_linker: Option<Linker>,
     available_linkers: Vec<Linker>,
     driver_mode: Option<DriverMode>,
+
+    /// If set, this test is currently expected to fail because of a known bug in wild. The string
+    /// is a human-readable description of the bug. The test is reported as ignored while it keeps
+    /// failing, but reported as *failed* if it starts passing, so that the directive can never
+    /// silently hide a working test. See `//#KnownFailure`.
+    known_failure: Option<String>,
 }
 
 /// These configs are used by the config file specified in `$WILD_TEST_CONFIG`
@@ -1221,6 +1273,10 @@ struct TestConfig {
 
     /// Run the diffing component of each test. By default, diffs are skipped.
     /// Enable this to verify that wild produces output matching other linkers.
+    ///
+    /// Can also be turned on without a config file by setting `WILD_TEST_RUN_ALL_DIFFS=1`, which
+    /// is how CI enables it for the Mach-O job. Note that diffing additionally requires at least
+    /// one reference linker to be available - see `available_linkers_for_mac`.
     #[serde(default)]
     run_all_diffs: bool,
 
@@ -1871,6 +1927,7 @@ impl Config {
             expect_stderr: Default::default(),
             expect_stdout: Default::default(),
             active_malfunction: None,
+            malfunction_expect_keys: Vec::new(),
             cross_enabled: true,
             support_architectures: platform.supported_architectures().to_owned(),
             requires_glibc: false,
@@ -1886,11 +1943,13 @@ impl Config {
             rustc_channel: RustcChannel::Default,
             requires_rust_musl: false,
             test_update_in_place: false,
+            test_relink_after_exec: false,
             test_config: test_config.clone(),
             tracked_files: Default::default(),
             available_linkers: available_linkers.to_owned(),
             so_single_linker: None,
             driver_mode: None,
+            known_failure: None,
         }
     }
 }
@@ -2195,6 +2254,12 @@ fn process_directive(
             config.diff_match_any = arg.parse().context("Invalid bool for DiffMatchAny")?
         }
         "RunEnabled" => config.should_run = arg.parse().context("Invalid bool for RunEnabled")?,
+        "KnownFailure" => {
+            if arg.is_empty() {
+                bail!("KnownFailure requires a description of the bug being tracked");
+            }
+            config.known_failure = Some(arg.to_owned());
+        }
         "RunDynSym" => {
             config.run_dyn_sym = Some(arg.parse().context("Invalid string for RunDynSym")?)
         }
@@ -2257,8 +2322,18 @@ fn process_directive(
             if !config.config_name.starts_with(&prefix) {
                 bail!("Config name must be prefixed with '{prefix}'");
             }
+            if arg == NO_MALFUNCTION {
+                bail!(
+                    "`{NO_MALFUNCTION}` is reserved: the harness passes it to \
+                     WILD_MALFUNCTION to produce the un-corrupted half of a malfunction test, so \
+                     an injection point by that name would corrupt the control link too"
+                );
+            }
             config.active_malfunction = Some(arg.to_owned());
             config.should_run = false;
+        }
+        "MalfunctionExpectKey" => {
+            config.malfunction_expect_keys.push(arg.to_owned());
         }
         "SecEquiv" => config.section_equiv.push(
             arg.split_once('=')
@@ -2380,6 +2455,9 @@ fn process_directive(
         }
         "TestUpdateInPlace" => {
             config.test_update_in_place = arg.parse()?;
+        }
+        "TestRelinkAfterExec" => {
+            config.test_relink_after_exec = arg.parse()?;
         }
         "DriverMode" => {
             config.driver_mode = Some(DriverMode::from_str(arg).map_err(|_| {
@@ -2641,7 +2719,86 @@ impl Debug for SectionDiff {
 const TEST_BINARY_TIMEOUT: Duration = std::time::Duration::from_secs(10);
 const EXIT_SUCCESS: i32 = 42;
 
+/// Returns something that identifies the file itself rather than the path, so that we can tell
+/// whether a relink wrote over the original file or created a new one in its place.
+fn file_identity(path: &Path) -> Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(std::fs::metadata(path)
+            .with_context(|| format!("Failed to stat {}", path.display()))?
+            .ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(0)
+    }
+}
+
 impl Program<'_> {
+    /// Relinks over a binary that has just been executed, then runs it again.
+    ///
+    /// The caller has already run the binary once, which is the part that matters: it gives the
+    /// kernel a chance to cache state about the file, so that reusing it for the second link can
+    /// be caught. See the `TestRelinkAfterExec` directive.
+    fn relink_and_rerun(&mut self, config: &Config, cross_arch: Option<Architecture>) -> Result {
+        let path = self.link_output.binary.clone();
+        let content_before = std::fs::read(&path)?;
+        let inode_before = file_identity(&path)?;
+
+        self.link_output.messages = self
+            .link_output
+            .command
+            .run(config)
+            .with_context(|| format!("Failed to relink {}", path.display()))?;
+
+        ensure!(
+            self.link_output.binary == path,
+            "Relink wrote to {} rather than back over {}, so nothing was tested",
+            self.link_output.binary.display(),
+            path.display()
+        );
+
+        // Relinking the same inputs has to be deterministic. Checking this here rather than only
+        // running the binary matters because whether a stale byte actually breaks the output
+        // depends on what happened to be in the file underneath it, which varies with the size and
+        // shape of the link.
+        let content_after = std::fs::read(&path)?;
+        if content_before != content_after {
+            let diffs = sections_with_diffs(&content_before, &content_after)?;
+            bail!(
+                "Relinking `{path}` over itself produced different bytes to the first link. \
+                 Diffs:\n{diffs:#?}\nRerun with:\n{cmd}",
+                path = path.display(),
+                cmd = self.link_output.command,
+            );
+        }
+
+        // A code-signed format can't reuse the file: once the kernel has execed a vnode it caches
+        // the signature against it, and rewriting the same inode leaves that cache describing
+        // content that is no longer there. Assert the invariant directly, because the symptom it
+        // prevents only shows up on links big enough for the stale pages to matter.
+        if config.platform == PlatformKind::MachO {
+            ensure!(
+                file_identity(&path)? != inode_before,
+                "Relinking `{}` reused the original file. Code-signed output has to be written to \
+                 a newly created file, otherwise executing the binary, relinking, then executing \
+                 again dies with SIGKILL.",
+                path.display()
+            );
+        }
+
+        self.run(cross_arch).with_context(|| {
+            format!(
+                "Relinking over `{}` after it had been executed produced a binary that no longer \
+                 runs. Rerun with:\n{cmd}",
+                path.display(),
+                cmd = self.link_output.command,
+            )
+        })
+    }
+
     fn run(&self, cross_arch: Option<Architecture>) -> Result {
         if self.link_output.command.config.platform == PlatformKind::Wasm {
             return run_wasm_with_wasmtime(
@@ -2971,7 +3128,7 @@ fn build_linker_input(
                 linker.link_intermediate(&objects, &obj_path, &config, cross_arch, kind)?;
             let assertions = Assertions::default();
             assertions
-                .check_path(&out.path, linker)
+                .check_path(&out.path, linker, config.active_malfunction.is_some())
                 .with_context(|| format!("Assertions failed for `{}`", out.path.display()))?;
 
             if let Some(fat_kind) = dep.input_type.fat_kind() {
@@ -3493,6 +3650,11 @@ fn compiler_for_file(
             CompilerKind::C,
         ),
         "c" => (
+            get_c_compiler(&config.compiler, CLanguage::C, cross_arch)?,
+            CompilerKind::C,
+        ),
+        // Objective-C is compiled by the C compiler, which recognises it by the extension.
+        "m" => (
             get_c_compiler(&config.compiler, CLanguage::C, cross_arch)?,
             CompilerKind::C,
         ),
@@ -4369,7 +4531,7 @@ fn get_script(inputs: &[LinkerInput]) -> Option<(PathBuf, &[LinkerInput])> {
 }
 
 impl Assertions {
-    fn check(&self, link_output: &LinkOutput) -> Result {
+    fn check(&self, link_output: &LinkOutput, malfunction_active: bool) -> Result {
         // If the output file doesn't exist and we have no assertions, then skip parsing the output
         // file. This allows tests like the one that writes to /dev/null to succeed, while still
         // checking that the output file is valid in cases where we don't have any assertions.
@@ -4377,7 +4539,11 @@ impl Assertions {
             return Ok(());
         }
 
-        self.check_path(&link_output.binary, &link_output.linker_used)?;
+        self.check_path(
+            &link_output.binary,
+            &link_output.linker_used,
+            malfunction_active,
+        )?;
         self.check_output_files(link_output)?;
         Ok(())
     }
@@ -4402,7 +4568,12 @@ impl Assertions {
         Ok(())
     }
 
-    fn check_path(&self, path: &PathBuf, linker_used: &Linker) -> Result {
+    /// `malfunction_active` is true when this binary was linked with `WILD_MALFUNCTION` set, i.e.
+    /// when it has been *deliberately* corrupted. Structural self-consistency checks over the
+    /// whole binary are then skipped, because the corruption is the point of the test and the
+    /// detection is supposed to come from linker-diff. Assertions that a test explicitly asked
+    /// for via a `//#` directive still run.
+    fn check_path(&self, path: &PathBuf, linker_used: &Linker, malfunction_active: bool) -> Result {
         let bytes =
             std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
 
@@ -4415,7 +4586,7 @@ impl Assertions {
 
         // For Mach-O.
         if matches!(obj, object::File::MachO64(_)) {
-            return self.check_macho_path(&obj, &bytes, linker_used);
+            return self.check_macho_path(&obj, &bytes, linker_used, malfunction_active);
         }
 
         self.verify_file_kind(&obj)?;
@@ -4459,7 +4630,13 @@ impl Assertions {
         Ok(())
     }
 
-    fn check_macho_path(&self, obj: &object::File, bytes: &[u8], linker_used: &Linker) -> Result {
+    fn check_macho_path(
+        &self,
+        obj: &object::File,
+        bytes: &[u8],
+        linker_used: &Linker,
+        malfunction_active: bool,
+    ) -> Result {
         // Allowlist of assertion fields implemented for Mach-O.
         let supported = Assertions {
             expected_symtab_entries: self.expected_symtab_entries.clone(),
@@ -4494,12 +4671,21 @@ impl Assertions {
         self.verify_absent_sections(obj)?;
         self.verify_section_bytes(obj)?;
         self.verify_strings(bytes)?;
-        verify_no_overlapping_sections(obj)?;
-        verify_no_overlapping_segments(obj)?;
-        verify_chained_fixups_segment_offsets(obj, bytes)?;
 
-        if linker_used.is_wild() {
-            verify_uuid(obj, bytes)?;
+        // Structural self-consistency checks. A malfunction test corrupts the output on purpose,
+        // so running these would turn "the corruption was applied" into a hard test failure
+        // instead of letting linker-diff be the thing that catches it. Skipping them is what makes
+        // malfunctions like `macho-no-pie` and `macho-wrong-segment-offset` usable at all.
+        if !malfunction_active {
+            verify_no_overlapping_sections(obj)?;
+            verify_no_overlapping_segments(obj)?;
+            verify_chained_fixups_segment_offsets(obj, bytes)?;
+            verify_macho_pie(obj)?;
+
+            if linker_used.is_wild() {
+                verify_uuid(obj, bytes)?;
+                verify_unwind_info_covers_frames(obj)?;
+            }
         }
         Ok(())
     }
@@ -5426,6 +5612,230 @@ fn verify_chained_fixups_segment_offsets(obj: &object::File, bytes: &[u8]) -> Re
     Ok(())
 }
 
+/// Checks that Mach-O executables are position independent.
+///
+/// Without `MH_PIE` the kernel loads the image at its link-time address, the load bias is always
+/// zero and every missing rebase / chained fixup becomes invisible at run time. Since the test
+/// binaries are executed with a plain `posix_spawn` (nothing in this harness asks for
+/// `POSIX_SPAWN_DISABLE_ASLR`), `MH_PIE` is the only thing that makes ASLR actually happen, and
+/// therefore the only thing that makes a missing fixup observable. Assert it explicitly so that a
+/// regression which drops the flag cannot quietly disable that coverage.
+fn verify_macho_pie(obj: &object::File) -> Result {
+    let object::File::MachO64(file) = obj else {
+        return Ok(());
+    };
+
+    // Values from <mach-o/loader.h>.
+    const MH_EXECUTE: u32 = 0x2;
+    const MH_PIE: u32 = 0x0020_0000;
+
+    let header = file.macho_header();
+    let e = file.endianness();
+
+    if header.filetype.get(e).0 != MH_EXECUTE {
+        return Ok(());
+    }
+
+    let flags: u32 = header.flags.get(e).0;
+    ensure!(
+        flags & MH_PIE != 0,
+        "Mach-O executable is missing MH_PIE (header flags 0x{flags:x}). Without it the image \
+         loads at a fixed address, so ASLR is off and missing rebases become undetectable."
+    );
+
+    Ok(())
+}
+
+/// Checks that every FDE in `__eh_frame` belongs to a function `__unwind_info` has an entry for.
+///
+/// The table has no gaps: an entry's reach ends where the next entry begins, so a function the
+/// table doesn't mention is claimed by its neighbour's entry, and unwinding through it restores
+/// registers by the wrong function's rules. A compiler that describes unwinding only in DWARF -
+/// Cranelift emits no `__compact_unwind` at all - contributes exactly such functions, so the
+/// linker has to synthesize an entry per otherwise-uncovered FDE, the way ld64 does. Every FDE
+/// having an entry at its function's address is the invariant that keeps that true.
+fn verify_unwind_info_covers_frames(obj: &object::File) -> Result {
+    use object::ObjectSection as _;
+    use object::ObjectSegment as _;
+
+    let Some(unwind_info) = obj.section_by_name_bytes(b"__unwind_info") else {
+        return Ok(());
+    };
+    let Some(eh_frame) = obj.section_by_name_bytes(b"__eh_frame") else {
+        return Ok(());
+    };
+
+    let text_base = obj
+        .segments()
+        .find(|segment| segment.name_bytes() == Ok(Some(b"__TEXT")))
+        .context("Mach-O output has no __TEXT segment")?
+        .address();
+
+    let u = unwind_info.data()?;
+    let read_u32 = |offset: usize| -> Result<u32> {
+        Ok(u32::from_le_bytes(u[offset..offset + 4].try_into()?))
+    };
+    let read_u16 = |offset: usize| -> Result<u16> {
+        Ok(u16::from_le_bytes(u[offset..offset + 2].try_into()?))
+    };
+
+    // Collect the address of every function the table describes. Layout details are in
+    // <mach-o/compact_unwind_encoding.h>.
+    let index_offset = read_u32(20)? as usize;
+    let index_count = read_u32(24)? as usize;
+
+    let mut covered = std::collections::HashSet::new();
+
+    for index in 0..index_count.saturating_sub(1) {
+        let entry = index_offset + index * 12;
+        let page_function = u64::from(read_u32(entry)?);
+        let second_level = read_u32(entry + 4)? as usize;
+
+        if second_level == 0 {
+            continue;
+        }
+
+        match read_u32(second_level)? {
+            // UNWIND_SECOND_LEVEL_REGULAR
+            2 => {
+                let entries_offset = read_u16(second_level + 4)? as usize;
+                let count = read_u16(second_level + 6)? as usize;
+                for i in 0..count {
+                    let function = read_u32(second_level + entries_offset + i * 8)?;
+                    covered.insert(text_base + u64::from(function));
+                }
+            }
+            // UNWIND_SECOND_LEVEL_COMPRESSED
+            3 => {
+                let entries_offset = read_u16(second_level + 4)? as usize;
+                let count = read_u16(second_level + 6)? as usize;
+                for i in 0..count {
+                    let entry = read_u32(second_level + entries_offset + i * 4)?;
+                    covered.insert(text_base + page_function + u64::from(entry & 0x00FF_FFFF));
+                }
+            }
+            other => bail!("Unknown __unwind_info second-level page kind {other}"),
+        }
+    }
+
+    // Walk `__eh_frame` and hold every FDE against the table.
+    let eh = eh_frame.data()?;
+    let eh_address = eh_frame.address();
+    let mut offset = 0;
+
+    while offset + 8 <= eh.len() {
+        let length = u32::from_le_bytes(eh[offset..offset + 4].try_into()?) as usize;
+        if length == 0 {
+            break;
+        }
+
+        let record_end = offset + 4 + length;
+        ensure!(
+            record_end <= eh.len(),
+            "__eh_frame record at {offset:#x} runs past the end of the section"
+        );
+
+        let cie_id = u32::from_le_bytes(eh[offset + 4..offset + 8].try_into()?);
+
+        if cie_id != 0 {
+            // An FDE. Its CIE's `R` augmentation says how pc-begin is stored; everything emitted
+            // on this platform uses a pcrel form, so the field width is all that's read from it.
+            let cie_start = (offset + 4)
+                .checked_sub(cie_id as usize)
+                .context("FDE names a CIE before the start of __eh_frame")?;
+            let encoding = fde_pointer_encoding(&eh[cie_start..])
+                .with_context(|| format!("Unreadable CIE at {cie_start:#x} of __eh_frame"))?;
+            ensure!(
+                encoding & 0x10 != 0,
+                "CIE at {cie_start:#x} of __eh_frame stores pc-begin as something other than \
+                 pcrel, which nothing on this platform emits"
+            );
+
+            let field = offset + 8;
+            let pc_begin = match encoding & 0x0F {
+                // DW_EH_PE_absptr / DW_EH_PE_sdata8 (pcrel)
+                0x00 | 0x0C => (eh_address + field as u64)
+                    .wrapping_add(i64::from_le_bytes(eh[field..field + 8].try_into()?) as u64),
+                // DW_EH_PE_sdata4 (pcrel)
+                0x0B => (eh_address + field as u64).wrapping_add(i64::from(i32::from_le_bytes(
+                    eh[field..field + 4].try_into()?,
+                )) as u64),
+                other => bail!("Unsupported FDE pointer encoding 0x1{other:x} in __eh_frame"),
+            };
+
+            ensure!(
+                covered.contains(&pc_begin),
+                "__eh_frame FDE at {offset:#x} describes the function at {pc_begin:#x}, which \
+                 __unwind_info has no entry for - its addresses fall to a neighbouring entry, and \
+                 unwinding through it follows the wrong function's rules"
+            );
+        }
+
+        offset = record_end;
+    }
+
+    Ok(())
+}
+
+/// Reads the `R` augmentation of a CIE: how the FDEs that extend it store their pointers.
+fn fde_pointer_encoding(cie: &[u8]) -> Result<u8> {
+    // length(4) + id(4) + version(1), then the augmentation string.
+    let augmentation_start = 9;
+    let augmentation_end = augmentation_start
+        + cie[augmentation_start..]
+            .iter()
+            .position(|&b| b == 0)
+            .context("CIE augmentation string is unterminated")?;
+    let augmentation = &cie[augmentation_start..augmentation_end];
+
+    ensure!(
+        augmentation.first() == Some(&b'z'),
+        "CIE has no augmentation data, so its FDE pointer encoding is unknowable"
+    );
+
+    let mut cursor = augmentation_end + 1;
+    let mut read_uleb = |cie: &[u8]| -> Result<u64> {
+        let mut value = 0u64;
+        let mut shift = 0;
+        loop {
+            let byte = *cie.get(cursor).context("CIE ends inside a ULEB128")?;
+            cursor += 1;
+            value |= u64::from(byte & 0x7F) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+            shift += 7;
+        }
+    };
+
+    read_uleb(cie)?; // code alignment factor
+    // Data alignment factor, an SLEB128: the same wire shape as a ULEB128.
+    read_uleb(cie)?;
+    read_uleb(cie)?; // return address register
+    read_uleb(cie)?; // augmentation data length
+
+    for &kind in &augmentation[1..] {
+        match kind {
+            b'R' => return Ok(*cie.get(cursor).context("CIE ends before its R encoding")?),
+            b'L' => cursor += 1,
+            b'P' => {
+                let encoding = *cie.get(cursor).context("CIE ends before its P encoding")?;
+                cursor += 1;
+                // The personality pointer itself, sized by its encoding's low nibble.
+                cursor += match encoding & 0x0F {
+                    0x00 | 0x04 | 0x0C => 8,
+                    0x03 | 0x0B => 4,
+                    0x02 | 0x0A => 2,
+                    other => bail!("Unsupported personality pointer encoding low nibble {other}"),
+                };
+            }
+            other => bail!("Unsupported CIE augmentation {:?}", other as char),
+        }
+    }
+
+    bail!("CIE has no R augmentation, so its FDE pointer encoding is unknowable")
+}
+
 fn verify_uuid(obj: &object::File, bytes: &[u8]) -> Result {
     const CS_BLOCK_SIZE: usize = 4096;
     const CS_HASH_SIZE: usize = 32;
@@ -5959,6 +6369,16 @@ fn diff_shared_objects(config: &Config, programs: &[Program]) -> Result {
         return Ok(());
     }
 
+    // No malfunction config diffs intermediate shared objects today, and `diff_files` requires a
+    // clean-link baseline whenever a malfunction is active. Rather than silently skipping the
+    // malfunction verification for shared objects (a fresh way for a malfunction test to pass
+    // vacuously), say so.
+    assert!(
+        config.active_malfunction.is_none() || programs.iter().all(|p| p.shared_objects.is_empty()),
+        "Malfunction configs that produce shared objects need baseline plumbing in \
+         `diff_shared_objects`, mirroring `diff_executables`."
+    );
+
     // All our programs should have the same number of shared objects and they should be in the same
     // order. We use this to group shared objects at the corresponding index so that we can then
     // diff them.
@@ -5978,17 +6398,87 @@ fn diff_shared_objects(config: &Config, programs: &[Program]) -> Result {
             filenames,
             // Shared objects should always have a command.
             so_group.last().unwrap().command.as_ref().unwrap(),
+            None,
         )?;
     }
     Ok(())
 }
 
-fn diff_executables(config: &Config, programs: &[Program]) -> Result {
+fn diff_executables(
+    config: &Config,
+    programs: &[Program],
+    baseline: Option<&MalfunctionBaseline>,
+) -> Result {
     let filenames = programs
         .iter()
         .map(|p| p.link_output.binary.clone())
         .collect_vec();
-    diff_files_report_command(config, filenames, programs.last().unwrap())
+    diff_files_report_command(config, filenames, programs.last().unwrap(), baseline)
+}
+
+/// The name given to `WILD_MALFUNCTION` for the clean half of a malfunction test.
+///
+/// `malfunction_point` compares the environment variable against each injection point's name, so
+/// any name that no injection point uses is a no-op. Using one - rather than unsetting the
+/// variable - keeps the clean link on byte-for-byte the same code path as the malfunctioning one:
+/// same `WILD_MALFUNCTION` handling, and in particular still a subprocess link rather than the
+/// in-process one that `Config::can_use_wild_in_process` would otherwise select.
+const NO_MALFUNCTION: &str = "none";
+
+/// Links `program_inputs` again with the malfunction disabled and records how linker-diff renders
+/// each problem key for that clean output. This is the control against which the malfunctioning
+/// link is judged; see the `MalfunctionExpectKey` directive docs at the top of this file.
+fn build_malfunction_baseline(
+    program_inputs: &ProgramInputs,
+    config: &Config,
+    cross_arch: Option<Architecture>,
+) -> Result<MalfunctionBaseline> {
+    let mut clean_config = config.clone();
+    clean_config.active_malfunction = Some(NO_MALFUNCTION.to_owned());
+    // A separate output directory, so the clean binary can't overwrite the malfunctioning one.
+    clean_config.config_name = format!("{}.no-malfunction", config.config_name);
+
+    std::fs::create_dir_all(clean_config.build_dir()).with_context(|| {
+        format!(
+            "Failed to create directory `{}`",
+            clean_config.build_dir().display()
+        )
+    })?;
+
+    let programs = clean_config
+        .available_linkers
+        .iter()
+        .filter(|linker| clean_config.is_linker_enabled(linker))
+        .map(|linker| {
+            program_inputs
+                .build(linker, &clean_config, cross_arch)
+                .with_context(|| {
+                    format!(
+                        "Failed to produce the no-malfunction baseline for config `{}`",
+                        config.config_name
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let files = programs
+        .iter()
+        .map(|program| program.link_output.binary.clone())
+        .collect_vec();
+
+    let details = if files.len() < 2 {
+        // Caller has already established that we have enough linkers to diff; being defensive
+        // here just means an empty baseline, i.e. every key counts as changed.
+        HashMap::new()
+    } else {
+        let diff_config = create_diff_config(&clean_config, files)?;
+        produce_diff_report(&diff_config)?
+            .problem_details()
+            .into_iter()
+            .collect()
+    };
+
+    Ok(MalfunctionBaseline { details })
 }
 
 fn normalise_report(report: &linker_diff::Report) -> String {
@@ -6070,6 +6560,7 @@ fn diff_files_report_command(
     config: &Config,
     files: Vec<PathBuf>,
     command_display: &dyn Display,
+    baseline: Option<&MalfunctionBaseline>,
 ) -> Result {
     if !config.should_diff || files.len() < 2 {
         return Ok(());
@@ -6077,7 +6568,7 @@ fn diff_files_report_command(
 
     let diff_config = create_diff_config(config, files)?;
 
-    diff_files(config, &diff_config).with_context(|| {
+    diff_files(config, &diff_config, baseline).with_context(|| {
         format!(
             "Diff reported error: {command_display}\nTo revalidate:\n\
             cargo run --bin linker-diff -- {}",
@@ -6086,13 +6577,36 @@ fn diff_files_report_command(
     })
 }
 
+/// How each problem key was rendered by linker-diff for the same program linked *without* the
+/// malfunction. See the `MalfunctionExpectKey` directive docs at the top of this file.
+struct MalfunctionBaseline {
+    /// Key -> rendered body. A key that is absent from the map was not a problem at all in the
+    /// clean link, which is the strongest form of "this changed".
+    details: HashMap<String, String>,
+}
+
 /// Diff the supplied files. The last file should be the one that we produced.
-fn diff_files(config: &Config, diff_config: &linker_diff::Config) -> Result {
+fn diff_files(
+    config: &Config,
+    diff_config: &linker_diff::Config,
+    baseline: Option<&MalfunctionBaseline>,
+) -> Result {
     let report = produce_diff_report(diff_config)?;
 
     if let Some(malfunction) = config.active_malfunction.as_ref() {
-        if !report.has_problems() {
-            bail!("No diff reported when running with malfunction `{malfunction}`");
+        let baseline = baseline.context(
+            "Internal error: no clean-link baseline was computed for a malfunction config",
+        )?;
+
+        verify_malfunction_detected(config, malfunction, &report, baseline)?;
+
+        // Snapshot the whole report as well, but only where the snapshot is portable. The Mach-O
+        // reference linker differs between machines - `ld64.lld` where it's installed, Apple's
+        // `ld` otherwise - and the two produce different (both correct) layouts, so a byte-exact
+        // snapshot would be a machine-specific artifact rather than a test. Mach-O detection is
+        // established by `verify_malfunction_detected` above instead.
+        if config.platform == PlatformKind::MachO {
+            return Ok(());
         }
 
         let path = config.test_src_dir.join(format!(
@@ -6108,6 +6622,67 @@ fn diff_files(config: &Config, diff_config: &linker_diff::Config) -> Result {
         bail!("Validation failed.\n{report}");
     }
     Ok(())
+}
+
+/// Checks that `report` differs from the clean-link `baseline` in each of the ways that
+/// `//#MalfunctionExpectKey` says it should.
+///
+/// A malfunction config that merely produces *a* diff proves nothing, because the diff may predate
+/// the malfunction entirely - which is exactly how all seven Mach-O malfunction configs used to
+/// pass while one of them (`macho-wrong-entry-point`) was detected by nothing whatsoever.
+fn verify_malfunction_detected(
+    config: &Config,
+    malfunction: &str,
+    report: &linker_diff::Report,
+    baseline: &MalfunctionBaseline,
+) -> Result {
+    let details: HashMap<String, String> = report.problem_details().into_iter().collect();
+
+    if config.malfunction_expect_keys.is_empty() {
+        bail!(
+            "Malfunction config `{malfunction}` has no `//#MalfunctionExpectKey:` directive, so \
+             nothing establishes that the malfunction was detected rather than merely coinciding \
+             with an unrelated diff. Keys reported for this link: {}",
+            format_key_list(details.keys())
+        );
+    }
+
+    for key in &config.malfunction_expect_keys {
+        let Some(actual) = details.get(key) else {
+            bail!(
+                "Malfunction `{malfunction}` was NOT detected: linker-diff reported nothing for \
+                 the expected key `{key}`. Either the check that is supposed to catch this \
+                 malfunction has regressed, or the malfunction injection point is no longer \
+                 reached. Keys actually reported: {}",
+                format_key_list(details.keys())
+            );
+        };
+
+        if baseline
+            .details
+            .get(key)
+            .is_some_and(|clean| clean == actual)
+        {
+            bail!(
+                "Malfunction `{malfunction}` was NOT detected: linker-diff reports `{key}`, but \
+                 it reports exactly the same thing for the *same program linked without the \
+                 malfunction*, so this difference is not evidence that anything detected the \
+                 malfunction. Pick a key that the malfunction actually changes, or make the check \
+                 for `{key}` sensitive to it.\n{key}\n{actual}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn format_key_list<'a>(keys: impl Iterator<Item = &'a String>) -> String {
+    let keys = keys.sorted().join(", ");
+    if keys.is_empty() {
+        "(none)".to_owned()
+    } else {
+        keys
+    }
 }
 
 fn create_diff_config(config: &Config, files: Vec<PathBuf>) -> Result<linker_diff::Config> {
@@ -6329,6 +6904,24 @@ fn available_linkers_for_mac() -> Result<Vec<Linker>> {
         }));
     }
 
+    // Apple's own linker (`ld-prime`). Present on any machine with the Xcode command line tools,
+    // whereas `ld64.lld` usually is not. Without it, a developer on macOS gets exactly one linker,
+    // `files.len() < 2` in `diff_files_report_command`, and therefore *no* output diffing at all -
+    // which in turn means the Mach-O malfunction configs pass without linker-diff ever running.
+    //
+    // It is NOT enabled by default: Wild's Mach-O output does not yet match ld-prime closely
+    // enough for the whole suite to diff clean (15 of 21 tests fail if you turn it on globally).
+    // Tests that want it opt in with `//#ReferenceLinkers:ld`.
+    if let Ok(path) = find_bin(&["ld"]) {
+        linkers.push(Linker::ThirdParty(ThirdPartyLinker {
+            name: "ld",
+            gcc_name: "ld",
+            path,
+            cross_paths: HashMap::new(),
+            enabled_by_default: false,
+        }));
+    }
+
     linkers.push(Linker::Wild);
 
     Ok(linkers)
@@ -6411,16 +7004,28 @@ fn run_with_config(
     for program in &programs {
         program
             .assertions
-            .check(&program.link_output)
+            .check(&program.link_output, config.active_malfunction.is_some())
             .with_context(|| format!("Output binary assertions failed. {program}"))?;
     }
+
+    // A malfunction config exists solely to prove that a linker-diff check works, so it always
+    // diffs. Without this it would be gated behind `run_all_diffs`, which defaults to false, and
+    // the whole test would reduce to "the corrupted binary still linked".
+    let diffing_required = config.active_malfunction.is_some();
 
     // ppc64le: full output-diff parity against the reference linker is pending (glink /
     // DT_PPC64_GLINK emission and section alignment aren't matched yet), so we validate that
     // binaries link and run, but don't byte-compare them. Drop this carve-out as parity lands.
-    if config.test_config.run_all_diffs && config.arch != Architecture::Ppc64 {
+    if (config.test_config.run_all_diffs || diffing_required) && config.arch != Architecture::Ppc64
+    {
+        let baseline = config
+            .active_malfunction
+            .as_ref()
+            .map(|_| build_malfunction_baseline(program_inputs, config, cross_arch))
+            .transpose()?;
+
         diff_shared_objects(config, &programs)?;
-        diff_executables(config, &programs)?;
+        diff_executables(config, &programs, baseline.as_ref())?;
     }
 
     if should_print_timing() {
@@ -6430,7 +7035,7 @@ fn run_with_config(
         );
     }
 
-    for program in programs {
+    for mut program in programs {
         if config.should_run {
             // If RunDynSym is set, execute our binary by loading it dynamically and calling the
             // configured function.
@@ -6451,6 +7056,10 @@ fn run_with_config(
                 program
                     .run(cross_arch)
                     .with_context(|| format!("Failed to run program. {program}"))?;
+
+                if config.test_relink_after_exec && program.link_output.linker_used.is_wild() {
+                    program.relink_and_rerun(config, cross_arch)?;
+                }
             }
         } else if config.run_dyn_sym.is_some() {
             // RunEnabled is false but RunDynSym is set.
@@ -6628,10 +7237,41 @@ fn run_integration_test(
         return Ok(libtest_mimic::Completion::ignored_with(error.to_string()));
     }
 
-    if !cfg!(debug_assertions) && config.active_malfunction.is_some() {
-        return Ok(libtest_mimic::Completion::ignored_with(
-            "Malfunction tests are allowed only in Debug profile",
-        ));
+    if let Some(malfunction) = config.active_malfunction.as_deref() {
+        // Checked before any of the "ignore" paths below, so that a malfunction config which can
+        // never prove anything is rejected on every machine, not just on the ones that would have
+        // run it.
+        if config.malfunction_expect_keys.is_empty() {
+            bail!(
+                "Malfunction config `{malfunction}` has no `//#MalfunctionExpectKey:` directive. \
+                 Without one, the test only asserts that linker-diff reported *something*, which \
+                 is satisfied by any pre-existing difference and therefore proves nothing about \
+                 the malfunction. See the directive docs in integration_tests.rs."
+            );
+        }
+
+        if !cfg!(debug_assertions) {
+            return Ok(libtest_mimic::Completion::ignored_with(
+                "Malfunction tests are allowed only in Debug profile",
+            ));
+        }
+
+        // Detection is established by diffing against a reference linker. With no reference
+        // linker there is nothing to diff against and the test can only assert that the corrupted
+        // binary still linked - so report it as skipped rather than as a pass.
+        let enabled_linkers = config
+            .available_linkers
+            .iter()
+            .filter(|linker| config.is_linker_enabled(linker))
+            .count();
+
+        if !config.should_diff || enabled_linkers < 2 || config.arch == Architecture::Ppc64 {
+            return Ok(libtest_mimic::Completion::ignored_with(format!(
+                "Malfunction `{malfunction}` cannot be verified here: linker-diff needs a \
+                 reference linker to compare against and {enabled_linkers} linker(s) are enabled \
+                 for this config"
+            )));
+        }
     }
 
     std::fs::create_dir_all(config.build_dir()).with_context(|| {
@@ -6641,14 +7281,30 @@ fn run_integration_test(
         )
     })?;
 
-    run_with_config(program_inputs, &config, cross_arch)?;
+    let result = run_with_config(program_inputs, &config, cross_arch);
+
+    if let Some(known_failure) = config.known_failure.as_deref() {
+        return match result {
+            Err(error) => Ok(libtest_mimic::Completion::ignored_with(format!(
+                "Known failure ({known_failure}). Actual error: {}",
+                error.to_string()
+            ))),
+            Ok(()) => bail!(
+                "This test is marked `//#KnownFailure:{known_failure}`, but it passed. If wild \
+                 has been fixed, delete the KnownFailure directive so the test starts guarding \
+                 the fix."
+            ),
+        };
+    }
+
+    result?;
 
     Ok(libtest_mimic::Completion::Completed)
 }
 
 /// Determine the name of the primary source file for a test source directory.
 fn identify_primary_source(test_src_dir: &Path, test_name: &str) -> Result<PathBuf> {
-    let extensions = &["rs", "c", "cc", "s", "wat"];
+    let extensions = &["rs", "c", "cc", "m", "s", "wat"];
 
     for ext in extensions {
         let path = test_src_dir.join(format!("{test_name}.{ext}"));
@@ -6860,6 +7516,13 @@ fn read_test_config() -> Result<TestConfig> {
     // The environment variable `WILD_TEST_CROSS` can override the config file setting.
     if let Some(qemu_arch_from_env) = get_wild_test_cross()? {
         config.qemu_arch = qemu_arch_from_env;
+    }
+
+    // `WILD_TEST_RUN_ALL_DIFFS` turns diffing on without needing a config file at all. Without
+    // this, `run_all_diffs` silently defaults to false, which means output diffing never runs
+    // unless someone has created the (gitignored) `test-config.toml`.
+    if let Ok(value) = std::env::var("WILD_TEST_RUN_ALL_DIFFS") {
+        config.run_all_diffs = !value.is_empty() && value != "0";
     }
 
     Ok(config)

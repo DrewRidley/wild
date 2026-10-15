@@ -107,6 +107,18 @@ bitflags! {
 
         /// Whether the symbol has a reference from non-IR code.
         const HAS_NON_IR_REF = 1 << 16;
+
+        /// The symbol names a thread-local variable, so its value is an offset within a
+        /// thread-local block rather than an address in the image. Note that this says what the
+        /// symbol *is*, whereas the `GOT_TLS_*` flags say what a reference to it *needs*.
+        const THREAD_LOCAL = 1 << 17;
+
+        /// A reference stores the address of the symbol's GOT entry, so the entry has to physically
+        /// exist. That's different from `GOT`, which only says the reference is written in a
+        /// GOT-addressing form: such a reference can be rewritten to address the symbol directly
+        /// when its address is known at link time, and usually is. This one can't be, because
+        /// whoever reads the stored address will dereference it.
+        const GOT_ENTRY_REQUIRED = 1 << 18;
     }
 }
 
@@ -207,6 +219,11 @@ impl ValueFlags {
     }
 
     #[must_use]
+    pub(crate) fn needs_got_entry(self) -> bool {
+        self.contains(ValueFlags::GOT_ENTRY_REQUIRED)
+    }
+
+    #[must_use]
     pub(crate) fn needs_got(self) -> bool {
         self.contains(ValueFlags::GOT)
     }
@@ -236,11 +253,18 @@ impl ValueFlags {
         self.contains(ValueFlags::IFUNC_GOT_FOR_ADDRESS)
     }
 
+    /// Returns whether any reference to this symbol asked for a TLS GOT entry. This is about what
+    /// references need, not about what the symbol is - see `is_thread_local` for the latter.
     #[must_use]
     pub(crate) fn is_tls(self) -> bool {
         self.contains(ValueFlags::GOT_TLS_OFFSET)
             || self.contains(ValueFlags::GOT_TLS_MODULE)
             || self.contains(ValueFlags::GOT_TLS_DESCRIPTOR)
+    }
+
+    #[must_use]
+    pub(crate) fn is_thread_local(self) -> bool {
+        self.contains(ValueFlags::THREAD_LOCAL)
     }
 
     #[must_use]

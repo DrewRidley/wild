@@ -19,6 +19,12 @@ use object::SymbolKind;
 use std::borrow::Cow;
 
 pub(crate) fn report_diffs<A: Arch>(report: &mut crate::Report, objects: &[crate::Binary]) {
+    // Mach-O keeps initialisers in `__DATA,__mod_init_func` (or `__init_offsets`), never in
+    // `.init_array`, so `section_by_name` finds nothing and both sides produce an empty list.
+    // `get_r_type` would also panic on a `RelocationFlags::MachO` if it ever got that far.
+    if !report.require_format("init-order", objects, &["elf"]) {
+        return;
+    }
     report.add_diffs(crate::header_diff::diff_array(
         objects,
         |bin| get_pointer_list::<A>(bin, secnames::INIT_ARRAY_SECTION_NAME_STR),

@@ -1,7 +1,7 @@
 //#Object:runtime.c
 //#ExpectSym:_main
 //#TestUpdateInPlace:true
-//#DiffIgnore:section.__unwind_info
+//#TestRelinkAfterExec:true
 
 #include "../common/runtime.h"
 

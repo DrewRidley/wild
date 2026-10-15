@@ -36,6 +36,114 @@ use tabled::settings::style::HorizontalLine;
 const MACHO64_LINKEDIT_ALIGNMENT: u32 = 8;
 const MACHO_CODE_SIGNATURE_ALIGNMENT: u32 = 16;
 
+/// Names for `Section64::flags & SECTION_ATTRIBUTES`, indexed by bit number. Written from the
+/// `S_ATTR_*` definitions in `<mach-o/loader.h>`. The low 8 bits are the section *type*, which is
+/// an enumeration rather than a bit field, and is reported separately.
+const MACHO_SECTION_ATTRIBUTE_NAMES: &[Option<&'static str>] = &[
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some("LOC_RELOC"),
+    Some("EXT_RELOC"),
+    Some("SOME_INSTRUCTIONS"),
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some("DEBUG"),
+    Some("SELF_MODIFYING_CODE"),
+    Some("LIVE_SUPPORT"),
+    Some("NO_DEAD_STRIP"),
+    Some("STRIP_STATIC_SYMS"),
+    Some("NO_TOC"),
+    Some("PURE_INSTRUCTIONS"),
+];
+
+/// Names for the `MH_*` bits of the Mach-O header `flags` field, indexed by bit number. Written
+/// from `<mach-o/loader.h>`. `MH_PIE` (bit 21) decides whether the loaded image is subject to
+/// ASLR, so it matters that this is diffed rather than assumed.
+const MACHO_HEADER_FLAG_NAMES: &[Option<&'static str>] = &[
+    Some("MH_NOUNDEFS"),
+    Some("MH_INCRLINK"),
+    Some("MH_DYLDLINK"),
+    Some("MH_BINDATLOAD"),
+    Some("MH_PREBOUND"),
+    Some("MH_SPLIT_SEGS"),
+    Some("MH_LAZY_INIT"),
+    Some("MH_TWOLEVEL"),
+    Some("MH_FORCE_FLAT"),
+    Some("MH_NOMULTIDEFS"),
+    Some("MH_NOFIXPREBINDING"),
+    Some("MH_PREBINDABLE"),
+    Some("MH_ALLMODSBOUND"),
+    Some("MH_SUBSECTIONS_VIA_SYMBOLS"),
+    Some("MH_CANONICAL"),
+    Some("MH_WEAK_DEFINES"),
+    Some("MH_BINDS_TO_WEAK"),
+    Some("MH_ALLOW_STACK_EXECUTION"),
+    Some("MH_ROOT_SAFE"),
+    Some("MH_SETUID_SAFE"),
+    Some("MH_NO_REEXPORTED_DYLIBS"),
+    Some("MH_PIE"),
+    Some("MH_DEAD_STRIPPABLE_DYLIB"),
+    Some("MH_HAS_TLV_DESCRIPTORS"),
+    Some("MH_NO_HEAP_EXECUTION"),
+    Some("MH_APP_EXTENSION_SAFE"),
+    Some("MH_NLIST_OUTOFSYNC_WITH_DYLDINFO"),
+    Some("MH_SIM_SUPPORT"),
+    None,
+    None,
+    None,
+    Some("MH_DYLIB_IN_CACHE"),
+];
+
+/// Names for `Section64::flags & SECTION_TYPE`, written from the `S_*` definitions in
+/// `<mach-o/loader.h>`.
+fn macho_section_type_name(section_type: u32) -> String {
+    let name = match section_type {
+        0x0 => "S_REGULAR",
+        0x1 => "S_ZEROFILL",
+        0x2 => "S_CSTRING_LITERALS",
+        0x3 => "S_4BYTE_LITERALS",
+        0x4 => "S_8BYTE_LITERALS",
+        0x5 => "S_LITERAL_POINTERS",
+        0x6 => "S_NON_LAZY_SYMBOL_POINTERS",
+        0x7 => "S_LAZY_SYMBOL_POINTERS",
+        0x8 => "S_SYMBOL_STUBS",
+        0x9 => "S_MOD_INIT_FUNC_POINTERS",
+        0xa => "S_MOD_TERM_FUNC_POINTERS",
+        0xb => "S_COALESCED",
+        0xc => "S_GB_ZEROFILL",
+        0xd => "S_INTERPOSING",
+        0xe => "S_16BYTE_LITERALS",
+        0xf => "S_DTRACE_DOF",
+        0x10 => "S_LAZY_DYLIB_SYMBOL_POINTERS",
+        0x11 => "S_THREAD_LOCAL_REGULAR",
+        0x12 => "S_THREAD_LOCAL_ZEROFILL",
+        0x13 => "S_THREAD_LOCAL_VARIABLES",
+        0x14 => "S_THREAD_LOCAL_VARIABLE_POINTERS",
+        0x15 => "S_THREAD_LOCAL_INIT_FUNCTION_POINTERS",
+        0x16 => "S_INIT_FUNC_OFFSETS",
+        other => return format!("unknown(0x{other:x})"),
+    };
+    name.to_owned()
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Converter {
     None,
@@ -187,6 +295,9 @@ fn symbol_with_address(obj: &Binary, address: u64, allow_empty: bool) -> Option<
 }
 
 pub(crate) fn check_file_headers(report: &mut Report, objects: &[crate::Binary]) {
+    if !report.require_format("file-header", objects, &["elf", "macho"]) {
+        return;
+    }
     report.add_diffs(diff_fields(
         objects,
         read_file_header_fields,
@@ -196,6 +307,12 @@ pub(crate) fn check_file_headers(report: &mut Report, objects: &[crate::Binary])
 }
 
 pub(crate) fn check_dynamic_headers(report: &mut Report, objects: &[crate::Binary]) {
+    // Note: `DiffMode::IgnoreIfAllErrors` means that on a non-ELF binary, where every side fails
+    // with "missing .dynamic", this pass reports nothing at all. That's precisely why the format
+    // gate has to come first.
+    if !report.require_format("dynamic", objects, &["elf"]) {
+        return;
+    }
     report.add_diffs(diff_fields(
         objects,
         read_dynamic_fields,
@@ -204,7 +321,15 @@ pub(crate) fn check_dynamic_headers(report: &mut Report, objects: &[crate::Binar
     ));
 }
 
+/// A Mach-O-specific pass. There is no ELF counterpart to record as missing: ELF alignment
+/// concerns are covered by the section and segment passes.
 pub(crate) fn check_macho_linkedit_alignment(report: &mut Report, objects: &[crate::Binary]) {
+    if !objects
+        .iter()
+        .all(|o| matches!(o.file, object::File::MachO64(_)))
+    {
+        return;
+    }
     report.add_diffs(diff_fields(
         objects,
         read_macho_linkedit_fields,
@@ -214,6 +339,10 @@ pub(crate) fn check_macho_linkedit_alignment(report: &mut Report, objects: &[cra
 }
 
 pub(crate) fn report_section_diffs(report: &mut Report, objects: &[Binary]) {
+    if !report.require_format("section", objects, &["elf", "macho"]) {
+        return;
+    }
+
     // Find section names defined by our first reference object. We ignore empty sections though,
     // since Wild will output empty sections if they have start/stop symbols that are referenced.
     let mut common_names: HashSet<&[u8]> = objects[1]
@@ -277,7 +406,61 @@ pub(crate) fn report_section_diffs(report: &mut Report, objects: &[Binary]) {
                             object,
                         );
                     }
-                    _ => {}
+                    object::File::MachO64(macho_file) => {
+                        let macho_section = macho_file
+                            .section_by_index(section.index())?
+                            .macho_section();
+
+                        // `align` is stored as a log2 exponent, unlike ELF's sh_addralign. Report
+                        // it in bytes so the two formats read the same way.
+                        values.insert(
+                            "alignment",
+                            1u64 << macho_section.align.get(e).min(63),
+                            Converter::None,
+                            object,
+                        );
+
+                        let flags = macho_section.flags.get(e).0;
+                        values.insert_string(
+                            "type",
+                            macho_section_type_name(flags & object::macho::SECTION_TYPE),
+                        );
+                        values.insert(
+                            "flags",
+                            u64::from(flags & object::macho::SECTION_ATTRIBUTES),
+                            Converter::BitFlags(MACHO_SECTION_ATTRIBUTE_NAMES),
+                            object,
+                        );
+
+                        // reserved1/reserved2 are meaningful for indirect-symbol-bearing sections
+                        // (__stubs, __got, ...): reserved1 is the index into the indirect symbol
+                        // table and reserved2 is the stub size. Both are properties the linker
+                        // chooses and dyld relies on.
+                        values.insert(
+                            "reserved1",
+                            macho_section.reserved1.get(e),
+                            Converter::None,
+                            object,
+                        );
+                        values.insert(
+                            "reserved2",
+                            macho_section.reserved2.get(e),
+                            Converter::None,
+                            object,
+                        );
+
+                        // A fully linked image must have no relocation entries left.
+                        values.insert(
+                            "nreloc",
+                            macho_section.nreloc.get(e),
+                            Converter::None,
+                            object,
+                        );
+                    }
+                    other => bail!(
+                        "report_section_diffs has no implementation for `{}`",
+                        crate::file_format_name(other)
+                    ),
                 }
 
                 Ok(values)
@@ -496,7 +679,6 @@ impl FieldValues {
     }
 }
 
-#[allow(clippy::unnecessary_wraps)]
 fn read_file_header_fields(obj: &Binary) -> Result<FieldValues> {
     let mut values = FieldValues::default();
     match &obj.file {
@@ -533,8 +715,19 @@ fn read_file_header_fields(obj: &Binary) -> Result<FieldValues> {
             );
             values.insert("cpusubtype", header.cpusubtype(e).0, Converter::None, obj);
             values.insert("filetype", header.filetype(e).0, Converter::None, obj);
+            values.insert("ncmds", header.ncmds(e), Converter::None, obj);
+            values.insert("sizeofcmds", header.sizeofcmds(e), Converter::None, obj);
+            values.insert(
+                "flags",
+                header.flags(e).0,
+                Converter::BitFlags(MACHO_HEADER_FLAG_NAMES),
+                obj,
+            );
         }
-        _ => {}
+        other => bail!(
+            "read_file_header_fields has no implementation for `{}`",
+            crate::file_format_name(other)
+        ),
     }
     Ok(values)
 }

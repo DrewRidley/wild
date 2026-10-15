@@ -1651,15 +1651,6 @@ fn setup_argument_parser() -> ArgumentParser<ElfArgs> {
 
     parser
         .declare()
-        .long("no-fork")
-        .help("Do not fork while linking")
-        .execute(|args, _modifier_stack| {
-            args.common_mut().should_fork = false;
-            Ok(())
-        });
-
-    parser
-        .declare()
         .long("no-update-in-place")
         .help("Delete and recreate the file")
         .execute(|args, _modifier_stack| {
@@ -2217,7 +2208,7 @@ mod tests {
                 .inputs
                 .iter()
                 .filter_map(|i| match &i.spec {
-                    InputSpec::File(_) | InputSpec::Search(_) => None,
+                    InputSpec::File(_) | InputSpec::Search(_) | InputSpec::Framework(_) => None,
                     InputSpec::Lib(lib_name) => Some(lib_name.as_ref()),
                 })
                 .collect_vec(),
@@ -2227,7 +2218,7 @@ mod tests {
         assert_contains(&args.lib_search_path, "/usr/lib");
         assert!(!args.common.inputs.iter().any(|i| match &i.spec {
             InputSpec::File(f) => f.as_ref() == Path::new("/usr/bin/ld"),
-            InputSpec::Lib(_) | InputSpec::Search(_) => false,
+            InputSpec::Lib(_) | InputSpec::Search(_) | InputSpec::Framework(_) => false,
         }));
         assert_eq!(
             args.version_script_path,
@@ -2241,7 +2232,7 @@ mod tests {
             Some(Box::from(Path::new("/usr/aarch64-linux-gnu")))
         );
         assert!(args.common.inputs.iter().any(|i| match &i.spec {
-            InputSpec::File(_) | InputSpec::Lib(_) => false,
+            InputSpec::File(_) | InputSpec::Lib(_) | InputSpec::Framework(_) => false,
             InputSpec::Search(lib) => lib.as_ref() == "lib85caec4suo0pxg06jm2ma7b0o.so",
         }));
         assert_eq!(args.rpath.as_deref(), Some("foo/:bar/:baz:somewhere"));

@@ -60,6 +60,10 @@ pub trait InputFileData: Send + Sync + std::fmt::Debug {
     fn verify_unchanged(&self) -> std::io::Result<bool> {
         Ok(true)
     }
+
+    fn modification_time(&self) -> Option<std::time::SystemTime> {
+        None
+    }
 }
 
 /// A sized, random-access linker output.
@@ -340,6 +344,10 @@ impl InputFileData for OsInputFile {
 
     fn verify_unchanged(&self) -> std::io::Result<bool> {
         Ok(std::fs::metadata(&self.path)?.modified()? == self.modification_time)
+    }
+
+    fn modification_time(&self) -> Option<std::time::SystemTime> {
+        Some(self.modification_time)
     }
 }
 

@@ -113,7 +113,12 @@ pub(crate) const LINK_EDIT_SEGMENT: OutputSectionId =
 pub(crate) const LOAD_COMMANDS: OutputSectionId = part_id::LOAD_COMMANDS.output_section_id();
 pub(crate) const CHAINED_FIXUP_TABLE: OutputSectionId =
     part_id::CHAINED_FIXUP_TABLE.output_section_id();
+pub(crate) const INDIRECT_SYMTAB: OutputSectionId = part_id::INDIRECT_SYMTAB.output_section_id();
+pub(crate) const UNWIND_INFO: OutputSectionId = part_id::UNWIND_INFO.output_section_id();
+pub(crate) const EXPORT_TRIE: OutputSectionId = part_id::EXPORT_TRIE.output_section_id();
 pub(crate) const CODE_SIGNATURE: OutputSectionId = part_id::CODE_SIGNATURE.output_section_id();
+pub(crate) const OBJC_STUBS: OutputSectionId = part_id::OBJC_STUBS.output_section_id();
+pub(crate) const OBJC_METHNAME: OutputSectionId = part_id::OBJC_METHNAME.output_section_id();
 
 // Wasm specific sections.
 pub(crate) const WASM_TYPE: OutputSectionId = part_id::WASM_TYPE.output_section_id();
@@ -149,8 +154,42 @@ pub(crate) const DATA_REL_RO: OutputSectionId = OutputSectionId::regular(14);
 // Mach-O specific sections
 pub(crate) const CSTRING: OutputSectionId = OutputSectionId::regular(15);
 pub(crate) const CONST: OutputSectionId = OutputSectionId::regular(16);
+/// Mach-O `__DATA,__thread_vars`, which holds one `tlv_descriptor` per thread-local variable.
+/// The thread-local data itself lives in TDATA / TBSS, as it does for ELF.
+pub(crate) const THREAD_VARS: OutputSectionId = OutputSectionId::regular(17);
+/// Mach-O `__DATA,__common`, holding common (tentative) definitions. Zerofill like BSS, but kept
+/// separate because ld64 keeps it separate.
+pub(crate) const COMMON: OutputSectionId = OutputSectionId::regular(18);
+/// Mach-O `__TEXT,__eh_frame`. Distinct from `EH_FRAME` above: that ID selects the frame-data
+/// handling, which on Mach-O we point at `__compact_unwind` instead. This one is copied through
+/// like any other section, because `__unwind_info` entries reach into it by offset.
+pub(crate) const MACHO_EH_FRAME: OutputSectionId = OutputSectionId::regular(19);
 
-pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 17;
+// Swift's metadata. The runtime finds these by segment and section name, so each keeps its own
+// name and they all live in `__TEXT` - a conformance recorded anywhere else is one the runtime
+// cannot see.
+pub(crate) const SWIFT5_TYPEREF: OutputSectionId = OutputSectionId::regular(20);
+pub(crate) const SWIFT5_REFLSTR: OutputSectionId = OutputSectionId::regular(21);
+pub(crate) const SWIFT5_FIELDMD: OutputSectionId = OutputSectionId::regular(22);
+pub(crate) const SWIFT5_ASSOCTY: OutputSectionId = OutputSectionId::regular(23);
+pub(crate) const SWIFT5_CAPTURE: OutputSectionId = OutputSectionId::regular(24);
+pub(crate) const SWIFT5_BUILTIN: OutputSectionId = OutputSectionId::regular(25);
+pub(crate) const SWIFT5_PROTO: OutputSectionId = OutputSectionId::regular(26);
+pub(crate) const SWIFT5_PROTOS: OutputSectionId = OutputSectionId::regular(27);
+pub(crate) const SWIFT5_TYPES: OutputSectionId = OutputSectionId::regular(28);
+pub(crate) const SWIFT5_ENTRY: OutputSectionId = OutputSectionId::regular(29);
+pub(crate) const SWIFT5_MPENUM: OutputSectionId = OutputSectionId::regular(30);
+pub(crate) const SWIFT5_REPLACE: OutputSectionId = OutputSectionId::regular(31);
+pub(crate) const SWIFT5_REPLAC2: OutputSectionId = OutputSectionId::regular(32);
+pub(crate) const SWIFT5_ACFUNCS: OutputSectionId = OutputSectionId::regular(33);
+pub(crate) const SWIFT_CONSTG: OutputSectionId = OutputSectionId::regular(34);
+pub(crate) const SWIFT_MODHASH: OutputSectionId = OutputSectionId::regular(35);
+/// Mach-O `__DATA,__objc_selrefs`: selector references, from the inputs and from the
+/// `_objc_msgSend$selector` trampolines the linker synthesizes. One section, because the runtime
+/// finds it by name and would only uniquify the selectors in the first.
+pub(crate) const OBJC_SELREFS: OutputSectionId = OutputSectionId::regular(36);
+
+pub(crate) const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 37;
 
 #[derive(Debug)]
 pub(crate) struct OutputSections<'data, P: Platform> {

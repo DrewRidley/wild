@@ -103,6 +103,18 @@ pub(crate) trait Arch: Send + Sync + 'static {
         r_type: <Self::Platform as Platform>::RelocationInfo,
     ) -> Cow<'static, str>;
 
+    /// Rewrites the instruction at the start of `instruction` so that it forms the address of the
+    /// symbol directly rather than loading it from a GOT entry. This is only called for GOT-style
+    /// relocations against a symbol that layout decided not to give a GOT entry to, which is why
+    /// the default is to refuse rather than to silently leave the instruction alone. Platforms
+    /// that always allocate a GOT entry for GOT-style relocations never reach this.
+    fn relax_got_load(
+        _r_type: <Self::Platform as Platform>::RelocationInfo,
+        _instruction: &mut [u8],
+    ) -> Result {
+        bail!("GOT-load relaxation is not implemented for this architecture");
+    }
+
     /// Get DTV OFFSET.
     fn get_dtv_offset() -> u64 {
         0
@@ -736,6 +748,35 @@ pub(crate) trait Platform:
         symbol_db: &SymbolDb<Self>,
     ) -> Result;
 
+    /// A symbol the linker defines itself when an object refers to `name` and nothing defines it:
+    /// which kind, or `None` if the name is simply undefined. Mach-O's `_objc_msgSend$selector`
+    /// trampolines are the case - clang emits the call and leaves the callee to the linker.
+    fn synthetic_symbol_for_undefined(_name: &[u8]) -> Option<Self::PlatformSpecificSymbol> {
+        None
+    }
+
+    /// A symbol that a reference to the undefined `name` is also a reference to, so it has to be
+    /// loaded and given a GOT slot although nothing names it directly.
+    fn dependency_of_undefined(_name: &[u8]) -> Option<&'static [u8]> {
+        None
+    }
+
+    /// Resolves a platform-specific linker symbol, claiming whatever room it needs as it goes.
+    /// Paired with `finalise_sizes_for_symbol`, which reserved that room.
+    fn platform_symbol_resolution(
+        _symbol: Self::PlatformSpecificSymbol,
+        _name: &[u8],
+        flags: ValueFlags,
+        _memory_offsets: &mut OutputSectionPartMap<u64>,
+    ) -> layout::Resolution<Self> {
+        layout::Resolution {
+            raw_value: 0,
+            dynamic_symbol_index: None,
+            flags,
+            format_specific: Default::default(),
+        }
+    }
+
     fn allocate_prelude(common: &mut CommonGroupState<Self>, symbol_db: &SymbolDb<Self>);
 
     fn finalise_prelude_layout<'data>(
@@ -830,6 +871,27 @@ pub(crate) trait Platform:
     /// Whether the symbol table's first entry (index 0) is a reserved null / sentinel entry that
     /// should be excluded from name resolution. `true` for ELF (`STN_UNDEF`).
     const HAS_NULL_SYMBOL_ENTRY: bool = false;
+
+    /// Whether a definition that loses to another should have its content dropped even when we're
+    /// not removing unreachable code.
+    ///
+    /// ELF says no, because it has already happened: duplicate definitions of an inline function
+    /// arrive in COMDAT groups and the losing group is discarded when the group is read. Mach-O has
+    /// no groups - the duplicates are ordinary content that only the symbol table distinguishes -
+    /// so unless this is done, every copy of every template instantiation reaches the output.
+    const COALESCES_LOSING_DEFINITIONS: bool = false;
+
+    /// Whether exported symbols are numbered in a table that references can name them by.
+    ///
+    /// ELF has `.dynsym`, so each export gets an index and a relocation names it by that. Mach-O
+    /// has no such table - what an image exports is a trie over the names, searched by name - so
+    /// there is no index to hand out.
+    const HAS_DYNAMIC_SYMBOL_TABLE: bool = true;
+
+    /// Whether the file naming what to export lists one name per line rather than grouping them in
+    /// braces. ELF's version script does the latter, and can also say what is hidden; Mach-O's
+    /// `-exported_symbols_list` is the plain form.
+    const EXPORT_LIST_IS_PLAIN_LINES: bool = false;
 
     /// Used when the linker needs to create a symtab entry from scratch rather than copying one
     /// from an input file.
@@ -969,11 +1031,30 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
         &<Self::Platform as Platform>::SectionHeader,
     )>;
 
+    /// Whether the object defines an Objective-C class or category.
+    fn defines_objc_metadata(&self) -> bool {
+        false
+    }
+
     fn symbol_section(
         &self,
         symbol: &<Self::Platform as Platform>::SymtabEntry,
         index: object::SymbolIndex,
     ) -> Result<Option<object::SectionIndex>>;
+
+    /// Returns whether `symbol` names a thread-local variable.
+    ///
+    /// ELF marks this on the symbol itself, so the default answer just asks the symbol. Mach-O only
+    /// marks it on the section that the symbol is defined in, which is why this takes the defining
+    /// object rather than living on `Symbol`.
+    fn is_symbol_thread_local(
+        &self,
+        symbol: &<Self::Platform as Platform>::SymtabEntry,
+        index: object::SymbolIndex,
+    ) -> Result<bool> {
+        let _ = index;
+        Ok(symbol.is_tls())
+    }
 
     fn symbol_versions(&self) -> &[<Self::Platform as Platform>::SymbolVersionIndex];
 
@@ -1360,6 +1441,27 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
         &[]
     }
 
+    /// Whether a list of symbols to export narrows what a shared object offers, rather than only
+    /// adding to what an executable offers.
+    ///
+    /// On ELF a shared object exports everything and a version script is what takes things away, so
+    /// the list only ever adds. Mach-O has no version scripts: `-exported_symbols_list` is the way
+    /// to narrow a dylib, and a dylib that ignored it would offer everything it defines.
+    fn export_list_restricts_exports(&self) -> bool {
+        false
+    }
+
+    /// Names given one at a time rather than in a file, to withhold from what the output offers.
+    fn force_unexport_symbol_names(&self) -> &[String] {
+        &[]
+    }
+
+    /// Whether an archive member that defines Objective-C metadata is to be loaded whether or not
+    /// anything refers to it.
+    fn loads_objc_archive_members(&self) -> bool {
+        false
+    }
+
     fn force_export_symbol_names(&self) -> &[String] {
         &[]
     }
@@ -1376,6 +1478,11 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
 
     fn lib_search_path(&self) -> &[Box<Path>];
 
+    /// Where to look for Mach-O frameworks. Empty on formats that have no such notion.
+    fn framework_search_path(&self) -> &[Box<Path>] {
+        &[]
+    }
+
     fn output(&self) -> &Arc<Path> {
         &self.common().output
     }
@@ -1385,6 +1492,14 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
     fn common_mut(&mut self) -> &mut crate::args::CommonArgs;
 
     fn sysroot(&self) -> Option<&Path> {
+        None
+    }
+
+    /// A list of symbols to withhold, rather than one of symbols to offer.
+    ///
+    /// The two are alternatives: a list of what to keep says nothing about the rest by implication,
+    /// and a list of what to drop says nothing about the rest either.
+    fn unexport_list_path(&self) -> Option<&Path> {
         None
     }
 
@@ -1409,6 +1524,19 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
     }
 
     fn should_emit_got_plt_syms(&self) -> bool {
+        false
+    }
+
+    /// Returns whether the output must be written to a freshly created file rather than by
+    /// updating an existing one in place.
+    ///
+    /// Mach-O executables carry a code signature that covers the whole file. Once such a binary
+    /// has been executed, the kernel caches the signature validation state against that vnode, so
+    /// rewriting the same inode leaves the cache describing content that is no longer there and
+    /// the next exec is killed with SIGKILL. The file we write is byte-for-byte correct - only the
+    /// kernel's view of it is stale - so nothing short of giving the new content a new inode
+    /// avoids this. See `default_file_replacement_mode`.
+    fn requires_fresh_output_file(&self) -> bool {
         false
     }
 

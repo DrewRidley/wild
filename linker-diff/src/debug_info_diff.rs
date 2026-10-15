@@ -158,6 +158,12 @@ fn diff_debug_info(
 }
 
 pub(crate) fn check_debug_info(report: &mut Report, objects: &[crate::Binary]) {
+    // `read_file_debug_info` asks for gimli's ELF section names (`.debug_info`, ...). Mach-O calls
+    // them `__debug_info`, so nothing is ever found, zero compilation units are compared, and the
+    // pass reports success without having read a single byte of DWARF.
+    if !report.require_format("debug-info", objects, &["elf"]) {
+        return;
+    }
     report.add_diffs(diff_debug_info(
         objects,
         read_file_debug_info,

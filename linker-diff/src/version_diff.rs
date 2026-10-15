@@ -11,6 +11,10 @@ use object::elf::VER_FLG_BASE;
 use object::read::elf::Sym;
 
 pub(crate) fn report_diffs(report: &mut crate::Report, objects: &[crate::Binary]) {
+    // Both readers below early-return an empty `FieldValues` for non-ELF, which reports nothing.
+    if !report.require_format("version", objects, &["elf"]) {
+        return;
+    }
     report.add_diffs(crate::header_diff::diff_fields(
         objects,
         read_gnu_version_d,

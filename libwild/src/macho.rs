@@ -21,6 +21,7 @@ use crate::layout::SymbolCopyInfo;
 use crate::layout::SymbolResolutions;
 use crate::layout_rules::SectionKind;
 use crate::layout_rules::SectionRule;
+use crate::layout_rules::SectionRuleOutcome;
 use crate::macho_object::CodeSignatureBlobIndex;
 use crate::macho_object::CodeSignatureCodeDirectory;
 use crate::macho_object::CodeSignatureSuperBlob;
@@ -35,6 +36,7 @@ use crate::output_section_id::SectionName;
 use crate::output_section_id::SectionOutputInfo;
 use crate::output_section_part_map::OutputSectionPartMap;
 use crate::part_id;
+use crate::part_id::PartId;
 use crate::platform;
 use crate::platform::Args;
 use crate::platform::ObjectFile;
@@ -45,6 +47,7 @@ use crate::value_flags::ValueFlags;
 use crate::verbose_timing_phase;
 use anyhow::Context;
 use itertools::Itertools;
+use linker_utils::elf::RelocationKind;
 use object::Endianness;
 use object::SymbolIndex;
 use object::macho;
@@ -52,6 +55,7 @@ use object::macho::N_ABS;
 use object::macho::N_EXT;
 use object::macho::N_PEXT;
 use object::macho::N_SECT;
+use object::macho::N_UNDF;
 use object::macho::N_WEAK_DEF;
 use object::macho::SEG_LINKEDIT;
 use object::macho::Section64;
@@ -63,6 +67,7 @@ use object::read::macho::Segment;
 use std::borrow::Cow;
 use std::num::NonZeroU8;
 use std::num::NonZeroU64;
+use std::ops::Range;
 
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct MachO;
@@ -82,14 +87,124 @@ pub(crate) const DYLINKER_PATH: &[u8] = b"/usr/lib/dyld";
 // TODO: Getting the number of active segments in epilogue depends on determine_header_size
 // which is called later for the prologue. We potentially over-allocate a couple of bytes.
 pub(crate) const MAX_SEGMENT_COUNT: usize = 6;
+
+/// The number of segments that can hold chained fixups, and therefore the number of
+/// `dyld_chained_starts_in_segment` records the fixup table might have to hold. Applying a fixup
+/// is a store into the segment, so only the writable data segments qualify: `__DATA` and
+/// `__DATA_CONST`.
+pub(crate) const MAX_FIXUP_SEGMENT_COUNT: usize = 2;
+
 pub(crate) const CHAINED_FIXUP_TABLE_BASE_SIZE: u64 = (size_of::<ChainedFixupsHeader>()
     + size_of::<u32>() * (MAX_SEGMENT_COUNT + /* leading segment count */ 1)
-    + size_of::<DyldChainedStartsInSegment>())
-    as u64;
+    + MAX_FIXUP_SEGMENT_COUNT * size_of::<DyldChainedStartsInSegment>()
+    // The imports table is aligned, so there may be padding before it.
+    + size_of::<u32>()) as u64;
 pub(crate) const CHAINED_FIXUP_IMPORT_SIZE: u64 = size_of::<u32>() as u64;
 pub(crate) const CHAINED_FIXUP_PAGE_START_SIZE: u64 = size_of::<u16>() as u64;
 pub(crate) const GOT_ENTRY_SIZE: u64 = 8;
+/// One `u32` symbol index per symbol-pointer or stub slot.
+pub(crate) const INDIRECT_SYMTAB_ENTRY_SIZE: u64 = size_of::<u32>() as u64;
 pub(crate) const PLT_ENTRY_SIZE: u64 = 12;
+
+/// The name clang gives a call it wants the linker to turn into a selector-loading trampoline: the
+/// selector follows the `$`, and the linker writes the callee.
+pub(crate) const OBJC_MSGSEND_STUB_PREFIX: &[u8] = b"_objc_msgSend$";
+
+/// What every such trampoline tail-calls.
+pub(crate) const OBJC_MSGSEND: &[u8] = b"_objc_msgSend";
+
+/// The size of one `__objc_stubs` entry: the "fast" form ld64 defaults to, which reaches
+/// `_objc_msgSend` through the GOT rather than through `__stubs`. Five instructions and three
+/// `brk` of padding.
+pub(crate) const OBJC_STUB_SIZE: u64 = 32;
+
+/// Returns the selector a `_objc_msgSend$selector` symbol names, or `None` for any other name.
+pub(crate) fn objc_stub_selector(name: &[u8]) -> Option<&[u8]> {
+    name.strip_prefix(OBJC_MSGSEND_STUB_PREFIX)
+}
+
+/// The symbols the linker defines for itself on this platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkerSymbol {
+    /// A `_objc_msgSend$selector` trampoline: loads the selector reference into x1 and tail-calls
+    /// `_objc_msgSend`, so that a call site can name the selector as a callee.
+    ObjcMsgSendStub,
+}
+
+/// One `compact_unwind_entry`: the function's address, its length, how to unwind it, and where its
+/// personality routine and language-specific data are.
+pub(crate) const COMPACT_UNWIND_ENTRY_SIZE: u64 = 32;
+/// Offset of the personality field within an entry.
+pub(crate) const COMPACT_UNWIND_PERSONALITY_OFFSET: u64 = 16;
+/// Offset of the language-specific data area field within an entry.
+pub(crate) const COMPACT_UNWIND_LSDA_OFFSET: u64 = 24;
+
+/// What one function costs in `__unwind_info`, whichever way its page ends up being written.
+///
+/// A regular entry is eight bytes. A compressed one is four, and may bring a four-byte encoding
+/// with it if no other function on the page shares it - so eight covers the worse of the two. The
+/// landing pad index is counted separately, for the functions that actually have one.
+pub(crate) const UNWIND_INFO_BYTES_PER_ENTRY: u64 = 8;
+
+/// `unwind_info_section_header`: version, then a (offset, count) pair for each of the common
+/// encodings, the personalities and the index.
+pub(crate) const UNWIND_INFO_HEADER_SIZE: u64 = 7 * size_of::<u32>() as u64;
+/// An entry's encoding names its personality by a two-bit index into the personality array, so
+/// there is no room for a fourth.
+pub(crate) const UNWIND_INFO_MAX_PERSONALITIES: u64 = 3;
+/// `unwind_info_section_header_index_entry`: the first function on the page, where the page is, and
+/// where its LSDA index starts.
+pub(crate) const UNWIND_INFO_INDEX_ENTRY_SIZE: u64 = 3 * size_of::<u32>() as u64;
+/// `unwind_info_regular_second_level_page_header`: the kind, then where its entries start and how
+/// many there are.
+pub(crate) const UNWIND_INFO_PAGE_HEADER_SIZE: u64 = 2 * size_of::<u32>() as u64;
+/// `unwind_info_compressed_second_level_page_header`: the same, and then where the encodings this
+/// page uses start and how many of them there are.
+pub(crate) const UNWIND_INFO_COMPRESSED_PAGE_HEADER_SIZE: u64 =
+    size_of::<u32>() as u64 + 4 * size_of::<u16>() as u64;
+/// How large a second-level page may be. ld64 uses 4 KiB and so do we.
+pub(crate) const UNWIND_INFO_PAGE_SIZE: u64 = 4096;
+/// How many functions one second-level page describes.
+///
+/// A compressed page is what we normally write, and in the worst case - no two functions sharing
+/// an encoding - it costs four bytes for the entry and four more for the encoding it names. That,
+/// plus the header, is what has to fit.
+pub(crate) const UNWIND_INFO_PAGE_CAPACITY: u64 = (UNWIND_INFO_PAGE_SIZE
+    - UNWIND_INFO_COMPRESSED_PAGE_HEADER_SIZE)
+    / (UNWIND_INFO_COMPRESSED_ENTRY_SIZE + size_of::<u32>() as u64);
+/// `unwind_info_regular_second_level_entry`: the function's address and how to unwind it.
+pub(crate) const UNWIND_INFO_ENTRY_SIZE: u64 = 2 * size_of::<u32>() as u64;
+/// `unwind_info_section_header_lsda_index_entry`: the function's address and its LSDA's.
+pub(crate) const UNWIND_INFO_LSDA_ENTRY_SIZE: u64 = 2 * size_of::<u32>() as u64;
+/// The only version of the format there has ever been.
+pub(crate) const UNWIND_SECTION_VERSION: u32 = 1;
+/// A second-level page whose entries each carry their own encoding, as opposed to the compressed
+/// form, where they carry an index into the common encodings array instead.
+pub(crate) const UNWIND_SECOND_LEVEL_REGULAR: u32 = 2;
+/// A second-level page whose entries name their encoding by index and hold the function's address
+/// as an offset from the page's first, so that both fit in one word instead of two.
+pub(crate) const UNWIND_SECOND_LEVEL_COMPRESSED: u32 = 3;
+/// `unwind_info_compressed_second_level_entry`: the encoding index and the function offset, packed.
+pub(crate) const UNWIND_INFO_COMPRESSED_ENTRY_SIZE: u64 = size_of::<u32>() as u64;
+/// How far into the page's range a compressed entry can name, being the low 24 bits of its word.
+pub(crate) const UNWIND_INFO_COMPRESSED_FUNCTION_OFFSET_MASK: u32 = 0x00ff_ffff;
+/// Where the encoding index sits in a compressed entry.
+pub(crate) const UNWIND_INFO_COMPRESSED_ENCODING_SHIFT: u32 = 24;
+/// How many encodings the whole image may share. The index is eight bits and page-local encodings
+/// are numbered after the shared ones, so the shared table stops well short of 256; ld64 stops at
+/// 127 and so do we.
+pub(crate) const UNWIND_INFO_MAX_COMMON_ENCODINGS: usize = 127;
+/// How many encodings one entry can name at all, shared and page-local together.
+pub(crate) const UNWIND_INFO_MAX_ENCODINGS_PER_PAGE: usize = 256;
+/// Selects which of the four ways of describing a function an encoding uses.
+pub(crate) const UNWIND_ARM64_MODE_MASK: u32 = 0x0f00_0000;
+/// The function can't be described compactly, so the encoding names a DWARF frame in `__eh_frame`
+/// instead - by its offset, in the remaining bits.
+pub(crate) const UNWIND_ARM64_MODE_DWARF: u32 = 0x0300_0000;
+pub(crate) const UNWIND_ARM64_DWARF_SECTION_OFFSET: u32 = 0x00ff_ffff;
+/// Position of the personality index within a compact unwind encoding. Two bits wide, which is what
+/// limits an image to three personality routines.
+pub(crate) const UNWIND_PERSONALITY_SHIFT: u32 = 28;
 
 pub(crate) const SEG_DATA_CONST: &str = "__DATA_CONST";
 
@@ -97,7 +212,7 @@ type SectionHeader = Section64<crate::macho::Endianness>;
 type SectionTable<'data> = &'data [Section64<crate::macho::Endianness>];
 type SymbolTable<'data> = object::read::macho::SymbolTable<'data, macho::MachHeader64<Endianness>>;
 type SymtabEntry = object::macho::Nlist64<Endianness>;
-type Relocation = object::macho::Relocation<Endianness>;
+pub(crate) type Relocation = object::macho::Relocation<Endianness>;
 
 pub(crate) type FileHeader = object::macho::MachHeader64<Endianness>;
 pub(crate) type SegmentCommand = object::macho::SegmentCommand64<Endianness>;
@@ -105,10 +220,12 @@ pub(crate) type SectionEntry = object::macho::Section64<Endianness>;
 pub(crate) type EntryPointCommand = object::macho::EntryPointCommand<Endianness>;
 pub(crate) type DylinkerCommand = object::macho::DylinkerCommand<Endianness>;
 pub(crate) type DylibCommand = object::macho::DylibCommand<Endianness>;
+pub(crate) type RpathCommand = object::macho::RpathCommand<Endianness>;
 pub(crate) type CodeSignatureCommand = object::macho::LinkeditDataCommand<Endianness>;
 pub(crate) type DyldChainedFixupsCommand = object::macho::LinkeditDataCommand<Endianness>;
 pub(crate) type ChainedFixupsHeader = DyldChainedFixupsHeader;
 pub(crate) type SymtabCommand = object::macho::SymtabCommand<Endianness>;
+pub(crate) type DysymtabCommand = object::macho::DysymtabCommand<Endianness>;
 pub(crate) type BuildVersionCommand = object::macho::BuildVersionCommand<Endianness>;
 pub(crate) type UuidCommand = object::macho::UuidCommand<Endianness>;
 
@@ -138,20 +255,496 @@ pub(crate) fn code_signature_padded_identifier_size(args: &MachOArgs) -> u64 {
     (code_signature_identifier(args).len() as u64 + 1).next_multiple_of(CS_SECTION_ALIGNMENT)
 }
 
+/// The name a dylib we're producing records for itself, which is what an image linking against it
+/// will look for. Distinct from `install_name`, which reads the name out of a dylib we're reading.
+///
+/// Falls back to the output path when `-install_name` wasn't given, which is what ld64 does.
+pub(crate) fn own_install_name(args: &MachOArgs) -> &[u8] {
+    args.install_name
+        .as_deref()
+        .map_or_else(|| args.output_path_bytes(), str::as_bytes)
+}
+
 pub(crate) fn load_dylib_command_size(path: &[u8]) -> usize {
     (size_of::<DylibCommand>() + path.len() + 1).next_multiple_of(MACHO_COMMAND_ALIGNMENT)
+}
+
+/// The size of the `LC_RPATH` command naming one search directory, terminator and padding included.
+pub(crate) fn rpath_command_size(path: &str) -> usize {
+    (size_of::<RpathCommand>() + path.len() + 1).next_multiple_of(MACHO_COMMAND_ALIGNMENT)
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct LayoutExt {
     /// Imported STUB library symbols, sorted by GOT.
     pub(crate) imported_symbols: Vec<ImportedSymbolWithResolution>,
+
+    /// Symbols defined in this image that were nonetheless given a `__got` slot, because something
+    /// stores the address of the slot rather than reading through it. Sorted by slot address.
+    /// Unlike an import, the slot's contents are known at link time - it holds the symbol's own
+    /// address, and needs a rebase so that it follows the image when dyld slides it.
+    pub(crate) local_got_symbols: Vec<LocalGotSymbol>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocalGotSymbol {
+    pub(crate) got_address: NonZeroU64,
+    pub(crate) value: u64,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct FinaliseSizesExt {
     imported_libraries: Vec<FileId>,
     imported_symbols: Vec<SymbolId>,
+}
+
+/// One piece of unwind data, held against the function it describes rather than counted where it
+/// was found.
+///
+/// Both kinds of unwind data an object can carry end up here: a `__LD,__compact_unwind` entry,
+/// which becomes a row of `__unwind_info`, and an `__eh_frame` FDE, which is copied through for the
+/// functions `__unwind_info` can't describe compactly. Neither earns its place unless the function
+/// is still in the output, and what it points at - a personality routine, a language-specific data
+/// area - is only worth keeping for the same reason. Reaching them from here rather than from the
+/// section means the unwind data follows the code instead of anchoring it.
+#[derive(Debug)]
+pub(crate) struct FrameEntry {
+    /// Where this entry's relocations sit in `ObjectLayoutStateExt::frame_relocations`.
+    relocations: Range<u32>,
+
+    /// The section the entry was read from, needed to reach those relocations again once the
+    /// function turns out to be live.
+    section_index: object::SectionIndex,
+
+    /// The entry before this one for the same function. A function commonly has both a compact
+    /// entry and an FDE, and can have several of either.
+    previous_frame_for_section: Option<platform::FrameIndex>,
+
+    kind: FrameKind,
+}
+
+#[derive(Debug)]
+enum FrameKind {
+    /// A 32-byte `__compact_unwind` entry, which costs a fixed-size row of `__unwind_info`.
+    CompactUnwind,
+
+    /// An `__eh_frame` FDE, which costs its own bytes because it is copied through verbatim.
+    Fde {
+        /// The whole record, length field included.
+        size: u32,
+    },
+}
+
+/// Which of a parent section's relocations fall inside one of the atoms cut from it.
+///
+/// Relocations arrive in address order - clang emits them from the end of a section backwards - so
+/// an atom's are a contiguous run and can be found rather than sifted out of the whole list. That
+/// matters because there is one atom per function: sifting means every atom walks every relocation
+/// of the section it came from, which on an object holding a whole crate is a hundred thousand
+/// relocations walked one and a half thousand times over.
+///
+/// `None` means the order isn't there to exploit and the caller should consider all of them, which
+/// is what it did before this existed.
+pub(crate) fn atom_relocation_range(
+    relocations: &[Relocation],
+    span: &std::ops::Range<u64>,
+) -> Option<std::ops::Range<usize>> {
+    let address = |index: usize| u64::from(relocations[index].info(LE).r_address);
+
+    if relocations.len() > 1 && address(0) >= address(relocations.len() - 1) {
+        // Descending, which is what clang emits.
+        let first = relocations.partition_point(|r| u64::from(r.info(LE).r_address) >= span.end);
+        let last = relocations.partition_point(|r| u64::from(r.info(LE).r_address) >= span.start);
+
+        return Some(first..last);
+    }
+
+    if relocations.is_sorted_by_key(|r| u64::from(r.info(LE).r_address)) {
+        let first = relocations.partition_point(|r| u64::from(r.info(LE).r_address) < span.start);
+        let last = relocations.partition_point(|r| u64::from(r.info(LE).r_address) < span.end);
+
+        return Some(first..last);
+    }
+
+    None
+}
+
+/// Whether `-unexported_symbols_list` withholds this symbol.
+///
+/// A withheld symbol becomes local to the image rather than disappearing: it still names its own
+/// code for a debugger and for anything that walks the symbol table, it just stops being something
+/// another image can bind to. That is one decision, and it has to be made the same way when the
+/// symbol table is measured as when it is written, or the two runs `LC_DYSYMTAB` names would not
+/// be the sizes it was told.
+pub(crate) fn is_unexported<'data>(
+    symbol_db: &crate::symbol_db::SymbolDb<'data, MachO>,
+    name: &[u8],
+) -> bool {
+    symbol_db
+        .unexport_list
+        .as_ref()
+        .is_some_and(|list| list.contains(&crate::symbol::UnversionedSymbolName::prehashed(name)))
+}
+
+/// Returns the section holding the function a `__compact_unwind` entry describes.
+///
+/// The answer is an atom rather than one of the object's own sections, because atoms are what the
+/// output places and what dead-stripping drops - which is the whole point of asking.
+fn compact_unwind_target_section(
+    object: &crate::layout::ObjectLayoutState<'_, MachO>,
+    info: object::macho::RelocationInfo,
+    data: &[u8],
+) -> Result<Option<object::SectionIndex>> {
+    if info.r_extern {
+        // Naming a symbol, so the section is whichever one defines it.
+        let symbol_index = SymbolIndex(info.r_symbolnum as usize);
+        let symbol = object.object.symbol(symbol_index)?;
+
+        return object.object.symbol_section(symbol, symbol_index);
+    }
+
+    // Naming a section instead, numbered from one, with the function's address in the object's own
+    // addressing stored in the entry.
+    let section_index = (info.r_symbolnum as usize)
+        .checked_sub(1)
+        .context("Section number zero in a __compact_unwind relocation")?;
+
+    let offset = info.r_address as usize;
+    let Some(stored) = data
+        .get(offset..offset + size_of::<u64>())
+        .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("just sized")))
+    else {
+        return Ok(None);
+    };
+
+    Ok(object
+        .object
+        .atom_for_address(object::SectionIndex(section_index), stored))
+}
+
+/// The name Mach-O gives the DWARF call-frame-information section.
+pub(crate) const EH_FRAME_SECTION_NAME: &[u8] = b"__eh_frame";
+
+/// Where `__eh_frame` content is allocated. Records are copied whole and in input order, so a
+/// single part is all that's needed - the alignment is the section's, not any record's.
+pub(crate) const EH_FRAME_PART_ID: crate::part_id::PartId =
+    output_section_id::MACHO_EH_FRAME.part_id_with_alignment(alignment::USIZE);
+
+/// Where an FDE says which function it describes, as a distance from that field.
+pub(crate) const FDE_PC_BEGIN_OFFSET: u32 = 8;
+
+/// One record of an `__eh_frame` section.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EhFrameRecord {
+    pub(crate) offset: u32,
+
+    /// The whole record, its length field included.
+    pub(crate) size: u32,
+
+    /// Where this FDE's CIE starts, or `None` if the record is itself a CIE.
+    pub(crate) cie_offset: Option<u32>,
+}
+
+/// Splits an `__eh_frame` section into its records.
+///
+/// The format is self-describing - a length, then a field that is zero for a CIE and otherwise says
+/// how far back the FDE's CIE sits - so walking it needs no relocations and gives the same answer
+/// during layout and during writing, which is what lets the two agree on what is being emitted.
+pub(crate) fn eh_frame_records(data: &[u8]) -> Result<Vec<EhFrameRecord>> {
+    const PREFIX_LEN: usize = 2 * size_of::<u32>();
+
+    let mut records = Vec::new();
+    let mut offset = 0;
+
+    while offset + PREFIX_LEN <= data.len() {
+        let length = u32::from_le_bytes(data[offset..offset + 4].try_into()?);
+
+        // The end marker. Anything after it isn't a record; lld stops here and so do we.
+        if length == 0 {
+            break;
+        }
+
+        ensure!(
+            length != u32::MAX,
+            "__eh_frame record at {offset:#x} uses the 64-bit length form, which we don't support"
+        );
+
+        let size = size_of::<u32>() + length as usize;
+        let end = offset
+            .checked_add(size)
+            .context("__eh_frame record length overflows")?;
+
+        ensure!(
+            end <= data.len(),
+            "__eh_frame record at {offset:#x} runs past the end of the section"
+        );
+
+        let cie_id = u32::from_le_bytes(data[offset + 4..offset + 8].try_into()?);
+
+        // An FDE stores how far back its CIE is from the field holding that distance, which is why
+        // the same CIE is named by a different value in every FDE that extends it.
+        let cie_offset = if cie_id == 0 {
+            None
+        } else {
+            Some(
+                (offset as u32 + size_of::<u32>() as u32)
+                    .checked_sub(cie_id)
+                    .with_context(|| {
+                        format!("FDE at {offset:#x} names a CIE before the start of __eh_frame")
+                    })?,
+            )
+        };
+
+        records.push(EhFrameRecord {
+            offset: offset as u32,
+            size: size as u32,
+            cie_offset,
+        });
+
+        offset = end;
+    }
+
+    Ok(records)
+}
+
+/// Groups a frame section's relocations by the record they land in.
+///
+/// They are written in descending address order by clang and nothing requires any order at all, so
+/// they are bucketed rather than sliced.
+pub(crate) fn relocations_by_record(
+    records: &[EhFrameRecord],
+    relocations: &[Relocation],
+) -> Vec<Vec<u32>> {
+    let mut by_record: Vec<Vec<u32>> = vec![Vec::new(); records.len()];
+
+    for (index, relocation) in relocations.iter().enumerate() {
+        let address = relocation.info(LE).r_address;
+
+        let Some(record_index) = records
+            .partition_point(|record| record.offset <= address)
+            .checked_sub(1)
+        else {
+            continue;
+        };
+
+        let record = &records[record_index];
+
+        if address < record.offset + record.size {
+            by_record[record_index].push(index as u32);
+        }
+    }
+
+    by_record
+}
+
+/// Accounts for one input `__eh_frame` section.
+///
+/// The FDEs are hung off the functions they describe and cost nothing yet; the CIEs are recorded
+/// whole, since they are shared and small, and are paid for later if any FDE of this object turns
+/// out to be worth keeping.
+fn load_eh_frame<'data, 'scope, A: platform::Arch<Platform = MachO>>(
+    object: &mut crate::layout::ObjectLayoutState<'data, MachO>,
+    section_index: object::SectionIndex,
+    resources: &'scope crate::layout::GraphResources<'data, '_, MachO>,
+    queue: &mut crate::layout::LocalWorkQueue,
+    scope: &rayon::Scope<'scope>,
+) -> Result {
+    let section = object.object.section(section_index)?;
+    let data = object.object.raw_section_data(section)?;
+    let records = eh_frame_records(data)?;
+
+    let relocations = object
+        .object
+        .relocations(section_index, &object.relocations)?
+        .relocations;
+
+    let by_record = relocations_by_record(&records, relocations);
+
+    for (record, bucket) in records.iter().zip(by_record) {
+        let Some(_cie_offset) = record.cie_offset else {
+            object.format_specific.cie_bytes += u64::from(record.size);
+
+            // A CIE names its personality routine through the GOT. We keep every CIE of an object
+            // that contributes any FDE at all, so there is no later moment at which to ask this -
+            // and a personality that only a dropped CIE named costs one unused slot, not
+            // correctness.
+            for &index in &bucket {
+                process_relocation::<A>(
+                    object,
+                    &relocations[index as usize],
+                    section_index,
+                    resources,
+                    queue,
+                    scope,
+                )?;
+            }
+
+            continue;
+        };
+
+        let pc_begin = record.offset + FDE_PC_BEGIN_OFFSET;
+
+        let info = bucket
+            .iter()
+            .map(|&index| relocations[index as usize].info(LE))
+            .find(|info| {
+                info.r_address == pc_begin && info.r_type == object::macho::ARM64_RELOC_UNSIGNED
+            })
+            .with_context(|| {
+                format!(
+                    "FDE at {:#x} of `{}` has no relocation naming the function it describes",
+                    record.offset,
+                    object.object.section_display_name(section_index)
+                )
+            })?;
+
+        // Unlike a `__compact_unwind` entry, an FDE stores a distance rather than an address, so
+        // there is nothing to look the function up by if the relocation doesn't name it outright.
+        ensure!(
+            info.r_extern,
+            "FDE at {:#x} of `{}` names its function by section rather than by symbol",
+            record.offset,
+            object.object.section_display_name(section_index)
+        );
+
+        let symbol_index = SymbolIndex(info.r_symbolnum as usize);
+        let symbol = object.object.symbol(symbol_index)?;
+
+        let Some(target_section_index) = object.object.symbol_section(symbol, symbol_index)? else {
+            continue;
+        };
+
+        let Some(unloaded) = object.sections[target_section_index.0].unloaded_mut() else {
+            // Already loaded, or not a section that can hold code. Either way there is no
+            // pending-load slot to hang this on.
+            continue;
+        };
+
+        let frame_index =
+            platform::FrameIndex::from_usize(object.format_specific.frame_entries.len());
+        let previous_frame_for_section = unloaded.last_frame_index.replace(frame_index);
+
+        // The anchor the pc-begin and landing-pad fields are measured from is a symbol in this very
+        // section. Following it would ask for `__eh_frame` to be loaded as though it were ordinary
+        // data, which is exactly the anchoring this is here to remove, and it tells us nothing: the
+        // writer resolves those fields from where the record lands.
+        let start = object.format_specific.frame_relocations.len() as u32;
+
+        for index in bucket {
+            let info = relocations[index as usize].info(LE);
+
+            if info.r_extern {
+                let symbol_index = SymbolIndex(info.r_symbolnum as usize);
+                let symbol = object.object.symbol(symbol_index)?;
+
+                if object.object.symbol_section(symbol, symbol_index)? == Some(section_index) {
+                    continue;
+                }
+            }
+
+            object.format_specific.frame_relocations.push(index);
+        }
+
+        let end = object.format_specific.frame_relocations.len() as u32;
+
+        object.format_specific.frame_entries.push(FrameEntry {
+            relocations: start..end,
+            section_index,
+            previous_frame_for_section,
+            kind: FrameKind::Fde { size: record.size },
+        });
+    }
+
+    Ok(())
+}
+
+/// Accounts for one input `__LD,__compact_unwind` section.
+///
+/// Each entry describes one function and becomes one row of the `__unwind_info` table we build in
+/// its place. Nothing is read here beyond which function that is.
+fn load_compact_unwind(
+    object: &mut crate::layout::ObjectLayoutState<'_, MachO>,
+    section_index: object::SectionIndex,
+) -> Result {
+    let section = object.object.section(section_index)?;
+    let data = object.object.raw_section_data(section)?;
+
+    let relocations = object
+        .object
+        .relocations(section_index, &object.relocations)?
+        .relocations;
+
+    // Gather each entry's relocations by which entry they land in. They are usually written in
+    // order, but nothing requires it, so they are bucketed rather than sliced.
+    let entry_count = (data.len() as u64 / COMPACT_UNWIND_ENTRY_SIZE) as usize;
+    let mut by_entry: Vec<Vec<u32>> = vec![Vec::new(); entry_count];
+
+    for (index, relocation) in relocations.iter().enumerate() {
+        let entry = u64::from(relocation.info(LE).r_address) / COMPACT_UNWIND_ENTRY_SIZE;
+
+        if let Some(bucket) = by_entry.get_mut(entry as usize) {
+            bucket.push(index as u32);
+        }
+    }
+
+    for (entry_index, bucket) in by_entry.into_iter().enumerate() {
+        let entry_offset = entry_index as u64 * COMPACT_UNWIND_ENTRY_SIZE;
+
+        // The function is named by the relocation at the start of the entry. Without one there
+        // is nothing to hang the entry on, so it can never be reached and is dropped.
+        let Some(target_section_index) = bucket
+            .iter()
+            .map(|&index| relocations[index as usize].info(LE))
+            .find(|info| u64::from(info.r_address) == entry_offset)
+            .and_then(|info| compact_unwind_target_section(object, info, data).transpose())
+            .transpose()?
+        else {
+            continue;
+        };
+
+        let Some(unloaded) = object.sections[target_section_index.0].unloaded_mut() else {
+            // Already loaded, or not a section that can hold code. Either way there is no
+            // pending-load slot to hang this on.
+            continue;
+        };
+
+        let frame_index =
+            platform::FrameIndex::from_usize(object.format_specific.frame_entries.len());
+        let previous_frame_for_section = unloaded.last_frame_index.replace(frame_index);
+
+        let start = object.format_specific.frame_relocations.len() as u32;
+        object.format_specific.frame_relocations.extend(bucket);
+        let end = object.format_specific.frame_relocations.len() as u32;
+
+        object.format_specific.frame_entries.push(FrameEntry {
+            relocations: start..end,
+            section_index,
+            previous_frame_for_section,
+            kind: FrameKind::CompactUnwind,
+        });
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ObjectLayoutStateExt {
+    /// Indexed by `platform::FrameIndex`, and threaded into per-function chains through
+    /// `UnloadedSection::last_frame_index`.
+    frame_entries: Vec<FrameEntry>,
+
+    /// Relocation indices grouped by entry. The relocations of one entry need not be adjacent in
+    /// the section's own list, so they are gathered here and each entry keeps a range into it.
+    frame_relocations: Vec<u32>,
+
+    /// How many bytes this object's CIEs come to. An FDE is useless without the CIE it names, and
+    /// a CIE is a few dozen bytes shared by all of them, so they are not worth dead-stripping
+    /// individually - but an object none of whose FDEs survived contributes none of them either.
+    cie_bytes: u64,
+
+    /// How many bytes of `__eh_frame` this object contributes: its surviving FDEs, plus its CIEs
+    /// once at least one FDE has earned them.
+    eh_frame_size: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -179,16 +772,197 @@ pub(crate) struct File<'data> {
     kind: ObjectKind<'data>,
 }
 
+/// The pieces an input object is split into so that unreferenced ones can be dropped.
+///
+/// A Mach-O object puts every function in one `__text` rather than one section each, and marks the
+/// header `MH_SUBSECTIONS_VIA_SYMBOLS` to say that the sections may be cut at symbol boundaries.
+/// Splitting there is what lets the rest of the linker - which reasons about whole sections - drop
+/// an individual function, because after the split a function *is* a whole section.
+#[derive(Debug)]
+struct Atoms {
+    /// One synthesised section per atom, in address order within each parent.
+    sections: Vec<SectionHeader>,
+
+    /// Which real section each atom came from, so its relocations can be found.
+    parents: Vec<u32>,
+
+    /// The atoms belonging to each real section, as a range into the two vectors above.
+    by_parent: Vec<Range<u32>>,
+}
+
+impl Atoms {
+    /// Splits every section of `sections` at the addresses in `symbol_addresses`.
+    ///
+    /// `symbol_addresses` holds, for each real section, the addresses of the symbols defined in it.
+    /// It doesn't need to be sorted or free of duplicates.
+    fn split(
+        sections: &[SectionHeader],
+        symbol_addresses: &mut [Vec<u64>],
+        subsections_via_symbols: bool,
+    ) -> Self {
+        let mut atoms = Atoms {
+            sections: Vec::with_capacity(sections.len()),
+            parents: Vec::with_capacity(sections.len()),
+            by_parent: Vec::with_capacity(sections.len()),
+        };
+
+        for (index, section) in sections.iter().enumerate() {
+            let start = atoms.sections.len() as u32;
+            atoms.push_atoms_of(
+                section,
+                index as u32,
+                &mut symbol_addresses[index],
+                subsections_via_symbols,
+            );
+            atoms.by_parent.push(start..atoms.sections.len() as u32);
+        }
+
+        atoms
+    }
+
+    fn push_atoms_of(
+        &mut self,
+        section: &SectionHeader,
+        parent: u32,
+        addresses: &mut Vec<u64>,
+        subsections_via_symbols: bool,
+    ) {
+        let base = section.addr.get(LE);
+        let size = section.size.get(LE);
+
+        if !subsections_via_symbols || !is_splittable_section_type(section.section_type(LE)) {
+            self.push_atom(section, parent, 0, size);
+            return;
+        }
+
+        addresses.sort_unstable();
+        addresses.dedup();
+
+        // A cut is only safe where it preserves how everything inside the atom is aligned. Placing
+        // an atom respects its own alignment, but everything within it keeps the offsets it had -
+        // so if the atom starts partway through the section's alignment, a pointer that was aligned
+        // inside it stops being so, and dyld refuses a fixup it can't reach. Cutting only on the
+        // section's own alignment means an atom can be placed anywhere that alignment allows and
+        // its contents land exactly as they did.
+        let section_alignment = 1u64 << section.align.get(LE).min(63);
+
+        // Anything before the first symbol has no name to be reached by, so it stays with the
+        // section rather than becoming droppable on its own.
+        let mut offset = 0;
+        let mut cuts = addresses
+            .iter()
+            .filter_map(|address| address.checked_sub(base))
+            .filter(|cut| *cut > 0 && *cut < size && cut.is_multiple_of(section_alignment))
+            .peekable();
+
+        if cuts.peek().is_none() {
+            self.push_atom(section, parent, 0, size);
+            return;
+        }
+
+        for cut in cuts {
+            self.push_atom(section, parent, offset, cut - offset);
+            offset = cut;
+        }
+
+        self.push_atom(section, parent, offset, size - offset);
+    }
+
+    /// Returns the atom of `parent` that `address` falls in.
+    fn atom_containing(
+        &self,
+        parent: object::SectionIndex,
+        address: u64,
+        file_sections: &[SectionHeader],
+    ) -> Option<object::SectionIndex> {
+        let range = self.by_parent.get(parent.0)?.clone();
+        let candidates = &self.sections[range.start as usize..range.end as usize];
+
+        // Atoms of a section are contiguous and in address order, so the one we want is the last
+        // that starts at or before the address. A symbol exactly on a boundary belongs to the atom
+        // it opens, which is what `partition_point` gives.
+        let found = candidates.partition_point(|atom| atom.addr.get(LE) <= address);
+
+        if found == 0 {
+            // Before the first atom, which can only happen if the address is outside the section.
+            let _ = file_sections;
+            return None;
+        }
+
+        Some(object::SectionIndex(range.start as usize + found - 1))
+    }
+
+    fn push_atom(&mut self, section: &SectionHeader, parent: u32, offset: u64, size: u64) {
+        let mut atom = *section;
+        atom.addr.set(LE, section.addr.get(LE) + offset);
+        atom.size.set(LE, size);
+
+        // A zerofill section has no bytes in the file, so its `offset` names nothing and must stay
+        // as it is rather than being advanced past the end of the file.
+        if !is_no_bits_section_type(section.section_type(LE)) {
+            atom.offset.set(LE, section.offset.get(LE) + offset as u32);
+        }
+
+        // Every atom keeps the section's alignment. Cuts are only made where that alignment allows,
+        // so this is a promise each of them can keep, and it is what makes their contents land as
+        // they did in the section.
+
+        self.sections.push(atom);
+        self.parents.push(parent);
+    }
+}
+
+/// Returns whether a section of this type may be cut at symbol boundaries.
+///
+/// The literal sections may not: their contents are deduplicated by the string merger, which owns
+/// how they're divided, and a symbol in one names a string rather than a region.
+fn is_splittable_section_type(section_type: macho::SectionType) -> bool {
+    !matches!(
+        section_type,
+        macho::S_CSTRING_LITERALS
+            | macho::S_4BYTE_LITERALS
+            | macho::S_8BYTE_LITERALS
+            | macho::S_16BYTE_LITERALS
+            | macho::S_LITERAL_POINTERS
+    )
+}
+
+/// What a dylib says about its own versioning, as `LC_ID_DYLIB` records it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DylibVersions {
+    pub(crate) compatibility: object::macho::Version,
+    pub(crate) current: object::macho::Version,
+}
+
 #[derive(Debug)]
 enum ObjectKind<'data> {
     Regular(RegularObject<'data>),
-    Dylib,
+    Dylib {
+        /// The name the library calls itself, from its `LC_ID_DYLIB`. This, not the path we
+        /// happened to open it by, is what an image linking against it must record: the
+        /// path is where the library was at link time, while the install name is where it
+        /// expects to be found at run time - commonly `@rpath/...`, which is the whole
+        /// point of `-rpath`.
+        install_name: Option<&'data [u8]>,
+
+        /// What the library says about itself: the version it is, and the oldest version an image
+        /// built against it will accept. dyld compares the two at load time, so they have to be
+        /// carried across rather than invented.
+        versions: Option<DylibVersions>,
+    },
 }
 
 #[derive(derive_more::Debug)]
 struct RegularObject<'data> {
+    /// The sections as the object file records them. Kept because relocations and section
+    /// numbering are expressed against these, not against the atoms.
     #[debug(skip)]
     pub(crate) sections: SectionTable<'data>,
+
+    /// The same content divided into independently droppable pieces. This is what the rest of the
+    /// linker sees as "the sections of this object".
+    #[debug(skip)]
+    atoms: Atoms,
 }
 
 impl<'data> platform::ObjectFile<'data> for File<'data> {
@@ -200,11 +974,20 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
         let mut symbols = None;
         let mut sections = None;
+        let mut install_name = None;
+        let mut versions = None;
 
         while let Some(command) = commands.next()? {
             if let Some(symtab_command) = command.symtab()? {
                 ensure!(symbols.is_none(), "At most one symtab command expected");
                 symbols = Some(symtab_command.symbols::<macho::MachHeader64<_>, _>(LE, input)?);
+            } else if is_dynamic && command.cmd() == object::macho::LC_ID_DYLIB {
+                let dylib_command = command.data::<DylibCommand>()?;
+                install_name = Some(command.string(LE, dylib_command.dylib.name)?);
+                versions = Some(DylibVersions {
+                    compatibility: dylib_command.dylib.compatibility_version.get(LE),
+                    current: dylib_command.dylib.current_version.get(LE),
+                });
             } else if !is_dynamic
                 && let Some((segment_command, segment_data)) = command.segment_64()?
             {
@@ -214,17 +997,46 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
             }
         }
 
+        let symbols = symbols.ok_or("Missing symbol table")?;
+
         let kind = if is_dynamic {
-            ObjectKind::Dylib
+            ObjectKind::Dylib {
+                install_name,
+                versions,
+            }
         } else {
+            let sections = sections.ok_or("Missing segment command")?;
+
+            // Where each section may be cut. A symbol marks the start of an independently
+            // droppable region, so gathering the defined symbols by section is what determines the
+            // atoms - see `Atoms::split`.
+            let mut addresses_by_section = vec![Vec::new(); sections.len()];
+            for symbol in symbols.iter() {
+                if symbol.n_type.typ() != N_SECT || symbol.n_sect == 0 {
+                    continue;
+                }
+                if let Some(addresses) =
+                    addresses_by_section.get_mut(usize::from(symbol.n_sect - 1))
+                {
+                    addresses.push(symbol.n_value.get(LE));
+                }
+            }
+
+            // The flag is the object saying its sections are safe to cut this way. Without it the
+            // compiler has made no such promise - data may be addressed across what looks like a
+            // symbol boundary - so each section stays whole.
+            let subsections_via_symbols =
+                header.flags(LE).0 & object::macho::MH_SUBSECTIONS_VIA_SYMBOLS.0 != 0;
+
             ObjectKind::Regular(RegularObject {
-                sections: sections.ok_or("Missing segment command")?,
+                atoms: Atoms::split(sections, &mut addresses_by_section, subsections_via_symbols),
+                sections,
             })
         };
 
         Ok(File {
             data: input,
-            symbols: symbols.ok_or("Missing symbol table")?,
+            symbols,
             flags: header.flags(LE),
             kind,
         })
@@ -239,7 +1051,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     }
 
     fn is_dynamic(&self) -> bool {
-        matches!(self.kind, ObjectKind::Dylib)
+        matches!(self.kind, ObjectKind::Dylib { .. })
     }
 
     fn num_symbols(&self) -> usize {
@@ -319,12 +1131,28 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
     fn section_by_name(
         &self,
-        _name: &str,
+        name: &str,
     ) -> Option<(
         object::SectionIndex,
         &<Self::Platform as platform::Platform>::SectionHeader,
     )> {
-        todo!()
+        // The file's own sections rather than the atoms cut from them: a caller asking by name
+        // wants the thing the object declared, and only whole sections have names of their own.
+        self.file_sections()
+            .iter()
+            .position(|section| section.name() == name.as_bytes())
+            .map(|index| (object::SectionIndex(index), &self.file_sections()[index]))
+    }
+
+    /// A class is listed in `__objc_classlist` and a category in `__objc_catlist`, and those lists
+    /// are what the runtime walks when the image loads.
+    fn defines_objc_metadata(&self) -> bool {
+        self.file_sections().iter().any(|section| {
+            matches!(
+                section.name(),
+                b"__objc_classlist" | b"__objc_catlist" | b"__objc_nlclslist" | b"__objc_nlcatlist"
+            )
+        })
     }
 
     fn symbol_section(
@@ -332,16 +1160,51 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         symbol: &<Self::Platform as platform::Platform>::SymtabEntry,
         _index: object::SymbolIndex,
     ) -> crate::error::Result<Option<object::SectionIndex>> {
-        if symbol.n_type.typ() == N_SECT && symbol.n_sect != 0 {
-            // The index is one-based, NO_SECT == 0, marks a missing section for the symbol.
-            Ok(Some(object::SectionIndex(usize::from(symbol.n_sect - 1))))
-        } else {
-            Ok(None)
+        if symbol.n_type.typ() != N_SECT || symbol.n_sect == 0 {
+            // NO_SECT is zero, so a section number of zero means the symbol has none.
+            return Ok(None);
         }
+
+        // The number is one-based and names a section of the file. What the linker wants is the
+        // atom that section was cut into at this symbol's address.
+        let parent = object::SectionIndex(usize::from(symbol.n_sect - 1));
+
+        let Some(atoms) = self.atoms() else {
+            return Ok(Some(parent));
+        };
+
+        Ok(atoms.atom_containing(parent, symbol.n_value.get(LE), self.file_sections()))
+    }
+
+    fn is_symbol_thread_local(
+        &self,
+        symbol: &<Self::Platform as platform::Platform>::SymtabEntry,
+        index: object::SymbolIndex,
+    ) -> crate::error::Result<bool> {
+        // We take a dylib's exported symbols without parsing its section table, so there's nothing
+        // to consult. That costs nothing: a thread-local in another image is reached through a
+        // descriptor over there, never by taking its address from here.
+        if self.is_dynamic() {
+            return Ok(false);
+        }
+
+        // An nlist entry says nothing about thread-locality; the section type does. So a symbol is
+        // thread-local exactly when it's defined in one of the thread-local sections, which also
+        // means an undefined symbol can't be recognised as one until it's been resolved.
+        let Some(section_index) = self.symbol_section(symbol, index)? else {
+            return Ok(false);
+        };
+
+        Ok(platform::SectionHeader::is_tls(
+            self.section(section_index)?,
+        ))
     }
 
     fn symbol_versions(&self) -> &[<Self::Platform as platform::Platform>::SymbolVersionIndex] {
-        todo!()
+        // Symbol versioning is an ELF facility. A Mach-O library distinguishes its revisions by the
+        // compatibility and current versions in `LC_ID_DYLIB`, which apply to the library as a
+        // whole rather than to individual symbols.
+        &[]
     }
 
     fn dynamic_symbol_used(
@@ -374,27 +1237,35 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     }
 
     fn section_name(&self, index: object::SectionIndex) -> crate::error::Result<&'data [u8]> {
-        let section = self
-            .sections()
-            .get(index.0)
-            .ok_or(error!("section index out of range"))?;
-        Ok(section.name())
+        // An atom carries its parent's name, and the parent is borrowed from the file, so the name
+        // outlives us. The atom's own copy of the header does not.
+        Ok(self.atom_parent_section(index)?.name())
     }
 
     fn raw_section_data(
         &self,
-        _section: &<Self::Platform as platform::Platform>::SectionHeader,
+        section: &<Self::Platform as platform::Platform>::SectionHeader,
     ) -> crate::error::Result<&'data [u8]> {
-        todo!()
+        section
+            .data(LE, self.data)
+            .map_err(|()| error!("Cannot get section data"))
     }
 
     fn section_data(
         &self,
-        _section: &<Self::Platform as platform::Platform>::SectionHeader,
+        section: &<Self::Platform as platform::Platform>::SectionHeader,
         _member: &bumpalo_herd::Member<'data>,
-        _loaded_metrics: &crate::resolution::LoadedMetrics,
+        loaded_metrics: &crate::resolution::LoadedMetrics,
     ) -> crate::error::Result<&'data [u8]> {
-        todo!()
+        // Nothing to decompress: Mach-O has no equivalent of ELF's compressed sections, so the
+        // bytes in the file are the bytes of the section and no scratch allocation is needed.
+        let data = self.raw_section_data(section)?;
+
+        loaded_metrics
+            .loaded_bytes
+            .fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
+
+        Ok(data)
     }
 
     fn copy_section_data(&self, section: &SectionHeader, out: &mut [u8]) -> Result {
@@ -408,9 +1279,11 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
     fn section_data_cow(
         &self,
-        _section: &<Self::Platform as platform::Platform>::SectionHeader,
+        section: &<Self::Platform as platform::Platform>::SectionHeader,
     ) -> crate::error::Result<std::borrow::Cow<'data, [u8]>> {
-        todo!()
+        // Borrowed rather than owned: this exists so that ELF can hand back a decompressed copy of
+        // a `SHF_COMPRESSED` section, and Mach-O has no compressed sections to expand.
+        Ok(std::borrow::Cow::Borrowed(self.raw_section_data(section)?))
     }
 
     fn section_alignment(
@@ -420,6 +1293,12 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         Ok(2u64.pow(section.align(LE)))
     }
 
+    /// Returns the relocations of the section an atom was cut from.
+    ///
+    /// Not just the atom's own: relocations are recorded against the whole section and are not in
+    /// address order, so an atom's are not a contiguous run that could be handed back on its own.
+    /// Callers narrow them with `atom_span_in_parent`, and `r_address` stays relative to the parent
+    /// so that it still lines up with the list.
     fn relocations(
         &self,
         index: object::SectionIndex,
@@ -427,9 +1306,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     ) -> crate::error::Result<<Self::Platform as platform::Platform>::RelocationList<'data>> {
         Ok(RelocationList {
             relocations: self
-                .sections()
-                .get(index.0)
-                .ok_or(error!("section index out of range"))?
+                .atom_parent_section(index)?
                 .relocations(LE, self.data)?,
         })
     }
@@ -456,7 +1333,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     ) -> Option<<Self::Platform as platform::Platform>::DynamicTagValues<'data>> {
         match self.kind {
             ObjectKind::Regular(_) => None,
-            ObjectKind::Dylib => Some(DynamicTagValues::default()),
+            ObjectKind::Dylib { .. } => Some(DynamicTagValues::default()),
         }
     }
 
@@ -501,7 +1378,9 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     fn dynamic_tags(
         &self,
     ) -> crate::error::Result<&'data [<Self::Platform as platform::Platform>::DynamicEntry]> {
-        todo!()
+        // What ELF states in `.dynamic`, Mach-O states in load commands, each with its own
+        // structure rather than as tag/value pairs - so there is no list of these to return.
+        Ok(&[])
     }
 }
 
@@ -521,16 +1400,33 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn is_tls(&self) -> bool {
-        todo!()
+        matches!(
+            self.section_type(LE),
+            macho::S_THREAD_LOCAL_REGULAR
+                | macho::S_THREAD_LOCAL_ZEROFILL
+                | macho::S_THREAD_LOCAL_VARIABLES
+                | macho::S_THREAD_LOCAL_VARIABLE_POINTERS
+                | macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS
+        )
     }
 
     fn is_merge_section(&self) -> bool {
-        // TODO
-        false
+        // A literal section holds constants the compiler put in their own section precisely so the
+        // linker could drop the duplicates - the same string appears in every object that mentions
+        // it. Which of these actually get merged is narrowed further by `should_merge_sections`,
+        // which currently only takes sections aligned to a byte, so in practice this means
+        // `__cstring`.
+        matches!(
+            self.section_type(LE),
+            macho::S_CSTRING_LITERALS
+                | macho::S_4BYTE_LITERALS
+                | macho::S_8BYTE_LITERALS
+                | macho::S_16BYTE_LITERALS
+        )
     }
 
     fn is_strings(&self) -> bool {
-        todo!()
+        self.section_type(LE) == macho::S_CSTRING_LITERALS
     }
 
     fn should_retain(&self) -> bool {
@@ -544,7 +1440,10 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn is_group(&self) -> bool {
-        todo!()
+        // Mach-O has no equivalent of ELF section groups. Answering `false` rather than panicking
+        // matters because the duplicate-symbol diagnostic asks this to work out whether a repeated
+        // definition is a legitimate COMDAT merge or a genuine clash.
+        false
     }
 
     fn is_note(&self) -> bool {
@@ -552,12 +1451,25 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn is_prog_bits(&self) -> bool {
-        todo!()
+        !self.is_no_bits()
     }
 
     fn is_no_bits(&self) -> bool {
-        todo!()
+        is_no_bits_section_type(self.section_type(LE))
     }
+}
+
+/// Returns whether a section of this type occupies address space without occupying any space in the
+/// file, which is what ELF calls `SHT_NOBITS`.
+///
+/// Both an input section header and an output section's attributes answer `is_no_bits` from here,
+/// so that a zerofill section can't be read as having file content and then written as not having
+/// any, or the other way around.
+pub(crate) fn is_no_bits_section_type(section_type: macho::SectionType) -> bool {
+    matches!(
+        section_type,
+        macho::S_ZEROFILL | macho::S_GB_ZEROFILL | macho::S_THREAD_LOCAL_ZEROFILL
+    )
 }
 
 #[derive(Debug, Copy, Clone, Default)]
@@ -565,19 +1477,23 @@ pub(crate) struct SectionType {}
 
 impl platform::SectionType for SectionType {
     fn is_rela(&self) -> bool {
-        todo!()
+        // Mach-O keeps a section's relocations beside it, named by the section header, rather than
+        // in a section of their own that has to be recognised by type.
+        false
     }
 
     fn is_rel(&self) -> bool {
-        todo!()
+        false
     }
 
     fn is_symtab(&self) -> bool {
-        todo!()
+        // The symbol and string tables are found through `LC_SYMTAB`, not by scanning sections for
+        // one of the right type.
+        false
     }
 
     fn is_strtab(&self) -> bool {
-        todo!()
+        false
     }
 }
 
@@ -590,12 +1506,31 @@ impl platform::SectionFlags for SectionFlags {
 // Documentation link for Nlist64 type: https://leopard-adc.pepas.com/documentation/DeveloperTools/Conceptual/MachORuntime/Reference/reference.html
 impl platform::Symbol for SymtabEntry {
     fn as_common(&self) -> Option<platform::CommonSymbol> {
-        // TODO
-        None
+        // A common symbol is an external undefined one with a value, which is its size - an
+        // undefined symbol has no use for a value otherwise. Its alignment is a power of two held
+        // in four bits of the descriptor.
+        let size = self.n_value.get(LE);
+        if self.n_type.is_stab()
+            || self.n_type.typ() != N_UNDF
+            || !self.n_type.contains(N_EXT)
+            || size == 0
+        {
+            return None;
+        }
+
+        let alignment =
+            Alignment::from_exponent(u32::from(self.n_desc.get(LE).common_alignment())).ok()?;
+
+        Some(platform::CommonSymbol {
+            size: alignment.align_up(size),
+            part_id: output_section_id::COMMON.part_id_with_alignment(alignment),
+        })
     }
 
     fn is_undefined(&self) -> bool {
-        Nlist::is_undefined(self)
+        // A common symbol is spelled as an undefined one, but it is a definition: nothing needs
+        // to be imported to find it.
+        Nlist::is_undefined(self) && self.as_common().is_none()
     }
 
     fn is_local(&self) -> bool {
@@ -623,8 +1558,15 @@ impl platform::Symbol for SymtabEntry {
     }
 
     fn size(&self) -> u64 {
-        // TODO
-        0
+        // An nlist entry records where a symbol starts but not how far it extends - the size is
+        // implied by where the next symbol begins. Nothing needs it yet; dead stripping will, since
+        // it is what bounds the region a symbol keeps alive. A common symbol is the exception: it
+        // has no start, and says how big it is instead.
+        if self.as_common().is_some() {
+            self.n_value.get(LE)
+        } else {
+            0
+        }
     }
 
     fn has_name(&self) -> bool {
@@ -632,16 +1574,25 @@ impl platform::Symbol for SymtabEntry {
     }
 
     fn is_default_strippable(&self, name: &[u8]) -> bool {
-        self.is_local() && name.starts_with(b"ltmp")
+        // A leading `l` marks a label the assembler made for its own use - string constants,
+        // section anchors, jump tables. It carries no meaning outside the object it came from, and
+        // ld64 drops these from the linked image, so keeping them only inflates the symbol table.
+        // Nothing a user writes lands here: C and C++ names reach the assembler with a leading
+        // underscore, so only generated labels start with a letter at all.
+        self.is_local() && name.starts_with(b"l")
     }
 
     fn debug_string(&self) -> String {
-        // TODO
+        // Only used to add detail to diagnostics. An nlist entry has no field that would say more
+        // than the name and address the caller already prints.
         String::new()
     }
 
     fn is_tls(&self) -> bool {
-        // TODO: derive from section name
+        // Unanswerable from an nlist entry, which says nothing about thread-locality - the section
+        // the symbol is defined in does. `ObjectFile::is_symbol_thread_local` is the query that has
+        // the object to hand and so can answer it; this exists only for the platforms where the
+        // symbol alone is enough.
         false
     }
 
@@ -650,7 +1601,10 @@ impl platform::Symbol for SymtabEntry {
     }
 
     fn is_func(&self) -> bool {
-        // TODO: derive from section name
+        // Only ever asked of symbols taken from a dylib, whose export list we read without parsing
+        // its sections - so there is nothing here that distinguishes code from data. What needs the
+        // distinction infers it instead from the relocation referring to the symbol: a branch means
+        // a function, and that is what decides whether it gets a stub.
         false
     }
 
@@ -704,10 +1658,16 @@ impl platform::SectionAttributes for SectionAttributes {
     }
 
     fn is_executable(&self) -> bool {
-        false
+        self.flags
+            .contains(macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS)
     }
 
     fn is_tls(&self) -> bool {
+        // Layout only asks this in order to give ELF's `.tbss` its special treatment: there, a
+        // no-bits TLS section occupies no address space in the image, so layout rewinds over it.
+        // Mach-O's `__thread_bss` is not like that - it's the tail of the template block that dyld
+        // copies per thread, and ld64 gives it an address directly after `__thread_data` - so
+        // answering `false` keeps it laid out as an ordinary zerofill section.
         false
     }
 
@@ -716,7 +1676,7 @@ impl platform::SectionAttributes for SectionAttributes {
     }
 
     fn is_no_bits(&self) -> bool {
-        false
+        is_no_bits_section_type(self.flags.typ())
     }
 
     fn flags(&self) -> <Self::Platform as platform::Platform>::SectionFlags {
@@ -745,8 +1705,15 @@ pub(crate) enum SegmentType {
     Text,
     LoadCommands,
     TextSections,
-    DataSections,
+    // `__DATA_CONST` comes before `__DATA`, as ld64 places it. The order matters for more than
+    // fidelity: `__DATA` ends in zerofill, which occupies memory but not file, so any segment
+    // after it sits at a file offset lower than its memory offset says. dyld's kernel page-in
+    // linking sizes each segment's file claim by its *memory* footprint, so the segment after the
+    // zerofill starts inside the file range the kernel attributes to `__DATA` - and the fixups on
+    // the contested page are silently never applied. Keeping every fixup-bearing segment ahead of
+    // the zerofill keeps file and memory offsets congruent where it counts.
     DataConstSections,
+    DataSections,
     LinkeditSections,
     // The other ELF-specific (or unused) parts/sections will be collected here.
     #[default]
@@ -754,6 +1721,78 @@ pub(crate) enum SegmentType {
 }
 
 impl platform::SegmentType for SegmentType {}
+
+/// Returns the segment that the supplied output section belongs to. `SegmentType::Unused` means
+/// that the section isn't part of the Mach-O output at all.
+/// Whether a section holds Swift metadata, which is kept together in `__TEXT`.
+fn is_swift_metadata_section(section_id: crate::output_section_id::OutputSectionId) -> bool {
+    (output_section_id::SWIFT5_TYPEREF.as_usize()..=output_section_id::SWIFT_MODHASH.as_usize())
+        .contains(&section_id.as_usize())
+}
+
+fn mapped_segment_type(section_id: crate::output_section_id::OutputSectionId) -> SegmentType {
+    match section_id {
+        output_section_id::FILE_HEADER => SegmentType::Text,
+        output_section_id::LOAD_COMMANDS => SegmentType::LoadCommands,
+        output_section_id::TEXT
+        | output_section_id::CSTRING
+        | output_section_id::GCC_EXCEPT_TABLE
+        | output_section_id::UNWIND_INFO
+        | output_section_id::MACHO_EH_FRAME
+        | output_section_id::PLT_GOT
+        | output_section_id::OBJC_STUBS
+        | output_section_id::OBJC_METHNAME => SegmentType::TextSections,
+        // Swift's metadata, which the runtime locates by segment and section name.
+        _ if is_swift_metadata_section(section_id) => SegmentType::TextSections,
+        // `__const` holds constants, but constants include pointers, and a pointer has to be
+        // rebased before it's read - which means living somewhere dyld can write to. ld64 sorts the
+        // input sections: the ones with relocations go to `__DATA_CONST,__const` and the rest stay
+        // in `__TEXT,__const`. We don't sort them yet, so they all go to the segment that can hold
+        // either. That costs a dirty page where ld64 would have kept the data shared, but the
+        // alternative is a pointer in a read-only segment, which simply doesn't work.
+        output_section_id::CONST => SegmentType::DataConstSections,
+        output_section_id::DATA
+        | output_section_id::INIT_ARRAY
+        | output_section_id::FINI_ARRAY
+        | output_section_id::THREAD_VARS
+        | output_section_id::TDATA
+        | output_section_id::TBSS
+        | output_section_id::COMMON
+        | output_section_id::BSS
+        | output_section_id::OBJC_SELREFS => SegmentType::DataSections,
+        output_section_id::GOT => SegmentType::DataConstSections,
+        output_section_id::CHAINED_FIXUP_TABLE
+        | output_section_id::SYMTAB_LOCAL
+        | output_section_id::SYMTAB_GLOBAL
+        | output_section_id::INDIRECT_SYMTAB
+        | output_section_id::EXPORT_TRIE
+        | output_section_id::STRTAB
+        | output_section_id::CODE_SIGNATURE => SegmentType::LinkeditSections,
+
+        // A section we have no built-in ID for still has to land somewhere. Answering `Unused`
+        // would leave it out of the output order, and so out of the file layout, while each object
+        // would still have reserved bytes for it - which shows up as the output buffer running out
+        // partway through the write. `__DATA` is the safe home: it's writable, so nothing that ends
+        // up there can fault on a store, and it's the segment ld64 uses for sections it doesn't
+        // recognise either.
+        _ if section_id.as_usize() >= crate::output_section_id::NUM_BUILT_IN_SECTIONS => {
+            SegmentType::DataSections
+        }
+
+        _ => SegmentType::Unused,
+    }
+}
+
+/// Returns whether the supplied output section is emitted as a real Mach-O section, i.e. it gets a
+/// `section_64` entry in the section list of its `LC_SEGMENT_64` load command. The remaining output
+/// sections are regions that we generate ourselves - the header, the load commands and the contents
+/// of `__LINKEDIT` - and are not sections as far as the file format is concerned.
+fn is_emitted_as_macho_section(section_id: crate::output_section_id::OutputSectionId) -> bool {
+    matches!(
+        mapped_segment_type(section_id),
+        SegmentType::TextSections | SegmentType::DataSections | SegmentType::DataConstSections
+    )
+}
 
 #[derive(Debug, Copy, Clone, Default, PartialEq)]
 pub(crate) struct ProgramSegmentDef {
@@ -810,21 +1849,7 @@ impl platform::ProgramSegmentDef for ProgramSegmentDef {
         section_id: crate::output_section_id::OutputSectionId,
         _rosegment: bool,
     ) -> bool {
-        let mapped_segment = match section_id {
-            output_section_id::FILE_HEADER => SegmentType::Text,
-            output_section_id::LOAD_COMMANDS => SegmentType::LoadCommands,
-            output_section_id::TEXT
-            | output_section_id::CSTRING
-            | output_section_id::CONST
-            | output_section_id::PLT_GOT => SegmentType::TextSections,
-            output_section_id::DATA => SegmentType::DataSections,
-            output_section_id::GOT => SegmentType::DataConstSections,
-            output_section_id::CHAINED_FIXUP_TABLE
-            | output_section_id::SYMTAB_GLOBAL
-            | output_section_id::STRTAB
-            | output_section_id::CODE_SIGNATURE => SegmentType::LinkeditSections,
-            _ => SegmentType::Unused,
-        };
+        let mapped_segment = mapped_segment_type(section_id);
 
         match (self.segment_type, mapped_segment) {
             (SegmentType::Text, SegmentType::LoadCommands | SegmentType::TextSections) => true,
@@ -908,7 +1933,8 @@ pub(crate) struct VerneedTable<'data> {
 
 impl<'data> platform::VerneedTable<'data> for VerneedTable<'data> {
     fn version_name(&self, _local_symbol_index: object::SymbolIndex) -> Option<&'data [u8]> {
-        todo!()
+        // No symbol carries a version, so none has a version to name.
+        None
     }
 }
 
@@ -916,7 +1942,7 @@ impl platform::Platform for MachO {
     type File<'data> = File<'data>;
     type FileFlags = u32;
     type SymtabEntry = SymtabEntry;
-    type PlatformSpecificSymbol = core::convert::Infallible;
+    type PlatformSpecificSymbol = LinkerSymbol;
     type SectionHeader = SectionHeader;
     type SectionFlags = SectionFlags;
     type SectionAttributes = SectionAttributes;
@@ -951,13 +1977,28 @@ impl platform::Platform for MachO {
     type LayoutResourcesExt<'data> = ();
     type PreludeLayoutStateExt = PreludeLayoutExt;
     type PreludeLayoutExt = PreludeLayoutExt;
-    type ObjectLayoutStateExt<'data> = ();
+    type ObjectLayoutStateExt<'data> = ObjectLayoutStateExt;
     type RawSymbolName<'data> = RawSymbolName<'data>;
     type VersionNames<'data> = ();
     type VerneedTable<'data> = VerneedTable<'data>;
     type ResolvedObjectExt<'data> = ();
 
-    const HAS_NULL_SYMBOL_ENTRY: bool = true;
+    // ELF reserves symbol index 0 for a null entry, so resolution skips it. Mach-O has no such
+    // reservation - index 0 is an ordinary symbol - and answering `true` here made us drop whatever
+    // symbol happened to be first from resolution entirely.
+    const HAS_NULL_SYMBOL_ENTRY: bool = false;
+
+    // Mach-O has no COMDAT groups, so nothing has already dropped the duplicate copies of an inline
+    // or template function - each object's copy is ordinary content, told apart only by which
+    // definition the symbol table settled on.
+    const COALESCES_LOSING_DEFINITIONS: bool = true;
+
+    // What a Mach-O image exports is a trie over the names rather than a numbered table, so there
+    // are no indices to assign.
+    const HAS_DYNAMIC_SYMBOL_TABLE: bool = false;
+
+    // `-exported_symbols_list` names one symbol per line.
+    const EXPORT_LIST_IS_PLAIN_LINES: bool = true;
 
     fn link_for_arch<'data, F: FileSystem>(
         linker: &'data crate::Linker<F>,
@@ -990,9 +2031,25 @@ impl platform::Platform for MachO {
     }
 
     fn is_zero_sized_section_content(
-        _section_id: crate::output_section_id::OutputSectionId,
+        section_id: crate::output_section_id::OutputSectionId,
     ) -> bool {
-        todo!()
+        // An input section that happens to be empty is still a section. ld64 keeps it: linking an
+        // object whose only `__DATA,__data` and `__DATA,__mycustom` sections are zero sized still
+        // produces an output with both of those sections (size 0) and hence a `__DATA` segment.
+        // Compilers routinely emit empty sections - a translation unit with no code still gets a
+        // zero-sized `__TEXT,__text` - so this path is reached by perfectly ordinary inputs.
+        //
+        // Note that this hook is only about a *zero sized* input section. It says nothing about
+        // Mach-O zerofill sections (`S_ZEROFILL` / `S_THREAD_LOCAL_ZEROFILL`), which have a
+        // non-zero size but no bytes in the file; those are sized from the section header like any
+        // other section and never reach here just because they lack file content. We don't
+        // currently map them to an output section at all.
+        //
+        // The output sections that aren't emitted as Mach-O sections (the header, the load
+        // commands and the `__LINKEDIT` contents) are generated by us rather than copied from an
+        // input, so nothing should ever be destined for them. Answer `false` for those so that an
+        // empty input section can't resurrect a region that we'd otherwise leave out.
+        is_emitted_as_macho_section(section_id)
     }
 
     fn built_in_section_details() -> &'static [Self::BuiltInSectionDetails] {
@@ -1004,10 +2061,15 @@ impl platform::Platform for MachO {
     ) -> Self::GroupLayoutExt {
     }
 
+    /// Where this object's contribution to `__eh_frame` starts.
+    ///
+    /// The anchor symbol an FDE measures its function from is defined in `__eh_frame` itself, so it
+    /// resolves against this. `__compact_unwind` is also frame data and gets the same answer, which
+    /// costs nothing: it is consumed rather than emitted, so nothing resolves against it.
     fn frame_data_base_address(
-        _memory_offsets: &crate::output_section_part_map::OutputSectionPartMap<u64>,
+        memory_offsets: &crate::output_section_part_map::OutputSectionPartMap<u64>,
     ) -> u64 {
-        todo!()
+        *memory_offsets.get(EH_FRAME_PART_ID)
     }
 
     fn activate_dynamic<'data>(
@@ -1031,15 +2093,24 @@ impl platform::Platform for MachO {
     }
 
     fn finalise_object_sizes<'data>(
-        _object: &mut crate::layout::ObjectLayoutState<'data, Self>,
-        _common: &mut crate::layout::CommonGroupState<'data, Self>,
+        object: &mut crate::layout::ObjectLayoutState<'data, Self>,
+        common: &mut crate::layout::CommonGroupState<'data, Self>,
     ) {
+        // An FDE is useless without the CIE it extends, so the object's CIEs come along as soon as
+        // any of its FDEs has survived - and an object all of whose functions were stripped
+        // contributes nothing at all, not even the CIEs none of them can now name.
+        if object.format_specific.eh_frame_size > 0 {
+            object.format_specific.eh_frame_size += object.format_specific.cie_bytes;
+        }
+
+        common.allocate(EH_FRAME_PART_ID, object.format_specific.eh_frame_size);
     }
 
     fn finalise_object_layout<'data>(
-        _object: &crate::layout::ObjectLayoutState<'data, Self>,
-        _memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
+        object: &crate::layout::ObjectLayoutState<'data, Self>,
+        memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
     ) {
+        memory_offsets.increment(EH_FRAME_PART_ID, object.format_specific.eh_frame_size);
     }
 
     fn finalise_layout_dynamic<'data>(
@@ -1084,10 +2155,13 @@ impl platform::Platform for MachO {
     }
 
     fn compute_object_addresses<'data>(
-        _object: &crate::layout::ObjectLayoutState<'data, Self>,
-        _memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
+        object: &crate::layout::ObjectLayoutState<'data, Self>,
+        memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
     ) {
-        todo!()
+        // `__eh_frame` isn't copied section by section like the rest, so the loop that walks an
+        // object's loaded sections steps over it. Its bytes still have to be counted here or every
+        // object after this one would be told it starts where this one does.
+        memory_offsets.increment(EH_FRAME_PART_ID, object.format_specific.eh_frame_size);
     }
 
     fn layout_resources_ext<'data>(
@@ -1104,18 +2178,38 @@ impl platform::Platform for MachO {
         section_index: object::SectionIndex,
         scope: &rayon::Scope<'scope>,
     ) -> crate::error::Result {
-        // TODO
-        for rel in state.relocations(section_index)?.relocations {
+        let span = state.object.atom_span_in_parent(section_index)?;
+        let relocations = state.relocations(section_index)?.relocations;
+
+        // Only the relocations landing inside this atom describe it. They are still checked below -
+        // this says where to start and stop looking, so that an atom doesn't walk the relocations
+        // of every other atom cut from the same section.
+        let range = atom_relocation_range(relocations, &span).unwrap_or(0..relocations.len());
+
+        for rel in &relocations[range] {
+            if !span.contains(&u64::from(rel.info(LE).r_address)) {
+                continue;
+            }
+
             process_relocation::<A>(state, rel, section_index, resources, queue, scope)?;
         }
+
         Ok(())
     }
 
+    /// Records that a symbol is to be exported.
+    ///
+    /// Nothing beyond the name is needed: Mach-O has no symbol versioning, so what a name resolves
+    /// to is decided entirely by the export trie built from these.
     fn create_dynamic_symbol_definition<'data>(
-        _symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
-        _symbol_id: crate::symbol_db::SymbolId,
+        symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
+        symbol_id: crate::symbol_db::SymbolId,
     ) -> crate::error::Result<crate::layout::DynamicSymbolDefinition<'data, Self>> {
-        todo!()
+        Ok(crate::layout::DynamicSymbolDefinition {
+            symbol_id,
+            name: symbol_db.symbol_name(symbol_id)?.bytes(),
+            format_specific: (),
+        })
     }
 
     fn update_segment_keep_list(
@@ -1133,11 +2227,35 @@ impl platform::Platform for MachO {
         &[]
     }
 
+    /// Mach-O only ever holds arm64 code here, so the thunk shape never varies by object the way
+    /// it does for ELF, where one link can mix architectures.
+    fn file_thunk_config<'data>(_file: &Self::File<'data>) -> Option<crate::platform::ThunkConfig> {
+        <crate::macho_aarch64::MachOAArch64 as platform::Arch>::thunk_config()
+    }
+
     fn create_linker_defined_symbols(
-        _symbols: &mut crate::parsing::InternalSymbolsBuilder<Self>,
+        symbols: &mut crate::parsing::InternalSymbolsBuilder<Self>,
         _output_kind: crate::output_kind::OutputKind,
         _args: &Self::Args,
     ) {
+        // Symbol ID 0 means "undefined" everywhere in the linker, so it must not name a real
+        // symbol. The prelude is allocated ids first, so claiming one here is what reserves it.
+        // ELF gets this for free from its null symbol table entry; Mach-O has no such entry, so
+        // without this the first symbol of the first object would land on the sentinel and read
+        // back as undefined.
+        symbols
+            .add_symbol(crate::parsing::InternalSymDefInfo::new(
+                crate::parsing::SymbolPlacement::Undefined,
+                b"",
+            ))
+            .hide();
+
+        // Both name the address the mach header is loaded at, which is also the image's base.
+        // `__mh_execute_header` is how code finds its own header; `___dso_handle` is what
+        // `__cxa_atexit` is handed to say which image a destructor belongs to, so anything with a
+        // static or thread-local destructor references it - which is most C++ programs.
+        symbols.section_start(output_section_id::FILE_HEADER, "__mh_execute_header");
+        symbols.section_start(output_section_id::FILE_HEADER, "___dso_handle");
     }
 
     fn built_in_section_infos<'data>()
@@ -1162,7 +2280,7 @@ impl platform::Platform for MachO {
     fn create_finalise_sizes_ext<'data, 'states, 'files, A: platform::Arch<Platform = Self>>(
         _args: &Self::Args,
         groups: &'files [layout::GroupState<'data, Self>],
-        _symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
+        symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
     ) -> crate::error::Result<Self::FinaliseSizesExt<'data>>
     where
         'data: 'files,
@@ -1192,6 +2310,16 @@ impl platform::Platform for MachO {
                 }
             }
         }
+
+        // One library reached by several names is still one library, and dyld rejects an image that
+        // loads the same install name twice. `-lSystem -lc -lm` is the ordinary way to arrive here:
+        // on macOS all three are libSystem, so the same stub is opened once per name.
+        //
+        // Keeping the first of each is what makes the ordinals that `create_dynamic_layout_ext`
+        // hands out contiguous, so that resolves by install name too rather than by file.
+        let mut seen_install_names = std::collections::HashSet::new();
+        imported_libraries
+            .retain(|&file_id| seen_install_names.insert(install_name(file_id, symbol_db)));
 
         Ok(FinaliseSizesExt {
             imported_libraries,
@@ -1231,35 +2359,169 @@ impl platform::Platform for MachO {
             .sorted_by_key(|symbol| symbol.got_address)
             .collect();
 
+        // Everything else that was given a slot is defined here, so the slot's contents are known
+        // now rather than at load time. `is_dynamic` is what separates the two: an import's slot is
+        // filled in by dyld from the bind, this one we write ourselves.
+        layout_ext.local_got_symbols = resolutions
+            .iter()
+            .filter(|(_, resolution)| !resolution.flags.is_dynamic())
+            .filter_map(|(_, resolution)| {
+                Some(LocalGotSymbol {
+                    got_address: resolution.format_specific.got_address?,
+                    value: resolution.raw_value,
+                })
+            })
+            .sorted_by_key(|symbol| symbol.got_address)
+            .collect();
+
         Ok(layout_ext)
     }
 
+    /// Accounts for one input section of unwind data.
+    ///
+    /// Two kinds reach here: `__LD,__compact_unwind`, which is consumed to build `__unwind_info`,
+    /// and `__eh_frame`, which is copied through. Neither is read for what it says about the
+    /// program - only for which function each record describes, so that the record can be hung off
+    /// that function and paid for if it survives.
     fn load_exception_frame_data<'data, 'scope, A: platform::Arch<Platform = Self>>(
-        _object: &mut crate::layout::ObjectLayoutState<'data, Self>,
+        object: &mut crate::layout::ObjectLayoutState<'data, Self>,
         _common: &mut crate::layout::CommonGroupState<'data, Self>,
-        _eh_frame_section_index: object::SectionIndex,
-        _resources: &'scope crate::layout::GraphResources<'data, '_, Self>,
-        _queue: &mut crate::layout::LocalWorkQueue,
-        _scope: &rayon::Scope<'scope>,
+        section_index: object::SectionIndex,
+        resources: &'scope crate::layout::GraphResources<'data, '_, Self>,
+        queue: &mut crate::layout::LocalWorkQueue,
+        scope: &rayon::Scope<'scope>,
     ) -> crate::error::Result {
-        todo!()
+        if object.object.section_name(section_index)? == EH_FRAME_SECTION_NAME {
+            return load_eh_frame::<A>(object, section_index, resources, queue, scope);
+        }
+
+        load_compact_unwind(object, section_index)
     }
 
+    /// Pays for the unwind data of a function that is staying in the output.
+    ///
+    /// This is what keeps the unwind sections in step with dead-stripping: they are sized from the
+    /// functions that survive rather than from every record that was read. Following a record's
+    /// relocations here rather than when it was read is what lets a language-specific data area be
+    /// dropped along with the function it describes.
     fn non_empty_section_loaded<'data, 'scope, A: platform::Arch<Platform = Self>>(
-        _object: &mut crate::layout::ObjectLayoutState<'data, Self>,
-        _common: &mut crate::layout::CommonGroupState<'data, Self>,
-        _queue: &mut crate::layout::LocalWorkQueue,
-        _unloaded: crate::resolution::UnloadedSection,
-        _resources: &'scope crate::layout::GraphResources<'data, 'scope, Self>,
-        _scope: &rayon::Scope<'scope>,
+        object: &mut crate::layout::ObjectLayoutState<'data, Self>,
+        common: &mut crate::layout::CommonGroupState<'data, Self>,
+        queue: &mut crate::layout::LocalWorkQueue,
+        unloaded: crate::resolution::UnloadedSection,
+        resources: &'scope crate::layout::GraphResources<'data, 'scope, Self>,
+        scope: &rayon::Scope<'scope>,
     ) -> crate::error::Result {
+        let mut next_frame_index = unloaded.last_frame_index;
+
+        while let Some(frame_index) = next_frame_index {
+            let entry = &object.format_specific.frame_entries[frame_index.as_usize()];
+            next_frame_index = entry.previous_frame_for_section;
+
+            let frame_section_index = entry.section_index;
+            let is_compact = matches!(entry.kind, FrameKind::CompactUnwind);
+            let relocation_indices = object.format_specific.frame_relocations
+                [entry.relocations.start as usize..entry.relocations.end as usize]
+                .to_vec();
+
+            let relocations = object
+                .object
+                .relocations(frame_section_index, &object.relocations)?
+                .relocations;
+
+            match entry.kind {
+                // A row of the table, whatever the entry says, plus a row of the landing pad
+                // index if it names one. Counting those here rather than reserving one for every
+                // function is most of what keeps the table the size ld64's is.
+                FrameKind::CompactUnwind => {
+                    let has_landing_pad = relocation_indices.iter().any(|&index| {
+                        u64::from(relocations[index as usize].info(LE).r_address)
+                            % COMPACT_UNWIND_ENTRY_SIZE
+                            == COMPACT_UNWIND_LSDA_OFFSET
+                    });
+
+                    common.allocate(part_id::UNWIND_INFO, UNWIND_INFO_BYTES_PER_ENTRY);
+
+                    if has_landing_pad {
+                        common.allocate(part_id::UNWIND_INFO, UNWIND_INFO_LSDA_ENTRY_SIZE);
+                    }
+                }
+
+                // Copied through verbatim, so it costs exactly what it is. The bytes are only
+                // counted here; they're allocated in `finalise_object_sizes`, together with the
+                // CIEs that this record has now earned.
+                FrameKind::Fde { size, .. } => {
+                    object.format_specific.eh_frame_size += u64::from(size);
+
+                    // A function that only DWARF describes - everything Cranelift emits - still
+                    // needs a `__unwind_info` entry deferring to its frame, or the neighbouring
+                    // entry claims its addresses. Whether this FDE's function also has a
+                    // `__compact_unwind` entry isn't known yet, so this over-reserves by one row
+                    // for the functions described both ways.
+                    common.allocate(part_id::UNWIND_INFO, UNWIND_INFO_BYTES_PER_ENTRY);
+                }
+            }
+
+            let data = object
+                .object
+                .raw_section_data(object.object.section(frame_section_index)?)?;
+
+            for index in relocation_indices {
+                let relocation = &relocations[index as usize];
+                let info = relocation.info(LE);
+
+                process_relocation::<A>(
+                    object,
+                    relocation,
+                    frame_section_index,
+                    resources,
+                    queue,
+                    scope,
+                )?;
+
+                if !is_compact {
+                    continue;
+                }
+
+                // A landing pad has no symbol on it, so its entry names it by section and offset,
+                // and `process_relocation` - which follows symbols - passes it by. Asking for the
+                // section directly is what keeps the table it lives in, now that the table is no
+                // longer kept unconditionally. An FDE reaches its landing pad through a symbol, so
+                // it needs none of this.
+                if !info.r_extern
+                    && let Some(target) = compact_unwind_target_section(object, info, data)?
+                {
+                    queue.send_section_request::<A>(object.file_id, target, resources, scope);
+                }
+
+                // The personality is reached through a slot rather than directly, because the entry
+                // stores where the routine's address is rather than the address itself - so it
+                // needs a GOT entry even when the routine is defined right here, which is how
+                // Rust's is.
+                if info.r_extern
+                    && u64::from(info.r_address) % COMPACT_UNWIND_ENTRY_SIZE
+                        == COMPACT_UNWIND_PERSONALITY_OFFSET
+                {
+                    let local_symbol_id = object
+                        .symbol_id_range
+                        .input_to_id(SymbolIndex(info.r_symbolnum as usize));
+                    let symbol_id = resources.symbol_db.definition(local_symbol_id);
+
+                    resources
+                        .per_symbol_flags
+                        .get_atomic(symbol_id)
+                        .fetch_or(ValueFlags::GOT_ENTRY_REQUIRED);
+                }
+            }
+        }
+
         Ok(())
     }
 
     fn new_epilogue_layout<'data>(
         _args: &Self::Args,
         _output_kind: crate::output_kind::OutputKind,
-        _dynamic_symbol_definitions: &mut [crate::layout::DynamicSymbolDefinition<'data, Self>],
+        dynamic_symbol_definitions: &mut [crate::layout::DynamicSymbolDefinition<'data, Self>],
         group_states: &[layout::GroupState<'data, Self>],
     ) -> Self::EpilogueLayoutExt {
         verbose_timing_phase!("Gather imported symbol IDs");
@@ -1280,7 +2542,19 @@ impl platform::Platform for MachO {
             .copied()
             .collect();
 
-        EpilogueLayoutExt { imported_symbols }
+        // Sorted here rather than at the point of use because the trie is built from a sorted
+        // list, and this is the only place the names are to hand.
+        dynamic_symbol_definitions.sort_unstable_by_key(|definition| definition.name);
+
+        let exported_symbols = dynamic_symbol_definitions
+            .iter()
+            .map(|definition| definition.symbol_id)
+            .collect();
+
+        EpilogueLayoutExt {
+            imported_symbols,
+            exported_symbols,
+        }
     }
 
     fn apply_non_addressable_indexes_epilogue(
@@ -1301,10 +2575,31 @@ impl platform::Platform for MachO {
     fn finalise_sizes_epilogue<'data>(
         state: &mut Self::EpilogueLayoutExt,
         mem_sizes: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
-        _dynamic_symbol_definitions: &[crate::layout::DynamicSymbolDefinition<'data, Self>],
+        dynamic_symbol_definitions: &[crate::layout::DynamicSymbolDefinition<'data, Self>],
         _format_specific: &Self::FinaliseSizesExt<'data>,
         symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
     ) {
+        // How large the trie encodes to depends on the addresses in it, and those aren't assigned
+        // yet. Building it with the widest address any of them could have gives an upper bound: no
+        // node can be larger than this, so no offset can be either, so neither can the whole.
+        if !dynamic_symbol_definitions.is_empty() {
+            let widest = dynamic_symbol_definitions
+                .iter()
+                .map(|definition| (definition.name, u64::MAX))
+                .collect_vec();
+
+            // Rounded up because what follows in `__LINKEDIT` expects to start on a pointer
+            // boundary, and because a trie is a byte stream that would otherwise leave it wherever
+            // its last node happened to end. The padding reads as a trie with nothing past its
+            // root, which is what the trailing space holds anyway.
+            let widest_len = crate::macho_export_trie::ExportTrie::build(&widest).len() as u64;
+
+            mem_sizes.increment(
+                part_id::EXPORT_TRIE,
+                widest_len.next_multiple_of(alignment::USIZE.value()),
+            );
+        }
+
         let mut fixup_table_size = CHAINED_FIXUP_TABLE_BASE_SIZE;
 
         fixup_table_size += state
@@ -1317,15 +2612,128 @@ impl platform::Platform for MachO {
             })
             .sum::<u64>();
 
-        // Chained fixups record start information per page. At this point the final GOT size is
-        // known, so reserve the fixup table entries needed to describe the GOT pages.
-        fixup_table_size += CHAINED_FIXUP_PAGE_START_SIZE
-            * (state.imported_symbols.len() as u64).div_ceil(MACHO_PAGE_ALIGNMENT.value());
+        // The space taken by the per-page start information is added by
+        // `apply_late_size_adjustments_epilogue`, which is the first point at which the sizes of
+        // the writable segments are known.
 
         mem_sizes.increment(
             part_id::CHAINED_FIXUP_TABLE,
             alignment::USIZE.align_up(fixup_table_size),
         );
+
+        // Every imported symbol also gets an undefined entry in the symbol table. Mach-O requires
+        // the undefined symbols to be contiguous and last, which they are because the epilogue is
+        // the last thing laid out, and `LC_DYSYMTAB` names that run by index.
+        let symtab_size = state.imported_symbols.len() as u64 * size_of::<SymtabEntry>() as u64;
+        let strings_size = state
+            .imported_symbols
+            .iter()
+            .map(|&s| symbol_db.symbol_name(s).unwrap().bytes().len() as u64 + 1)
+            .sum::<u64>();
+
+        mem_sizes.increment(part_id::SYMTAB_GLOBAL, symtab_size);
+        mem_sizes.increment(part_id::STRTAB, strings_size);
+    }
+
+    fn apply_late_size_adjustments_epilogue(
+        _state: &mut Self::EpilogueLayoutExt,
+        current_sizes: &crate::output_section_part_map::OutputSectionPartMap<u64>,
+        extra_sizes: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
+        _dynamic_symbol_defs: &[crate::layout::DynamicSymbolDefinition<Self>],
+        _format_specific: &Self::FinaliseSizesExt<'_>,
+        _args: &Self::Args,
+    ) -> Result {
+        // A `dyld_chained_starts_in_segment` record holds one `page_start` entry for every page of
+        // the segment it describes, whether or not that page has any fixups on it. How much space
+        // the fixup table needs therefore depends on the sizes of the writable segments, which
+        // aren't known until every group's sizes have been merged - later than
+        // `finalise_sizes_epilogue` runs.
+        // Both writable segments are described, so both have to be measured in full. Asking
+        // `mapped_segment_type` which segment each section belongs to keeps this in step with the
+        // layout: naming the sections directly meant that every section added to `__DATA` or
+        // `__DATA_CONST` afterwards went uncounted, and the table came up short by two bytes per
+        // uncounted page only once the link was big enough for those sections to span one.
+        let mut data_size = 0;
+        let mut data_const_size = 0;
+
+        for part_index in 0..current_sizes.num_parts() {
+            let part_id = PartId::from_usize(part_index);
+            let size = *current_sizes.get(part_id);
+
+            match mapped_segment_type(part_id.output_section_id()) {
+                SegmentType::DataSections => data_size += size,
+                SegmentType::DataConstSections => data_const_size += size,
+                _ => {}
+            }
+        }
+
+        // One extra page per segment covers it being padded out to an alignment boundary.
+        let page_start_count = [data_size, data_const_size]
+            .into_iter()
+            .map(|size| size.div_ceil(MACHO_PAGE_ALIGNMENT.value()) + 1)
+            .sum::<u64>();
+
+        extra_sizes.increment(
+            part_id::CHAINED_FIXUP_TABLE,
+            alignment::USIZE.align_up(page_start_count * CHAINED_FIXUP_PAGE_START_SIZE),
+        );
+
+        // The indirect symbol table holds one symbol index for every slot of every section whose
+        // type says its contents are symbol pointers or stubs - `__got` and `__stubs` here. Like
+        // the page starts above, that's a function of those sections' sizes, so it can't be
+        // counted until they've been merged.
+        let mut indirect_entry_count = 0;
+
+        for (section_id, entry_size) in [
+            (output_section_id::GOT, GOT_ENTRY_SIZE),
+            (output_section_id::PLT_GOT, PLT_ENTRY_SIZE),
+        ] {
+            let mut section_size = 0;
+
+            for part_index in 0..current_sizes.num_parts() {
+                let part_id = PartId::from_usize(part_index);
+                if part_id.output_section_id() == section_id {
+                    section_size += *current_sizes.get(part_id);
+                }
+            }
+
+            indirect_entry_count += section_size / entry_size;
+        }
+
+        extra_sizes.increment(
+            part_id::INDIRECT_SYMTAB,
+            indirect_entry_count * INDIRECT_SYMTAB_ENTRY_SIZE,
+        );
+
+        // The per-function part of `__unwind_info` was reserved as the input sections were read;
+        // what's left is the part that depends on how many functions there are in total - the
+        // header, and the index of the pages they're split across.
+        // An upper bound rather than the count: the reservation also holds the landing pad index,
+        // so dividing it by what one entry costs can only over-state how many there are, and an
+        // over-stated page count reserves an index row that goes unused.
+        let unwind_entry_count =
+            *current_sizes.get(part_id::UNWIND_INFO) / UNWIND_INFO_BYTES_PER_ENTRY;
+
+        if unwind_entry_count > 0 {
+            let pages = unwind_entry_count.div_ceil(UNWIND_INFO_PAGE_CAPACITY);
+
+            extra_sizes.increment(
+                part_id::UNWIND_INFO,
+                UNWIND_INFO_HEADER_SIZE
+                    + UNWIND_INFO_MAX_PERSONALITIES * size_of::<u32>() as u64
+                    // The encodings shared across the whole image, which a compressed entry names
+                    // by index rather than carrying.
+                    + UNWIND_INFO_MAX_COMMON_ENCODINGS as u64 * size_of::<u32>() as u64
+                    // One index entry per page, plus a sentinel that marks the end of the last
+                    // function.
+                    + (pages + 1) * UNWIND_INFO_INDEX_ENTRY_SIZE
+                    // The larger of the two page headers, since which one a page gets is decided
+                    // when it is written.
+                    + pages * UNWIND_INFO_COMPRESSED_PAGE_HEADER_SIZE,
+            );
+        }
+
+        Ok(())
     }
 
     fn finalise_sizes_all<'data>(
@@ -1401,8 +2809,17 @@ impl platform::Platform for MachO {
             );
         }
         allocate_load_cmd(size_of::<SegmentCommand>());
-        if resources.symbol_db.output_kind.is_executable() {
+        if args.is_executable() {
             allocate_load_cmd(size_of::<EntryPointCommand>());
+        } else {
+            // A dylib or a bundle is entered through its exports rather than at one address, so it
+            // carries no entry point but does say where those exports are listed. Only a dylib also
+            // records the name it will be looked up by; a bundle is opened by path.
+            if args.dylib {
+                allocate_load_cmd(load_dylib_command_size(own_install_name(args)));
+            }
+
+            allocate_load_cmd(size_of::<object::macho::LinkeditDataCommand<Endianness>>());
         }
         allocate_load_cmd(
             (size_of::<DylinkerCommand>() + DYLINKER_PATH.len())
@@ -1423,8 +2840,13 @@ impl platform::Platform for MachO {
             allocate_load_cmd(command_size);
         }
 
+        for rpath in &args.rpaths {
+            allocate_load_cmd(rpath_command_size(rpath));
+        }
+
         allocate_load_cmd(size_of::<DyldChainedFixupsCommand>());
         allocate_load_cmd(size_of::<SymtabCommand>());
+        allocate_load_cmd(size_of::<DysymtabCommand>());
         allocate_load_cmd(size_of::<CodeSignatureCommand>());
         allocate_load_cmd(size_of::<UuidCommand>());
         if args.platform_version.is_some() {
@@ -1433,17 +2855,17 @@ impl platform::Platform for MachO {
     }
 
     fn new_stub_library_layout_state_ext<'data>(
-        _stub: &resolution::ResolvedStubLibrary<'data>,
+        stub: &resolution::ResolvedStubLibrary<'data>,
         args: &Self::Args,
     ) -> Self::StubLibraryLayoutStateExt {
-        DynamicLayoutStateExt::new(args)
+        DynamicLayoutStateExt::new(args, stub.input.file.modifiers)
     }
 
     fn new_dynamic_layout_state_ext<'data>(
-        _file: &resolution::ResolvedDynamic<'data, Self>,
+        file: &resolution::ResolvedDynamic<'data, Self>,
         args: &Self::Args,
     ) -> Self::DynamicLayoutStateExt<'data> {
-        DynamicLayoutStateExt::new(args)
+        DynamicLayoutStateExt::new(args, file.common.input.file.modifiers)
     }
 
     fn load_stub_library_symbol<'data>(
@@ -1457,11 +2879,24 @@ impl platform::Platform for MachO {
     }
 
     fn finalise_sizes_for_symbol<'data>(
-        _common: &mut crate::layout::CommonGroupState<'data, Self>,
-        _symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
-        _symbol_id: crate::symbol_db::SymbolId,
-        _flags: crate::value_flags::ValueFlags,
+        common: &mut crate::layout::CommonGroupState<'data, Self>,
+        symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
+        symbol_id: crate::symbol_db::SymbolId,
+        flags: crate::value_flags::ValueFlags,
     ) -> crate::error::Result {
+        // A `_objc_msgSend$selector` trampoline is three pieces the linker writes: the code, the
+        // selector reference it loads, and the selector name that reference points at. Reserved
+        // here, claimed in `platform_symbol_resolution` - the two have to agree, and both skip a
+        // symbol nothing ended up referring to.
+        if flags.has_resolution()
+            && let Ok(name) = symbol_db.symbol_name(symbol_id)
+            && let Some(selector) = objc_stub_selector(name.bytes())
+        {
+            common.allocate(part_id::OBJC_STUBS, OBJC_STUB_SIZE);
+            common.allocate(objc_selrefs_part_id(), GOT_ENTRY_SIZE);
+            common.allocate(part_id::OBJC_METHNAME, selector.len() as u64 + 1);
+        }
+
         Ok(())
     }
 
@@ -1471,10 +2906,12 @@ impl platform::Platform for MachO {
         _output_kind: crate::output_kind::OutputKind,
         _args: &Self::Args,
     ) {
-        if flags.is_dynamic() && flags.needs_plt() {
+        let indirection = Indirection::for_symbol(flags);
+
+        if indirection.plt {
             mem_sizes.increment(part_id::PLT_GOT, PLT_ENTRY_SIZE);
         }
-        if flags.is_dynamic() && flags.needs_got() {
+        if indirection.got {
             mem_sizes.increment(part_id::GOT, GOT_ENTRY_SIZE);
         }
     }
@@ -1485,6 +2922,12 @@ impl platform::Platform for MachO {
         symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
         per_symbol_flags: &crate::value_flags::AtomicPerSymbolFlags,
     ) -> Result {
+        // Mach-O requires the symbol table to be partitioned - all local symbols, then all
+        // externally defined ones, then all undefined ones - because `LC_DYSYMTAB` names each run
+        // by a start index and a count. Objects are laid out one after another, so keeping the two
+        // kinds in separate output sections is what makes the runs contiguous across objects
+        // rather than only within each one.
+        let mut num_locals = 0;
         let mut num_globals = 0;
         let mut strings_size = 0;
         for ((sym_index, sym), flags) in state
@@ -1502,11 +2945,61 @@ impl platform::Platform for MachO {
                 flags.get(),
                 &state.sections,
             ) {
-                num_globals += 1;
+                if platform::Symbol::is_local(sym) || is_unexported(symbol_db, info.name) {
+                    num_locals += 1;
+                } else {
+                    num_globals += 1;
+                }
                 strings_size += info.name.len() + 1;
             }
         }
+        // The debug map, which is stabs and so counts as local symbols. It has to be measured the
+        // same way the writer emits it, so both walk the symbols by the same rule.
+        if let Some(debug_info) = debug_map_info(state.object, symbol_db.args)? {
+            num_locals += crate::macho_debug_map::STABS_PER_OBJECT;
+
+            strings_size += EMPTY_NAME_SIZE * 2
+                + debug_info.directory.len()
+                + 1
+                + debug_info.file_name.len()
+                + 1
+                + crate::macho_debug_map::object_path(&state.input, symbol_db.args).len()
+                + 1;
+
+            for ((sym_index, sym), flags) in state
+                .object
+                .enumerate_symbols()
+                .zip(per_symbol_flags.range(state.symbol_id_range))
+            {
+                let symbol_id = state.symbol_id_range.input_to_id(sym_index);
+                let Some(info) = SymbolCopyInfo::new(
+                    state.object,
+                    sym_index,
+                    sym,
+                    symbol_id,
+                    symbol_db,
+                    flags.get(),
+                    &state.sections,
+                ) else {
+                    continue;
+                };
+
+                match debug_map_stab_kind(state.object, sym, sym_index)? {
+                    Some(DebugMapEntry::Function) => {
+                        num_locals += crate::macho_debug_map::STABS_PER_FUNCTION;
+                        strings_size += info.name.len() + 1 + EMPTY_NAME_SIZE * 3;
+                    }
+                    Some(DebugMapEntry::Variable) => {
+                        num_locals += 1;
+                        strings_size += info.name.len() + 1;
+                    }
+                    None => {}
+                }
+            }
+        }
+
         let entry_size = size_of::<SymtabEntry>() as u64;
+        common.allocate(part_id::SYMTAB_LOCAL, num_locals * entry_size);
         common.allocate(part_id::SYMTAB_GLOBAL, num_globals * entry_size);
         common.allocate(part_id::STRTAB, strings_size as u64);
 
@@ -1519,7 +3012,57 @@ impl platform::Platform for MachO {
         _sizes: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
         _symbol_db: &crate::symbol_db::SymbolDb<Self>,
     ) -> crate::error::Result {
-        todo!()
+        // Linker-defined symbols resolve references but aren't written to the symbol table, so they
+        // need no space in it. Reserving some would leave a hole, since nothing in the writer emits
+        // them. ld64 does list `__mh_execute_header`, so this is a difference from its output;
+        // fixing it means emitting these symbols, not just allocating for them.
+        Ok(())
+    }
+
+    fn synthetic_symbol_for_undefined(name: &[u8]) -> Option<Self::PlatformSpecificSymbol> {
+        objc_stub_selector(name).map(|_| LinkerSymbol::ObjcMsgSendStub)
+    }
+
+    fn dependency_of_undefined(name: &[u8]) -> Option<&'static [u8]> {
+        objc_stub_selector(name).map(|_| OBJC_MSGSEND)
+    }
+
+    fn platform_symbol_resolution(
+        symbol: Self::PlatformSpecificSymbol,
+        name: &[u8],
+        flags: crate::value_flags::ValueFlags,
+        memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
+    ) -> Resolution<Self> {
+        let mut resolution = Resolution {
+            raw_value: 0,
+            dynamic_symbol_index: None,
+            flags,
+            format_specific: ResolutionExt::default(),
+        };
+
+        match symbol {
+            LinkerSymbol::ObjcMsgSendStub => {
+                // Sized by `finalise_sizes_for_symbol`, which skipped what has no resolution - and
+                // so does the caller, so nothing is claimed here that wasn't reserved.
+                let Some(selector) = objc_stub_selector(name) else {
+                    return resolution;
+                };
+
+                let stub = *memory_offsets.get(part_id::OBJC_STUBS);
+                memory_offsets.increment(part_id::OBJC_STUBS, OBJC_STUB_SIZE);
+
+                let selref = *memory_offsets.get(objc_selrefs_part_id());
+                memory_offsets.increment(objc_selrefs_part_id(), GOT_ENTRY_SIZE);
+
+                memory_offsets.increment(part_id::OBJC_METHNAME, selector.len() as u64 + 1);
+
+                // Callers branch to the trampoline, so that is the symbol's value.
+                resolution.raw_value = stub;
+                resolution.format_specific.selref_address = NonZeroU64::new(selref);
+            }
+        }
+
+        resolution
     }
 
     fn allocate_prelude(
@@ -1556,19 +3099,29 @@ impl platform::Platform for MachO {
             format_specific: ResolutionExt {
                 got_address: None,
                 plt_address: None,
+                selref_address: None,
             },
             flags,
         };
 
-        if flags.needs_plt() {
+        let indirection = Indirection::for_symbol(flags);
+
+        if indirection.plt {
             let plt_address = allocate_plt(memory_offsets);
             resolution.raw_value = plt_address.get();
             resolution.format_specific.plt_address = Some(plt_address);
-            resolution.format_specific.got_address = Some(allocate_got(memory_offsets));
-        } else if flags.needs_got() {
+        }
+        if indirection.got {
             let got_address = allocate_got(memory_offsets);
-            resolution.raw_value = got_address.get();
             resolution.format_specific.got_address = Some(got_address);
+
+            // An imported symbol has no address of its own until dyld binds it, so `raw_value` is
+            // free to stand in for the indirection that reaches it. A locally defined one does have
+            // an address, and references that aren't going through the GOT still need it, so
+            // leaving `raw_value` alone is what lets a symbol have both.
+            if !indirection.plt && flags.is_dynamic() {
+                resolution.raw_value = got_address.get();
+            }
         }
 
         resolution
@@ -1587,7 +3140,7 @@ impl platform::Platform for MachO {
     }
 
     fn build_output_order_and_program_segments<'data>(
-        _custom: &crate::output_section_id::CustomSectionIds,
+        custom: &crate::output_section_id::CustomSectionIds,
         output_kind: OutputKind,
         output_sections: &crate::output_section_id::OutputSections<'data, Self>,
         secondary: &crate::output_section_map::OutputSectionMap<
@@ -1605,16 +3158,68 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::FILE_HEADER);
         builder.add_section(output_section_id::LOAD_COMMANDS);
         // Content of the sections (e.g. __text, __data).
+        // `__stubs` and `__objc_stubs` go before `__text` because `thunks.rs` assumes all
+        // non-primary executable parts precede `primary_function_part_id` (`__text` align 4).
+        builder.add_section(output_section_id::PLT_GOT);
+        builder.add_section(output_section_id::OBJC_STUBS);
         builder.add_section(output_section_id::TEXT);
         builder.add_section(output_section_id::CSTRING);
-        builder.add_section(output_section_id::CONST);
-        builder.add_section(output_section_id::PLT_GOT);
-        builder.add_section(output_section_id::DATA);
+        builder.add_section(output_section_id::OBJC_METHNAME);
+        builder.add_section(output_section_id::GCC_EXCEPT_TABLE);
+        builder.add_section(output_section_id::UNWIND_INFO);
+        builder.add_section(output_section_id::MACHO_EH_FRAME);
+        builder.add_section(output_section_id::SWIFT5_TYPEREF);
+        builder.add_section(output_section_id::SWIFT5_REFLSTR);
+        builder.add_section(output_section_id::SWIFT5_FIELDMD);
+        builder.add_section(output_section_id::SWIFT5_ASSOCTY);
+        builder.add_section(output_section_id::SWIFT5_CAPTURE);
+        builder.add_section(output_section_id::SWIFT5_BUILTIN);
+        builder.add_section(output_section_id::SWIFT5_PROTO);
+        builder.add_section(output_section_id::SWIFT5_PROTOS);
+        builder.add_section(output_section_id::SWIFT5_TYPES);
+        builder.add_section(output_section_id::SWIFT5_ENTRY);
+        builder.add_section(output_section_id::SWIFT5_MPENUM);
+        builder.add_section(output_section_id::SWIFT5_REPLACE);
+        builder.add_section(output_section_id::SWIFT5_REPLAC2);
+        builder.add_section(output_section_id::SWIFT5_ACFUNCS);
+        builder.add_section(output_section_id::SWIFT_CONSTG);
+        builder.add_section(output_section_id::SWIFT_MODHASH);
+        // The `__DATA_CONST` sections go before `__DATA`'s: the zerofill at the end of `__DATA`
+        // must not sit between the file's start and any segment carrying chained fixups - see
+        // `SegmentType` for what goes wrong when it does.
         builder.add_section(output_section_id::GOT);
+        builder.add_section(output_section_id::CONST);
+        builder.add_section(output_section_id::DATA);
+        builder.add_section(output_section_id::OBJC_SELREFS);
+        builder.add_section(output_section_id::INIT_ARRAY);
+        builder.add_section(output_section_id::FINI_ARRAY);
+        // Sections we have no built-in ID for are mapped to `__DATA` by `mapped_segment_type`, so
+        // they have to be added here or the segment's section count and its contents disagree.
+        // They go before the zerofill sections below because they do have file content, and a
+        // zerofill section is only free of a file offset while nothing follows it in the segment.
+        //
+        // Mach-O attributes report neither `alloc` nor `writable`, so the generic classifier puts
+        // every custom section in the `nonalloc` bucket; there's nothing to read from the other
+        // buckets.
+        builder.add_sections(&custom.nonalloc);
+        // ld64 puts the descriptors ahead of the thread-local data they point at. `__thread_data`
+        // and `__thread_bss` are the template dyld copies for each thread, and a descriptor names
+        // its variable by an offset into that template - so nothing may come between them, or the
+        // offsets run past the end of what dyld allocated and it refuses to load the image.
+        builder.add_section(output_section_id::THREAD_VARS);
+        builder.add_section(output_section_id::TDATA);
+        builder.add_section(output_section_id::TBSS);
+        builder.add_section(output_section_id::COMMON);
+        builder.add_section(output_section_id::BSS);
         // The rest (e.g. symbol table, string table).
         builder.add_section(output_section_id::STRTAB);
         builder.add_section(output_section_id::CHAINED_FIXUP_TABLE);
+        // The local symbols have to precede the external ones for `LC_DYSYMTAB` to be able to name
+        // each run as a contiguous range.
+        builder.add_section(output_section_id::SYMTAB_LOCAL);
         builder.add_section(output_section_id::SYMTAB_GLOBAL);
+        builder.add_section(output_section_id::INDIRECT_SYMTAB);
+        builder.add_section(output_section_id::EXPORT_TRIE);
         builder.add_section(output_section_id::CODE_SIGNATURE);
 
         builder.build()
@@ -1673,22 +3278,240 @@ pub(crate) fn install_name<'data>(
 ) -> &'data [u8] {
     match symbol_db.file(file_id) {
         SequencedInput::StubLibrary(stub) => stub.defined_symbols.install_name.as_bytes(),
-        SequencedInput::Object(obj) => obj.parsed.input.lib_name(),
+
+        // What a library calls itself, not the path we opened it by. The two differ whenever a
+        // dylib is built to be found somewhere other than where it was when we linked against it,
+        // which is the normal case: `@rpath/libfoo.dylib` says "look along the rpath", and
+        // recording the build-time path instead produces an image that only runs from the
+        // directory it was linked in.
+        SequencedInput::Object(obj) => obj
+            .parsed
+            .object
+            .install_name()
+            .unwrap_or_else(|| obj.parsed.input.lib_name()),
+
         _ => {
             panic!("Internal error: Expected StubLibrary or Dynamic");
         }
     }
 }
 
+/// One byte for the terminator of a name that is empty.
+pub(crate) const EMPTY_NAME_SIZE: usize = 1;
+
+/// What kind of debug map entry a symbol earns, if any.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DebugMapEntry {
+    /// Code, described by its bounds and its length.
+    Function,
+
+    /// Data, described by name alone.
+    Variable,
+}
+
+/// Returns the debug map entry a symbol earns.
+///
+/// A symbol that isn't the start of its atom is an interior label rather than a thing with a
+/// length, and a symbol outside any section - an absolute, say - describes nothing `dsymutil` can
+/// go and look up. Both are left out, which is what ld64 does with them.
+pub(crate) fn debug_map_stab_kind(
+    object: &File<'_>,
+    symbol: &SymtabEntry,
+    symbol_index: SymbolIndex,
+) -> Result<Option<DebugMapEntry>> {
+    let Some(section_index) = object.symbol_section(symbol, symbol_index)? else {
+        return Ok(None);
+    };
+
+    if !object.atom_is_code(section_index)? {
+        return Ok(Some(DebugMapEntry::Variable));
+    }
+
+    if symbol.n_value.get(LE) != object.section(section_index)?.addr.get(LE) {
+        return Ok(None);
+    }
+
+    Ok(Some(DebugMapEntry::Function))
+}
+
+/// Reads what an object says about the source it was built from, unless we were asked not to carry
+/// a debug map at all.
+pub(crate) fn debug_map_info(
+    object: &File<'_>,
+    args: &MachOArgs,
+) -> Result<Option<crate::macho_debug_map::ObjectDebugInfo>> {
+    if <MachOArgs as platform::Args>::should_strip_debug(args) {
+        return Ok(None);
+    }
+
+    crate::macho_debug_map::read_object_debug_info(object)
+}
+
+/// Reads the libraries a dylib passes on the exports of, from its `LC_REEXPORT_DYLIB` commands.
+///
+/// dyld looks through such a library when resolving a symbol against the one naming it, so a
+/// program can bind to something an umbrella library never defined. We have to look through it at
+/// link time for the same reason - otherwise the symbol is undefined here and the program that
+/// `ld` links fine doesn't link at all.
+///
+/// This is the same relationship a `.tbd` states with `reexported-libraries`; the difference is
+/// only that a real dylib states it in a load command.
+pub(crate) fn reexported_dylibs(data: &[u8]) -> Result<Vec<&str>> {
+    let header = macho::MachHeader64::<Endianness>::parse(data, 0)?;
+    let mut commands = header.load_commands(LE, data, 0)?;
+    let mut names = Vec::new();
+
+    while let Some(command) = commands.next()? {
+        if command.cmd() != object::macho::LC_REEXPORT_DYLIB {
+            continue;
+        }
+
+        let dylib = command
+            .dylib()?
+            .context("LC_REEXPORT_DYLIB without a library")?;
+        let name = command.string(LE, dylib.dylib.name)?;
+
+        names.push(std::str::from_utf8(name).context("LC_REEXPORT_DYLIB name is not valid UTF-8")?);
+    }
+
+    Ok(names)
+}
+
+/// Reads the libraries an object says it needs, from its `LC_LINKER_OPTION` commands.
+///
+/// A compiler that knows which library provides what it just emitted records the linker flags for
+/// it in the object itself, rather than relying on whoever links to remember. Swift does this for
+/// its whole runtime - a single object carries a couple of dozen of these - and clang does it for
+/// modules. An object's options are the arguments that would have been passed, in the same form:
+/// `-lfoo`, or `-framework` followed by a name.
+pub(crate) fn linker_options(data: &[u8]) -> Result<Vec<Vec<&str>>> {
+    let header = macho::MachHeader64::<Endianness>::parse(data, 0)?;
+    let mut commands = header.load_commands(LE, data, 0)?;
+    let mut options = Vec::new();
+
+    while let Some(command) = commands.next()? {
+        if command.cmd() != object::macho::LC_LINKER_OPTION {
+            continue;
+        }
+
+        let option: &object::macho::LinkerOptionCommand<Endianness> = command.data()?;
+        let count = option.count.get(LE) as usize;
+
+        // The strings sit directly after the command, run together and each terminated, with
+        // whatever padding the command's size demands after the last of them.
+        let strings = command
+            .raw_data()
+            .get(size_of::<object::macho::LinkerOptionCommand<Endianness>>()..)
+            .context("LC_LINKER_OPTION has no room for its strings")?;
+
+        let mut values = Vec::with_capacity(count);
+
+        for value in strings.split(|byte| *byte == 0).take(count) {
+            values.push(std::str::from_utf8(value).context("LC_LINKER_OPTION is not valid UTF-8")?);
+        }
+
+        ensure!(
+            values.len() == count,
+            "LC_LINKER_OPTION says it has {count} strings but only {} are there",
+            values.len()
+        );
+
+        options.push(values);
+    }
+
+    Ok(options)
+}
+
+/// Whether a dependency was asked for only if it happens to be there.
+///
+/// Such a library is recorded with `LC_LOAD_WEAK_DYLIB` and everything imported from it is marked
+/// weak, which together tell dyld to carry on with those symbols resolved to zero rather than
+/// refuse to start. It is how a program supports a system older than the one it was built against.
+pub(crate) fn is_weak_library(
+    file_id: FileId,
+    symbol_db: &crate::symbol_db::SymbolDb<'_, MachO>,
+) -> bool {
+    match symbol_db.file(file_id) {
+        SequencedInput::StubLibrary(stub) => stub.input.file.modifiers.weak,
+        SequencedInput::Object(obj) => obj.parsed.input.file.modifiers.weak,
+        _ => false,
+    }
+}
+
+/// Whether what a dependency exports is passed on as though we exported it ourselves.
+///
+/// Recorded with `LC_REEXPORT_DYLIB`. dyld looks through such a library when resolving a symbol
+/// against us, so nothing has to be copied into our own export trie for it to be found - which is
+/// how an umbrella library offers what its children define without defining any of it.
+pub(crate) fn is_reexported_library(
+    file_id: FileId,
+    symbol_db: &crate::symbol_db::SymbolDb<'_, MachO>,
+) -> bool {
+    match symbol_db.file(file_id) {
+        SequencedInput::StubLibrary(stub) => stub.input.file.modifiers.reexport,
+        SequencedInput::Object(obj) => obj.parsed.input.file.modifiers.reexport,
+        _ => false,
+    }
+}
+
+/// What a dependency says about its versions, for the `LC_LOAD_DYLIB` naming it.
+///
+/// dyld refuses to load a library older than the one an image was built against, so these have to
+/// come from the library rather than be made up. A library that says nothing gets 1.0, which is
+/// what the `.tbd` format specifies for an absent field and what a library that has never broken
+/// compatibility would carry anyway.
+pub(crate) fn dylib_versions(
+    file_id: FileId,
+    symbol_db: &crate::symbol_db::SymbolDb<'_, MachO>,
+) -> DylibVersions {
+    let default = object::macho::Version::new(1, 0, 0);
+
+    match symbol_db.file(file_id) {
+        SequencedInput::StubLibrary(stub) => DylibVersions {
+            compatibility: parse_dylib_version(stub.defined_symbols.compatibility_version)
+                .unwrap_or(default),
+            current: parse_dylib_version(stub.defined_symbols.current_version).unwrap_or(default),
+        },
+
+        SequencedInput::Object(obj) => {
+            obj.parsed.object.dylib_versions().unwrap_or(DylibVersions {
+                compatibility: default,
+                current: default,
+            })
+        }
+
+        _ => panic!("Internal error: Expected StubLibrary or Dynamic"),
+    }
+}
+
+/// Parses a `.tbd` version, which is written in decimal like `150` or `3423.1.2`.
+fn parse_dylib_version(text: &str) -> Option<object::macho::Version> {
+    if text.is_empty() {
+        return None;
+    }
+
+    let mut parts = text.split('.');
+    let major: u16 = parts.next()?.parse().ok()?;
+    let minor: u8 = parts.next().map_or(Ok(0), str::parse).ok()?;
+    let patch: u8 = parts.next().map_or(Ok(0), str::parse).ok()?;
+
+    Some(object::macho::Version::new(major, minor, patch))
+}
+
 fn create_dynamic_layout_ext<'data>(
     target_file_id: FileId,
     resources: &layout::FinaliseLayoutResources<'_, 'data, MachO>,
 ) -> Result<Option<DynamicLayoutExt>> {
+    // By install name rather than by file, because the list holds one entry per name: a library
+    // opened under several names has one of its files in the list, and symbols from any of them
+    // bind against that entry.
+    let target_install_name = install_name(target_file_id, resources.symbol_db);
+
     let Some(index) = resources
         .format_specific
         .imported_libraries
         .iter()
-        .position(|file_id| *file_id == target_file_id)
+        .position(|&file_id| install_name(file_id, resources.symbol_db) == target_install_name)
     else {
         return Ok(None);
     };
@@ -1724,8 +3547,24 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         min_alignment: alignment::USIZE,
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::INDIRECT_SYMTAB.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"INDIRECT_SYMTAB")),
+        min_alignment: alignment::SYMTAB_SHNDX_ENTRY,
+        ..DEFAULT_DEFS
+    };
     defs[output_section_id::SYMTAB_GLOBAL.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"SYMTAB")),
+        min_alignment: alignment::USIZE,
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::UNWIND_INFO.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__unwind_info")),
+        section_flags: macho::S_REGULAR.to_flags(),
+        min_alignment: Alignment { exponent: 2 },
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::EXPORT_TRIE.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"EXPORT_TRIE")),
         min_alignment: alignment::USIZE,
         ..DEFAULT_DEFS
     };
@@ -1738,6 +3577,9 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
     };
     defs[output_section_id::GOT.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"__got")),
+        // Says the section is an array of symbol pointers, which is what makes `reserved1` mean an
+        // index into the indirect symbol table. Only correct because we now emit that table.
+        section_flags: macho::S_NON_LAZY_SYMBOL_POINTERS.to_flags(),
         ..DEFAULT_DEFS
     };
     defs[output_section_id::PLT_GOT.as_usize()] = BuiltInSectionDetails {
@@ -1747,6 +3589,21 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
             .with(macho::S_ATTR_PURE_INSTRUCTIONS)
             .with(macho::S_ATTR_SOME_INSTRUCTIONS),
         min_alignment: Alignment { exponent: 2 },
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::OBJC_STUBS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__objc_stubs")),
+        section_flags: macho::S_REGULAR
+            .to_flags()
+            .with(macho::S_ATTR_PURE_INSTRUCTIONS)
+            .with(macho::S_ATTR_SOME_INSTRUCTIONS),
+        // Each trampoline is 32 bytes, and ld64 keeps them on 32-byte boundaries.
+        min_alignment: Alignment { exponent: 5 },
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::OBJC_METHNAME.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__objc_methname")),
+        section_flags: macho::S_CSTRING_LITERALS.to_flags(),
         ..DEFAULT_DEFS
     };
     // Multi-part generated sections
@@ -1769,9 +3626,140 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         section_flags: macho::S_REGULAR.to_flags(),
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::GCC_EXCEPT_TABLE.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__gcc_except_tab")),
+        section_flags: macho::S_REGULAR.to_flags(),
+        ..DEFAULT_DEFS
+    };
     defs[output_section_id::DATA.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionName(b"__data")),
         section_flags: macho::S_REGULAR.to_flags(),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::OBJC_SELREFS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__objc_selrefs")),
+        // The runtime rewrites these to the uniqued selectors when the image loads, so they must
+        // stay writable and must all be kept - a reference nothing else names is still the one the
+        // runtime uniques through.
+        section_flags: macho::S_LITERAL_POINTERS
+            .to_flags()
+            .with(macho::S_ATTR_NO_DEAD_STRIP),
+        min_alignment: alignment::USIZE,
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::THREAD_VARS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__thread_vars")),
+        section_flags: macho::S_THREAD_LOCAL_VARIABLES.to_flags(),
+        // The section holds `tlv_descriptor`s, which are three pointers each, but clang declares it
+        // with an alignment of 1 and leaves the floor to the linker. Without one the descriptors
+        // can land anywhere, and dyld can neither bind the first word nor read the rest.
+        min_alignment: alignment::USIZE,
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::TDATA.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__thread_data")),
+        section_flags: macho::S_THREAD_LOCAL_REGULAR.to_flags(),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::TBSS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__thread_bss")),
+        section_flags: macho::S_THREAD_LOCAL_ZEROFILL.to_flags(),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::INIT_ARRAY.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__mod_init_func")),
+        // The type is what makes dyld call these rather than just map them, so it has to survive
+        // into the output - a `S_REGULAR` section of the same name is just an array of pointers
+        // nobody reads.
+        section_flags: macho::S_MOD_INIT_FUNC_POINTERS.to_flags(),
+        // Pointers, so dyld requires them aligned as such before it will walk them.
+        min_alignment: alignment::USIZE,
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::FINI_ARRAY.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__mod_term_func")),
+        section_flags: macho::S_MOD_TERM_FUNC_POINTERS.to_flags(),
+        min_alignment: alignment::USIZE,
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::MACHO_EH_FRAME.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__eh_frame")),
+        section_flags: macho::S_REGULAR.to_flags().with(macho::S_ATTR_LIVE_SUPPORT),
+        min_alignment: Alignment { exponent: 3 },
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_TYPEREF.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_typeref")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_REFLSTR.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_reflstr")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_FIELDMD.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_fieldmd")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_ASSOCTY.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_assocty")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_CAPTURE.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_capture")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_BUILTIN.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_builtin")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_PROTO.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_proto")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_PROTOS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_protos")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_TYPES.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_types")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_ENTRY.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_entry")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_MPENUM.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_mpenum")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_REPLACE.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_replace")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_REPLAC2.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_replac2")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT5_ACFUNCS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift5_acfuncs")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT_CONSTG.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__constg_swiftt")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::SWIFT_MODHASH.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__swift_modhash")),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::COMMON.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__common")),
+        section_flags: macho::S_ZEROFILL.to_flags(),
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::BSS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionName(b"__bss")),
+        section_flags: macho::S_ZEROFILL.to_flags(),
         ..DEFAULT_DEFS
     };
 
@@ -1781,6 +3769,10 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
 #[derive(Debug, Default)]
 pub(crate) struct EpilogueLayoutExt {
     imported_symbols: Vec<SymbolId>,
+
+    /// The symbols this image supplies to others, already in name order because that is the order
+    /// the export trie is built in. Empty for an executable, which exports nothing.
+    pub(crate) exported_symbols: Vec<SymbolId>,
 }
 
 #[derive(Debug)]
@@ -1798,6 +3790,47 @@ pub(crate) struct DynamicLayoutExt {
 pub(crate) struct ResolutionExt {
     pub(crate) got_address: Option<NonZeroU64>,
     pub(crate) plt_address: Option<NonZeroU64>,
+
+    /// For a `_objc_msgSend$selector` trampoline, the selector reference it loads into x1.
+    pub(crate) selref_address: Option<NonZeroU64>,
+}
+
+/// Which pieces of indirection a symbol gets: a `__stubs` (PLT) entry and/or a `__got` entry.
+///
+/// This exists so that the two passes that care can't drift apart. `allocate_resolution` runs
+/// during sizing and reserves the bytes; `create_resolution` runs during address assignment and
+/// hands out the addresses. If they disagree, addresses run past the space that was reserved and
+/// `OffsetVerifier` reports "Unexpected memory offsets" for `__got`.
+#[derive(Clone, Copy)]
+struct Indirection {
+    plt: bool,
+    got: bool,
+}
+
+impl Indirection {
+    /// A symbol imported from a dylib needs indirection because its address isn't known until dyld
+    /// binds it. A symbol defined in the output doesn't: a `GOT_LOAD` relocation against it is
+    /// relaxed into direct addressing when the relocation is applied (`Arch::relax_got_load`),
+    /// which is what ld64 does too.
+    ///
+    /// The exception is a reference that stores the address of the slot rather than reading through
+    /// it, since something else will dereference what it finds there. That can't be relaxed away,
+    /// so the slot has to exist even for a symbol we know the address of - which is how a CIE
+    /// reaches a personality routine defined in this image.
+    fn for_symbol(flags: ValueFlags) -> Self {
+        let indirect = flags.is_dynamic();
+
+        Self {
+            plt: indirect && flags.needs_plt(),
+            got: (indirect && (flags.needs_got() || flags.needs_plt())) || flags.needs_got_entry(),
+        }
+    }
+}
+
+/// The part of `__objc_selrefs` that the linker's own selector references go in. The section is a
+/// regular one, so that the inputs' references merge into it, and pointers want pointer alignment.
+pub(crate) fn objc_selrefs_part_id() -> part_id::PartId {
+    output_section_id::OBJC_SELREFS.part_id_with_alignment(alignment::USIZE)
 }
 
 fn allocate_got(memory_offsets: &mut OutputSectionPartMap<u64>) -> NonZeroU64 {
@@ -1814,11 +3847,110 @@ fn allocate_plt(memory_offsets: &mut OutputSectionPartMap<u64>) -> NonZeroU64 {
 
 // TODO: sort properly
 const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
-    SectionRule::exact_section_keep(b"__text", crate::output_section_id::TEXT),
-    SectionRule::exact_section_keep(b"__cstring", crate::output_section_id::CSTRING),
-    SectionRule::exact_section_keep(b"__const", crate::output_section_id::CONST),
-    SectionRule::exact_section_keep(b"__data", crate::output_section_id::DATA),
-    // SectionRule::exact_section_keep(b"__compact_unwind", crate::output_section_id::EH_FRAME),
+    SectionRule::exact_section(b"__text", crate::output_section_id::TEXT),
+    // Also code: clang puts the functions that run global constructors here rather than in
+    // `__text`. Getting this wrong is not a size difference - the catch-all below sends what it
+    // doesn't recognise to `__DATA`, and a function there faults on the first instruction fetched.
+    SectionRule::exact_section(b"__StaticInit", crate::output_section_id::TEXT),
+    SectionRule::exact_section(b"__cstring", crate::output_section_id::CSTRING),
+    SectionRule::exact_section(b"__ustring", crate::output_section_id::CONST),
+    SectionRule::prefix_section(b"__objc_meth", crate::output_section_id::CSTRING),
+    // Kept as one section with the references the linker synthesizes for its `_objc_msgSend$`
+    // trampolines: the runtime finds `__objc_selrefs` by name, once.
+    SectionRule::exact_section(b"__objc_selrefs", crate::output_section_id::OBJC_SELREFS),
+    SectionRule::exact_section(b"__objc_classname", crate::output_section_id::CSTRING),
+    SectionRule::exact_section(b"__const", crate::output_section_id::CONST),
+    SectionRule::exact_section(
+        b"__gcc_except_tab",
+        crate::output_section_id::GCC_EXCEPT_TABLE,
+    ),
+    SectionRule::exact_section(
+        b"__swift5_typeref",
+        crate::output_section_id::SWIFT5_TYPEREF,
+    ),
+    SectionRule::exact_section(
+        b"__swift5_reflstr",
+        crate::output_section_id::SWIFT5_REFLSTR,
+    ),
+    SectionRule::exact_section(
+        b"__swift5_fieldmd",
+        crate::output_section_id::SWIFT5_FIELDMD,
+    ),
+    SectionRule::exact_section(
+        b"__swift5_assocty",
+        crate::output_section_id::SWIFT5_ASSOCTY,
+    ),
+    SectionRule::exact_section(
+        b"__swift5_capture",
+        crate::output_section_id::SWIFT5_CAPTURE,
+    ),
+    SectionRule::exact_section(
+        b"__swift5_builtin",
+        crate::output_section_id::SWIFT5_BUILTIN,
+    ),
+    SectionRule::exact_section(b"__swift5_proto", crate::output_section_id::SWIFT5_PROTO),
+    SectionRule::exact_section(b"__swift5_protos", crate::output_section_id::SWIFT5_PROTOS),
+    SectionRule::exact_section(b"__swift5_types", crate::output_section_id::SWIFT5_TYPES),
+    SectionRule::exact_section(b"__swift5_entry", crate::output_section_id::SWIFT5_ENTRY),
+    SectionRule::exact_section(b"__swift5_mpenum", crate::output_section_id::SWIFT5_MPENUM),
+    SectionRule::exact_section(
+        b"__swift5_replace",
+        crate::output_section_id::SWIFT5_REPLACE,
+    ),
+    SectionRule::exact_section(
+        b"__swift5_replac2",
+        crate::output_section_id::SWIFT5_REPLAC2,
+    ),
+    SectionRule::exact_section(
+        b"__swift5_acfuncs",
+        crate::output_section_id::SWIFT5_ACFUNCS,
+    ),
+    SectionRule::exact_section(b"__constg_swiftt", crate::output_section_id::SWIFT_CONSTG),
+    SectionRule::exact_section(b"__swift_modhash", crate::output_section_id::SWIFT_MODHASH),
+    SectionRule::exact_section(b"__data", crate::output_section_id::DATA),
+    SectionRule::exact_section(b"__thread_vars", crate::output_section_id::THREAD_VARS),
+    SectionRule::exact_section(b"__thread_data", crate::output_section_id::TDATA),
+    SectionRule::exact_section(b"__thread_bss", crate::output_section_id::TBSS),
+    // Roots. Nothing in the image refers to these, so without `keep` they are unreachable by
+    // definition and would be dropped: dyld finds the initialiser lists from the section type.
+    //
+    // `__gcc_except_tab` is not among them. The only thing naming a landing pad is a
+    // `__compact_unwind` entry or an FDE, and those are now followed once the function they
+    // describe turns out to be live, so a table is kept exactly when something can still reach it.
+    SectionRule::exact_section_keep(b"__mod_init_func", crate::output_section_id::INIT_ARRAY),
+    SectionRule::exact_section_keep(b"__mod_term_func", crate::output_section_id::FINI_ARRAY),
+    SectionRule::exact_section(b"__common", crate::output_section_id::COMMON),
+    SectionRule::exact_section(b"__bss", crate::output_section_id::BSS),
+    // The literal pools are read-only constants that the assembler kept apart only so that the
+    // linker could deduplicate them by size. We don't deduplicate them yet, and ld64 doesn't carry
+    // the names through to the output either - it folds all three into `__TEXT,__const` - so
+    // sending them there costs no fidelity.
+    SectionRule::exact_section(b"__literal4", crate::output_section_id::CONST),
+    SectionRule::exact_section(b"__literal8", crate::output_section_id::CONST),
+    SectionRule::exact_section(b"__literal16", crate::output_section_id::CONST),
+    // `__LD,__compact_unwind` is input to the linker, not output from it: ld64 consumes it to
+    // build `__TEXT,__unwind_info` and emits no `__compact_unwind`. We can't build
+    // `__unwind_info` yet (`warn_if_unwind_info_needed` says so when it matters), but copying
+    // the raw input through would be wrong whether or not we could.
+    // Not copied through: `SectionRuleOutcome::EhFrame` hands the section to
+    // `load_exception_frame_data`, which is what we want for two reasons. Its relocations point
+    // into `__text`, so copying it as an ordinary section would try to rebase pointers inside a
+    // read-only segment; and the output we want from it isn't the input bytes at all, but the
+    // `__unwind_info` table we build from them.
+    SectionRule::exact(b"__compact_unwind", SectionRuleOutcome::EhFrame),
+    // Frame data too, for the same reason and then some. Copying `__eh_frame` through as an
+    // ordinary section would make every FDE's reference to its function a reason to keep that
+    // function, which anchors the whole program: an FDE exists for anything that can be unwound
+    // through, so nothing would ever be stripped. Read as frame data, the arrow points the other
+    // way - a function that survives brings its FDE with it.
+    SectionRule::exact(b"__eh_frame", SectionRuleOutcome::EhFrame),
+    // Debug info stays in the object files for `dsymutil` to collect into a .dSYM bundle; a linked
+    // Mach-O image carries none of it. `__bitcode` and `__cmdline` are likewise only there to feed
+    // LTO - `__bitcode` alone is 5 MiB in Rust's libstd.
+    SectionRule::prefix(b"__debug_", SectionRuleOutcome::Discard),
+    SectionRule::prefix(b"__apple_", SectionRuleOutcome::Discard),
+    SectionRule::exact(b"__bitcode", SectionRuleOutcome::Discard),
+    SectionRule::exact(b"__cmdline", SectionRuleOutcome::Discard),
 ];
 
 pub(crate) const PROGRAM_SEGMENT_DEFS: &[ProgramSegmentDef] = &[
@@ -1839,11 +3971,11 @@ pub(crate) const PROGRAM_SEGMENT_DEFS: &[ProgramSegmentDef] = &[
         count_as_segment: false,
     },
     ProgramSegmentDef {
-        segment_type: SegmentType::DataSections,
+        segment_type: SegmentType::DataConstSections,
         count_as_segment: true,
     },
     ProgramSegmentDef {
-        segment_type: SegmentType::DataConstSections,
+        segment_type: SegmentType::DataSections,
         count_as_segment: true,
     },
     ProgramSegmentDef {
@@ -1880,6 +4012,10 @@ pub(crate) struct SegmentSectionsInfo<'data> {
     pub(crate) segment_size: OutputRecordLayout,
     pub(crate) segment_sections:
         Vec<(OutputRecordLayout, Option<SectionName<'data>>, SectionFlags)>,
+    /// The same sections, in the same order, identified rather than measured. A symbol table entry
+    /// names the section it's in by its position among the sections actually emitted, so that
+    /// position has to come from here rather than from a separate walk that might disagree.
+    pub(crate) section_ids: Vec<crate::output_section_id::OutputSectionId>,
 }
 
 pub(crate) fn get_segment_sections<'data>(
@@ -1888,6 +4024,7 @@ pub(crate) fn get_segment_sections<'data>(
 ) -> Option<SegmentSectionsInfo<'data>> {
     let mut in_matching_segment = false;
     let mut sections = Vec::new();
+    let mut section_ids = Vec::new();
     let mut segment_id = None;
 
     for event in &layout.output_order {
@@ -1911,6 +4048,7 @@ pub(crate) fn get_segment_sections<'data>(
                     layout.output_sections.name(section_id),
                     layout.output_sections.section_flags(section_id),
                 ));
+                section_ids.push(section_id);
             }
             _ => {}
         }
@@ -1924,9 +4062,32 @@ pub(crate) fn get_segment_sections<'data>(
         .find(|seg| seg.id == segment_id)
         .map(|seg| seg.sizes);
 
-    segment_size.map(|segment_size| SegmentSectionsInfo {
-        segment_sections: sections,
-        segment_size,
+    segment_size.map(|mut segment_size| {
+        // A section is placed at whatever address its alignment demands, and an empty one still
+        // takes an address even though it adds nothing to the segment's extent - so the last
+        // section can begin, and end, past where the segment was measured to end. dyld checks that
+        // sections lie within their segment, so the segment is stretched to cover them.
+        for (section, _, _) in &sections {
+            let end = section.mem_offset + section.mem_size;
+            let past_end = end.saturating_sub(segment_size.mem_offset);
+
+            segment_size.mem_size = segment_size.mem_size.max(past_end);
+
+            // File size only follows for a section that has contents; a zerofill one occupies
+            // address space and no file.
+            if section.file_size > 0 {
+                let file_end = section.file_offset + section.file_size;
+                segment_size.file_size = segment_size
+                    .file_size
+                    .max(file_end.saturating_sub(segment_size.file_offset));
+            }
+        }
+
+        SegmentSectionsInfo {
+            segment_sections: sections,
+            section_ids,
+            segment_size,
+        }
     })
 }
 
@@ -1951,6 +4112,22 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
 
         let relocation = A::relocation_from_raw(rel_info)?;
         let mut flags_to_add = layout::resolution_flags(relocation.kind);
+
+        // The low half of an `adrp`/`add` pair addresses the symbol as surely as the high half
+        // does, but its kind asks for nothing, so it would send a load request without marking the
+        // symbol as requested - and the high half would send another. Loading a section twice is
+        // harmless; allocating a common symbol twice is not.
+        if relocation.kind == RelocationKind::AbsoluteLowPart {
+            flags_to_add |= ValueFlags::DIRECT;
+        }
+
+        // The GOT-load relocations are written in a GOT-addressing form but don't require the slot
+        // to exist - if the symbol's address is known at link time, `relax_got_load` rewrites the
+        // instruction to address it directly. This one is different: it stores the address of the
+        // slot for something else to dereference, so the slot has to be there.
+        if rel_info.r_type == object::macho::ARM64_RELOC_POINTER_TO_GOT {
+            flags_to_add |= ValueFlags::GOT_ENTRY_REQUIRED;
+        }
         if is_dynamic_library(&symbol_db.file(symbol_db.file_id_for_symbol(symbol_id))) {
             flags_to_add |= ValueFlags::GOT;
             // TODO: classify symbols more reliably, likely by checking whether their section is
@@ -1962,6 +4139,17 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
 
         let atomic_flags = &resources.per_symbol_flags.get_atomic(symbol_id);
         let previous_flags = atomic_flags.fetch_or(flags_to_add);
+
+        // A branch can only reach so far. This records that the target is branched to, so that
+        // layout can reserve an island for it if it turns out to land out of range - by the time
+        // relocations are applied it is far too late to make room for one.
+        crate::thunks::handle_thunk_extensions_for_relocation::<A>(
+            object.section_part_id(section_index, &symbol_db.section_part_ids),
+            resources,
+            local_symbol_id,
+            symbol_id,
+            rel_info,
+        );
 
         layout::check_for_undefined::<A>(
             object,
@@ -1990,25 +4178,108 @@ fn is_dynamic_library(file: &SequencedInput<MachO>) -> bool {
 }
 
 impl<'data> File<'data> {
-    fn sections(&self) -> &'data [SectionHeader] {
-        self.kind.sections()
-    }
-}
-
-impl<'data> ObjectKind<'data> {
-    fn sections(&self) -> &'data [SectionHeader] {
-        match self {
-            ObjectKind::Regular(regular_object) => regular_object.sections,
-            ObjectKind::Dylib => &[],
+    /// The object's sections as the linker sees them: one per atom.
+    fn sections(&self) -> &[SectionHeader] {
+        match &self.kind {
+            ObjectKind::Regular(regular) => &regular.atoms.sections,
+            ObjectKind::Dylib { .. } => &[],
         }
+    }
+
+    /// The sections as the file records them. Relocation offsets and the `n_sect` of a symbol are
+    /// both expressed against these.
+    fn file_sections(&self) -> &'data [SectionHeader] {
+        match &self.kind {
+            ObjectKind::Regular(regular) => regular.sections,
+            ObjectKind::Dylib { .. } => &[],
+        }
+    }
+
+    /// Returns the atom of real section `section` that `address` falls in, where `address` is in
+    /// the object's own addressing.
+    ///
+    /// A relocation that names a section rather than a symbol gives a real section number, but
+    /// everything downstream is indexed by atom, so the two have to be bridged.
+    pub(crate) fn atom_for_address(
+        &self,
+        section: object::SectionIndex,
+        address: u64,
+    ) -> Option<object::SectionIndex> {
+        self.atoms()?
+            .atom_containing(section, address, self.file_sections())
+    }
+
+    /// The name a dylib records for itself in `LC_ID_DYLIB`, if it is a dylib and says so.
+    pub(crate) fn install_name(&self) -> Option<&'data [u8]> {
+        match &self.kind {
+            ObjectKind::Regular(_) => None,
+            ObjectKind::Dylib { install_name, .. } => *install_name,
+        }
+    }
+
+    /// What a dylib records about its own versions, if it is a dylib.
+    pub(crate) fn dylib_versions(&self) -> Option<DylibVersions> {
+        match &self.kind {
+            ObjectKind::Regular(_) => None,
+            ObjectKind::Dylib { versions, .. } => *versions,
+        }
+    }
+
+    fn atoms(&self) -> Option<&Atoms> {
+        match &self.kind {
+            ObjectKind::Regular(regular) => Some(&regular.atoms),
+            ObjectKind::Dylib { .. } => None,
+        }
+    }
+
+    /// Returns where an atom sits within the section it was cut from, and how long it is. Used to
+    /// pick out the relocations that fall inside it, which are still recorded against the whole
+    /// section.
+    pub(crate) fn atom_span_in_parent(
+        &self,
+        index: object::SectionIndex,
+    ) -> crate::error::Result<Range<u64>> {
+        let atom = self.section(index)?;
+        let parent = self.atom_parent_section(index)?;
+        let offset = atom.addr.get(LE) - parent.addr.get(LE);
+        Ok(offset..offset + atom.size.get(LE))
+    }
+
+    /// Returns the real section an atom was cut from.
+    /// Whether the section an atom was cut from holds code.
+    pub(crate) fn atom_is_code(&self, index: object::SectionIndex) -> Result<bool> {
+        Ok(crate::macho_debug_map::is_code_section(
+            self.atom_parent_section(index)?,
+        ))
+    }
+
+    pub(crate) fn atom_parent_section(
+        &self,
+        index: object::SectionIndex,
+    ) -> crate::error::Result<&'data SectionHeader> {
+        let atoms = self
+            .atoms()
+            .ok_or_else(|| error!("Dylibs have no sections"))?;
+        let parent = *atoms
+            .parents
+            .get(index.0)
+            .ok_or_else(|| error!("Atom index out of range"))?;
+
+        self.file_sections()
+            .get(parent as usize)
+            .ok_or_else(|| error!("Atom names a section that doesn't exist"))
     }
 }
 
 impl DynamicLayoutStateExt {
-    fn new(args: &MachOArgs) -> Self {
+    fn new(args: &MachOArgs, modifiers: crate::args::Modifiers) -> Self {
         Self {
             imported_symbols: Default::default(),
-            loaded: !args.dead_strip_dylibs,
+            // A library the command line named is recorded whether or not anything came from it;
+            // one an object named for itself has to earn its place, because an object lists every
+            // library it might need rather than the ones it does. Recording those unconditionally
+            // means depending on libraries that need not even exist at run time.
+            loaded: !args.dead_strip_dylibs && !modifiers.autolinked,
         }
     }
 }

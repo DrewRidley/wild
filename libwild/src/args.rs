@@ -547,6 +547,22 @@ pub struct Modifiers {
     /// Whether archive semantics should be applied even for regular objects.
     pub(crate) archive_semantics: bool,
 
+    /// Whether a dependency is only wanted if it happens to be there. Mach-O records such a
+    /// library with `LC_LOAD_WEAK_DYLIB` and marks what it imports weak, so that dyld resolves
+    /// a missing one to zero rather than refusing to start.
+    pub(crate) weak: bool,
+
+    /// Whether what a dependency exports is passed on as though we exported it ourselves. Mach-O
+    /// records such a library with `LC_REEXPORT_DYLIB`, and dyld looks through it when resolving
+    /// a symbol against us - which is how an umbrella library offers what its children define.
+    pub(crate) reexport: bool,
+
+    /// Whether an object asked for this rather than the command line. A library named on the
+    /// command line is recorded whether or not anything came from it, because saying so was
+    /// deliberate; one an object named for itself is recorded only if it supplied something, since
+    /// an object names every library it might need rather than the ones it does.
+    pub(crate) autolinked: bool,
+
     /// Whether the file is known to be a temporary file that will be deleted when the linker
     /// exits, e.g. an output file from a linker plugin. This doesn't affect linking, but is
     /// stored in the layout file if written so that linker-diff knows not to error if the file
@@ -561,6 +577,9 @@ impl Default for Modifiers {
             allow_shared: true,
             whole_archive: false,
             archive_semantics: false,
+            weak: false,
+            reexport: false,
+            autolinked: false,
             temporary: false,
         }
     }
@@ -583,6 +602,9 @@ pub(crate) enum InputSpec {
     Lib(Box<str>),
     /// Name of the library, including prefix and suffix.
     Search(Box<str>),
+    /// Name of a Mach-O framework: a directory `Name.framework` holding a library called `Name`,
+    /// looked up on its own search path rather than the library one.
+    Framework(Box<str>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1339,6 +1361,18 @@ impl std::str::FromStr for CounterKind {
 }
 
 fn declare_common_args<T: platform::Args>(parser: &mut ArgumentParser<T>) {
+    // Whether to fork is about how the linker runs rather than about the format it emits, so every
+    // platform accepts this. Turning it off is what lets a profiler see the whole link: with the
+    // fork in place, the process that's measured is the parent, which does nothing but wait.
+    parser
+        .declare()
+        .long("no-fork")
+        .help("Do not fork while linking")
+        .execute(|args, _modifier_stack| {
+            args.common_mut().should_fork = false;
+            Ok(())
+        });
+
     parser
         .declare()
         .long("write-layout")

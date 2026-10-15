@@ -39,6 +39,9 @@ mod linker_plugins;
 pub(crate) mod linker_script;
 pub(crate) mod macho;
 pub(crate) mod macho_aarch64;
+pub(crate) mod macho_debug_map;
+pub(crate) mod macho_export_trie;
+pub(crate) mod macho_map;
 pub(crate) mod macho_object;
 pub(crate) mod macho_stub_library;
 pub(crate) mod macho_writer;
@@ -176,6 +179,11 @@ pub struct Linker<F: FileSystem = OsFileSystem> {
     /// We store our input files here once we've read them.
     inputs_arena: Arena<input_data::InputFile<F::Input>>,
 
+    /// Symbol names that we construct rather than read. A `.tbd` names an Objective-C class once
+    /// and leaves the linker to form the several symbols that class actually defines, and those
+    /// names have to outlive the parse that made them.
+    symbol_names_arena: Arena<String>,
+
     linker_plugin_arena: Arena<linker_plugins::LoadedPlugin>,
 
     /// Anything that doesn't need a custom Drop implementation can go in here. In practice, it's
@@ -217,6 +225,7 @@ impl<F: FileSystem> Linker<F> {
         Self {
             file_system: std::sync::Arc::new(file_system),
             inputs_arena: Arena::new(),
+            symbol_names_arena: Arena::new(),
             linker_plugin_arena: Arena::new(),
             herd: Default::default(),
             shutdown_scope: Default::default(),
@@ -279,6 +288,7 @@ impl<F: FileSystem> Linker<F> {
     ) -> error::Result<LinkerOutput<'data>> {
         let mut file_loader = input_data::FileLoader::new(
             &self.inputs_arena,
+            &self.symbol_names_arena,
             std::sync::Arc::clone(&self.file_system),
         );
 
@@ -430,6 +440,7 @@ impl<F: FileSystem> Drop for Linker<F> {
     fn drop(&mut self) {
         timing_phase!("Drop inputs");
         self.inputs_arena = Arena::new();
+        self.symbol_names_arena = Arena::new();
         self.herd = Default::default();
     }
 }

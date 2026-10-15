@@ -50,6 +50,9 @@ pub(crate) struct FileLoader<'data, F: FileSystem> {
 
     inputs_arena: &'data Arena<InputFile<F::Input>>,
 
+    /// Where symbol names we construct rather than read are kept, so that they outlive the parse.
+    symbol_names_arena: &'data Arena<String>,
+
     // File system used for reading and writing of the data.
     file_system: Arc<F>,
 }
@@ -110,6 +113,7 @@ pub(crate) struct InputFileRef<'data> {
     pub(crate) filename: &'data Path,
     original_filename: &'data Path,
     pub(crate) modifiers: Modifiers,
+    modification_time: Option<std::time::SystemTime>,
 }
 
 impl InputFileRef<'_> {
@@ -119,6 +123,7 @@ impl InputFileRef<'_> {
             filename: Path::new(""),
             original_filename: Path::new(""),
             modifiers: Modifiers::default(),
+            modification_time: None,
         }
     }
 }
@@ -133,6 +138,7 @@ impl<I: InputFileData> InputFile<I> {
             filename: &self.filename,
             original_filename: &self.original_filename,
             modifiers: self.modifiers,
+            modification_time: self.data.as_ref().and_then(InputFileData::modification_time),
         }
     }
 }
@@ -176,6 +182,8 @@ struct TemporaryState<'data, P: Platform, F: FileSystem> {
 
     inputs_arena: &'data Arena<InputFile<F::Input>>,
 
+    symbol_names_arena: &'data Arena<String>,
+
     file_system: Arc<F>,
 }
 
@@ -186,10 +194,16 @@ struct LoadedFile<'data, P: Platform, I: InputFileData> {
 
 enum LoadedFileState<'data, P: Platform, I: InputFileData> {
     Loaded(&'data InputFile<I>, InputRecord<'data, P>),
+    /// A Mach-O object, together with any libraries it named for itself.
+    Object(&'data InputFile<I>, InputRecord<'data, P>, Vec<FileLoadIndex>),
     Archive(&'data InputFile<I>, Vec<InputRecord<'data, P>>),
     ThinArchive(Vec<&'data InputFile<I>>, Vec<InputRecord<'data, P>>),
     LinkerScript(&'data InputFile<I>, LoadedLinkerScriptState<'data>),
-    StubLibrary(&'data InputFile<I>, DefinedStubLibrary<'data>),
+    StubLibrary(
+        &'data InputFile<I>,
+        DefinedStubLibrary<'data>,
+        Vec<FileLoadIndex>,
+    ),
     Error(Error),
 }
 
@@ -240,6 +254,7 @@ struct LoadedLinkerScript<'data> {
 pub(crate) struct AuxiliaryFiles<'data> {
     pub(crate) version_script_data: Option<ScriptData<'data>>,
     pub(crate) export_list_data: Option<ScriptData<'data>>,
+    pub(crate) unexport_list_data: Option<ScriptData<'data>>,
 }
 
 impl<'data> AuxiliaryFiles<'data> {
@@ -269,6 +284,10 @@ impl<'data> AuxiliaryFiles<'data> {
                 .export_list_path()
                 .map(|path| read_script_data(&resolve_script_path(path), inputs_arena, file_system))
                 .transpose()?,
+            unexport_list_data: args
+                .unexport_list_path()
+                .map(|path| read_script_data(&resolve_script_path(path), inputs_arena, file_system))
+                .transpose()?,
         })
     }
 }
@@ -276,9 +295,11 @@ impl<'data> AuxiliaryFiles<'data> {
 impl<'data, F: FileSystem> FileLoader<'data, F> {
     pub(crate) fn new(
         inputs_arena: &'data Arena<InputFile<F::Input>>,
+        symbol_names_arena: &'data Arena<String>,
         file_system: Arc<F>,
     ) -> Self {
         Self {
+            symbol_names_arena,
             loaded_files: Vec::new(),
             inputs_arena,
             file_system,
@@ -321,6 +342,7 @@ impl<'data, F: FileSystem> FileLoader<'data, F> {
             next_file_load_index: AtomicUsize::new(initial_work.len()),
             files: SegQueue::new(),
             inputs_arena: self.inputs_arena,
+            symbol_names_arena: self.symbol_names_arena,
             file_system: Arc::clone(&self.file_system),
         };
 
@@ -415,6 +437,14 @@ impl<'data, F: FileSystem> FileLoader<'data, F> {
                 loaded.add_record(parse_result, plugin);
                 self.loaded_files.push(input_file);
             }
+            Some(LoadedFileState::Object(input_file, parsed, file_indexes)) => {
+                loaded.add_record(parsed, plugin);
+                self.loaded_files.push(input_file);
+
+                for i in file_indexes {
+                    self.extract_file(i, files, loaded, plugin)?;
+                }
+            }
             Some(LoadedFileState::Archive(input_file, parsed_parts)) => {
                 loaded.add_records(parsed_parts, plugin);
                 self.loaded_files.push(input_file);
@@ -434,7 +464,7 @@ impl<'data, F: FileSystem> FileLoader<'data, F> {
                     self.extract_file(i, files, loaded, plugin)?;
                 }
             }
-            Some(LoadedFileState::StubLibrary(input_file, defined_stub_library)) => {
+            Some(LoadedFileState::StubLibrary(input_file, defined_stub_library, file_indexes)) => {
                 self.has_dynamic = true;
                 loaded.stub_libraries.push(LoadedStubLibrary {
                     input: InputRef {
@@ -445,6 +475,10 @@ impl<'data, F: FileSystem> FileLoader<'data, F> {
                     defined_symbols: defined_stub_library,
                 });
                 self.loaded_files.push(input_file);
+
+                for i in file_indexes {
+                    self.extract_file(i, files, loaded, plugin)?;
+                }
             }
             Some(LoadedFileState::Error(error)) => {
                 // For now, we just report the first error that we come to.
@@ -614,6 +648,60 @@ fn process_fat_macho_object<'data, P: Platform, F: FileSystem>(
 }
 
 impl<'data, P: Platform, F: FileSystem> TemporaryState<'data, P, F> {
+    /// Loads the libraries a Mach-O object names for itself, returning where each one landed.
+    ///
+    /// The options are the arguments that would otherwise have been passed, so they are turned back
+    /// into the inputs those arguments would have produced. Anything we don't recognise is left
+    /// alone: an option we can't act on is better ignored than guessed at, and the symbols it would
+    /// have provided will be reported missing by name if they are actually needed.
+    fn macho_autolinked_inputs<'scope>(
+        &'scope self,
+        input_file: &'data InputFile<F::Input>,
+        scope: &Scope<'scope>,
+    ) -> Result<Vec<FileLoadIndex>>
+    where
+        'data: 'scope,
+    {
+        let mut indexes = Vec::new();
+
+        for option in crate::macho::linker_options(input_file.data())? {
+            let spec = match option.as_slice() {
+                [flag] if let Some(name) = flag.strip_prefix("-l") => {
+                    InputSpec::Lib(Box::from(name))
+                }
+                ["-framework", name] => InputSpec::Framework(Box::from(*name)),
+                _ => continue,
+            };
+
+            let mut modifiers = input_file.modifiers;
+            modifiers.autolinked = true;
+
+            indexes.push(self.load_input(
+                &Input {
+                    spec,
+                    search_first: None,
+                    modifiers,
+                },
+                scope,
+                Some(input_file.filename.clone()),
+            )?);
+        }
+
+        Ok(indexes)
+    }
+
+    /// Returns the stub that describes the library with the given install name.
+    ///
+    /// An install name says where the library will be at run time; inside an SDK what sits at that
+    /// path is the `.tbd` standing in for it. `/usr/lib/libobjc.A.dylib` is described by
+    /// `libobjc.A.tbd`, and a framework's versioned binary by a `.tbd` beside it.
+    fn stub_library_path(&self, install_name: &str) -> Option<PathBuf> {
+        let sysroot = self.args.sysroot()?;
+        let relative = install_name.strip_prefix('/')?;
+        let candidate = sysroot.join(relative).with_extension("tbd");
+
+        candidate.exists().then_some(candidate)
+    }
     fn process_and_record_open_file_request<'scope>(
         &'scope self,
         request: OpenFileRequest,
@@ -694,14 +782,78 @@ impl<'data, P: Platform, F: FileSystem> TemporaryState<'data, P, F> {
                 ))
             }
             FileKind::MachOStubLibrary => {
-                let defined_library = parse_defined_library(str::from_utf8(input_file.data())?)
-                    .with_context(|| format!("Failed to process `{}`", absolute_path.display()))?;
+                let defined_library = parse_defined_library(
+                    str::from_utf8(input_file.data())?,
+                    self.symbol_names_arena,
+                )
+                .with_context(|| format!("Failed to process `{}`", absolute_path.display()))?;
                 tracing::debug!(file = ?input_file.filename, symbols = defined_library.symbols.len(),
                     weak_symbols = defined_library.weak_symbols.len(), "loaded TBD library");
-                Ok(LoadedFileState::StubLibrary(input_file, defined_library))
+
+                // What a library passes on the exports of is as much a part of what it offers as
+                // what it defines itself, so those files are read too.
+                let file_indexes = defined_library
+                    .reexported_libraries
+                    .iter()
+                    .filter_map(|install_name| {
+                        let path = self.stub_library_path(install_name)?;
+
+                        Some(self.load_input(
+                            &Input {
+                                spec: InputSpec::File(path.into_boxed_path()),
+                                search_first: None,
+                                modifiers: input_file.modifiers,
+                            },
+                            scope,
+                            Some(input_file.filename.clone()),
+                        ))
+                    })
+                    .collect::<Result<Vec<FileLoadIndex>>>()?;
+
+                Ok(LoadedFileState::StubLibrary(
+                    input_file,
+                    defined_library,
+                    file_indexes,
+                ))
             }
             FileKind::FatMachOObject => {
                 process_fat_macho_object(input_file, input_ref, file.as_ref(), self)
+            }
+            FileKind::MachOObject => {
+                // An object can name the libraries it needs rather than leaving it to whoever
+                // links it. Those are read before the object is parsed, so that what they define is
+                // available to resolve it against.
+                let file_indexes = self.macho_autolinked_inputs(input_file, scope)?;
+                let parsed = self.process_input(input_ref, file.as_ref(), kind)?;
+
+                Ok(LoadedFileState::Object(input_file, parsed, file_indexes))
+            }
+            FileKind::MachODylib => {
+                // A dylib can pass on what another one exports, and dyld looks through it when
+                // resolving a symbol against this one - so we have to look through it too, or a
+                // program binding to something an umbrella library never defined has nowhere to
+                // find it. Same relationship a `.tbd` states with `reexported-libraries`; a real
+                // dylib states it in a load command instead.
+                let file_indexes = crate::macho::reexported_dylibs(input_file.data())?
+                    .iter()
+                    .filter_map(|install_name| {
+                        let path = self.reexported_dylib_path(install_name)?;
+
+                        Some(self.load_input(
+                            &Input {
+                                spec: InputSpec::File(path.into_boxed_path()),
+                                search_first: None,
+                                modifiers: input_file.modifiers,
+                            },
+                            scope,
+                            Some(input_file.filename.clone()),
+                        ))
+                    })
+                    .collect::<Result<Vec<FileLoadIndex>>>()?;
+
+                let parsed = self.process_input(input_ref, file.as_ref(), kind)?;
+
+                Ok(LoadedFileState::Object(input_file, parsed, file_indexes))
             }
             _ => {
                 verbose_timing_phase!(
@@ -712,6 +864,19 @@ impl<'data, P: Platform, F: FileSystem> TemporaryState<'data, P, F> {
                 Ok(LoadedFileState::Loaded(input_file, parsed))
             }
         }
+    }
+
+    /// Where to find a library a dylib says it passes on the exports of.
+    ///
+    /// The name is what the library calls itself, which is a path but not necessarily one that
+    /// exists here: an SDK holds a stub beside the others rather than the library the name points
+    /// at. So the stub is looked for first and the name used as written only if there isn't one.
+    fn reexported_dylib_path(&self, install_name: &str) -> Option<PathBuf> {
+        self.stub_library_path(install_name).or_else(|| {
+            Path::new(install_name)
+                .exists()
+                .then(|| install_name.into())
+        })
     }
 
     /// Sends a request to load `input` unless it has already been requested. In either case, return
@@ -880,8 +1045,21 @@ impl Input {
                 })
             }
             InputSpec::Lib(lib_name) => {
+                // Dynamic first, then static, which is what both platforms' system linkers do. The
+                // dynamic spellings are per-format and only one of them will ever be found: `.so`
+                // on ELF, and on Mach-O either the library itself or the `.tbd` stub that stands
+                // in for it inside an SDK.
+                let mut candidates = Vec::new();
+
                 if self.modifiers.allow_shared {
-                    let filename = format!("lib{lib_name}.so");
+                    candidates.push(format!("lib{lib_name}.so"));
+                    candidates.push(format!("lib{lib_name}.dylib"));
+                    candidates.push(format!("lib{lib_name}.tbd"));
+                }
+
+                candidates.push(format!("lib{lib_name}.a"));
+
+                for filename in candidates {
                     if let Some(path) = search_for_file(
                         file_system,
                         args.lib_search_path(),
@@ -894,31 +1072,31 @@ impl Input {
                         });
                     }
                 }
-                let filename = format!("lib{lib_name}.a");
-                if let Some(path) = search_for_file(
-                    file_system,
-                    args.lib_search_path(),
-                    self.search_first.as_ref(),
-                    &filename,
-                ) {
-                    return Ok(InputPath {
-                        absolute: std::path::absolute(&path)?,
-                        original: PathBuf::from(filename),
-                    });
-                }
-                let filename = format!("lib{lib_name}.tbd");
-                if let Some(path) = search_for_file(
-                    file_system,
-                    args.lib_search_path(),
-                    self.search_first.as_ref(),
-                    &filename,
-                ) {
-                    return Ok(InputPath {
-                        absolute: std::path::absolute(&path)?,
-                        original: PathBuf::from(filename),
-                    });
-                }
                 bail!("Couldn't find library `{lib_name}` on library search path");
+            }
+            // A framework is a directory `Name.framework` holding, among other things, a library
+            // called `Name`. In an SDK that library is a `.tbd` stub describing what the real one
+            // exports; on the running system it's the dylib itself. Try the stub first, which is
+            // what a link against an SDK will find, and fall back to the library.
+            InputSpec::Framework(name) => {
+                for filename in [
+                    format!("{name}.framework/{name}.tbd"),
+                    format!("{name}.framework/{name}"),
+                ] {
+                    if let Some(path) = search_for_file(
+                        file_system,
+                        args.framework_search_path(),
+                        self.search_first.as_ref(),
+                        &filename,
+                    ) {
+                        return Ok(InputPath {
+                            absolute: std::path::absolute(&path)?,
+                            original: PathBuf::from(filename),
+                        });
+                    }
+                }
+
+                bail!("Couldn't find framework `{name}` on framework search path");
             }
             InputSpec::Search(filename) => {
                 if let Some(path) = search_for_file(
@@ -1023,6 +1201,46 @@ impl<'data> InputRef<'data> {
 
     fn is_archive_entry(&self) -> bool {
         self.entry.is_some()
+    }
+
+    /// When the file was last written, as seconds since the epoch.
+    ///
+    /// A Mach-O debug map records this alongside the object's path so that a later `dsymutil` can
+    /// tell whether the object it finds there is still the one that was linked.
+    pub(crate) fn modification_time_seconds(&self) -> u64 {
+        // A member of an archive gets no timestamp. The archive's own would be the wrong answer -
+        // what a reader checks it against is the member's header inside the archive - and ld64
+        // writes zero here, which is read as "don't check".
+        if self.entry.is_some() {
+            return 0;
+        }
+
+        self.file
+            .modification_time
+            .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |elapsed| elapsed.as_secs())
+    }
+
+    /// The path to record for this input, which for an archive member names the member inside the
+    /// archive the way `dsymutil` expects to read it back.
+    pub(crate) fn debug_map_path(&self) -> PathBuf {
+        // Absolute, because whoever reads the map later - `dsymutil`, or a debugger - is not
+        // running in the directory the link ran in, and a relative path would send them somewhere
+        // else or nowhere at all.
+        let filename =
+            std::path::absolute(self.file.filename).unwrap_or_else(|_| self.file.filename.to_path_buf());
+
+        match &self.entry {
+            Some(entry) => {
+                let member = String::from_utf8_lossy(entry.identifier.as_slice()).into_owned();
+                let mut path = filename.into_os_string();
+                path.push("(");
+                path.push(member);
+                path.push(")");
+                PathBuf::from(path)
+            }
+            None => filename,
+        }
     }
 }
 

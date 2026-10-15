@@ -623,6 +623,31 @@ fn parse_version_section<'data>(input: &mut &'data BStr) -> winnow::Result<RawVe
     Ok(out)
 }
 
+/// Classifies a bare symbol name as exact or as one of the glob shapes.
+///
+/// Shared so that a name means the same thing however the list naming it was written - a version
+/// script and a plain export list should not disagree about what `foo*` matches.
+pub(crate) fn classify_matcher(token: &[u8]) -> crate::error::Result<SymbolMatcher<'_>> {
+    Ok(match analyze_glob_pattern(token) {
+        GlobPatternType::Exact => SymbolMatcher::Exact(token),
+        GlobPatternType::EscapedExact => SymbolMatcher::EscapedExact(token),
+        GlobPatternType::Star => SymbolMatcher::StarGlob(
+            Pattern::new(
+                std::str::from_utf8(token)
+                    .map_err(|_| crate::error!("Invalid UTF-8 in an exported symbol name"))?,
+            )
+            .map_err(|_| crate::error!("Invalid glob in an exported symbol name"))?,
+        ),
+        GlobPatternType::NonStar => SymbolMatcher::NonstarGlob(
+            Pattern::new(
+                std::str::from_utf8(token)
+                    .map_err(|_| crate::error!("Invalid UTF-8 in an exported symbol name"))?,
+            )
+            .map_err(|_| crate::error!("Invalid glob in an exported symbol name"))?,
+        ),
+    })
+}
+
 pub(crate) fn parse_matcher<'data>(
     input: &mut &'data BStr,
     without_semicolon: bool, // e.g. symbol to export passed via CLI arg

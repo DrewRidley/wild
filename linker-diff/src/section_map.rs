@@ -265,6 +265,11 @@ impl<'data> IndexedLayout<'data> {
         self.files[section_id.file_index].sections[section_id.section_index.0].as_ref()
     }
 
+    /// Every caller of this is inside `asm_diff`, which gates on file format up front
+    /// (`Report::require_format("asm-diff", .., &["elf"])`). Some of those callers `.ok()` the
+    /// error away; that is only safe because of that gate. If you make `asm_diff` run for another
+    /// format, audit those call sites first - they will silently skip sections rather than report
+    /// that they could not read them.
     pub(crate) fn get_elf_section(
         &self,
         section_id: InputSectionId,
