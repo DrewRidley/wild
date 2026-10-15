@@ -4282,6 +4282,7 @@ fn compute_data_addresses(
         .map(|(i, input)| (input.file_id, i))
         .collect();
 
+    let mut func_overrides: Vec<(usize, usize, u32)> = Vec::new();
     for (obj_idx, (index_map, symbols)) in object_index_maps
         .iter_mut()
         .zip(per_object_symbols.iter())
@@ -4289,18 +4290,33 @@ fn compute_data_addresses(
     {
         let mut data_addresses = vec![0u32; symbols.len()];
         for (sym_idx, sym) in symbols.iter().enumerate() {
+            let symbol_id = layout_inputs[obj_idx].symbol_id_range.offset_to_id(sym_idx);
+            let def_id = symbol_db.definition(symbol_id);
+
+            if sym.kind == WasmSymbolKind::Func && !sym.is_undefined() && def_id != symbol_id {
+                let def_file_id = symbol_db.file_id_for_symbol(def_id);
+                if let Some(&def_obj_idx) = file_id_to_index.get(&def_file_id) {
+                    let def_input = &layout_inputs[def_obj_idx];
+                    let def_sym = per_object_symbols[def_obj_idx]
+                        [def_id.to_offset(def_input.symbol_id_range)];
+                    if !def_sym.is_undefined() && def_sym.kind == WasmSymbolKind::Func {
+                        func_overrides.push((obj_idx, sym.index as usize, def_sym.index));
+                        // Temporarily store def_obj_idx in the high bits? Even simpler: store tuplewith def_obj_idx.
+                    }
+                }
+                continue;
+            }
+
             if sym.kind != WasmSymbolKind::Data {
                 continue;
             }
-            let symbol_id = layout_inputs[obj_idx].symbol_id_range.offset_to_id(sym_idx);
 
-            if !sym.is_undefined() {
+            if !sym.is_undefined() && def_id == symbol_id {
                 data_addresses[sym_idx] =
                     data_symbol_memory_address(&object_data_layouts[obj_idx], sym)?;
                 continue;
             }
 
-            let def_id = symbol_db.definition(symbol_id);
             let def_file_id = symbol_db.file_id_for_symbol(def_id);
 
             if let Some(&def_obj_idx) = file_id_to_index.get(&def_file_id) {
@@ -4324,6 +4340,35 @@ fn compute_data_addresses(
             }
         }
         index_map.data_addresses = data_addresses;
+    }
+
+    for (obj_idx, sym_func_idx, _) in func_overrides {
+        // Resolve overridden defined functions to their winning definition's output function index.
+        let symbols = &per_object_symbols[obj_idx];
+        if let Some(sym) = symbols
+            .iter()
+            .find(|s| s.kind == WasmSymbolKind::Func && s.index as usize == sym_func_idx)
+        {
+            let sym_idx = (sym as *const WasmSymbol as usize - symbols.as_ptr() as usize)
+                / size_of::<WasmSymbol>();
+            let symbol_id = layout_inputs[obj_idx].symbol_id_range.offset_to_id(sym_idx);
+            let def_id = symbol_db.definition(symbol_id);
+            let def_file_id = symbol_db.file_id_for_symbol(def_id);
+            if let Some(&def_obj_idx) = file_id_to_index.get(&def_file_id) {
+                let def_input = &layout_inputs[def_obj_idx];
+                let def_sym =
+                    per_object_symbols[def_obj_idx][def_id.to_offset(def_input.symbol_id_range)];
+                if let Some(&target_out_idx) = object_index_maps[def_obj_idx]
+                    .function_indices
+                    .get(def_sym.index as usize)
+                    && let Some(slot) = object_index_maps[obj_idx]
+                        .function_indices
+                        .get_mut(sym_func_idx)
+                {
+                    *slot = target_out_idx;
+                }
+            }
+        }
     }
 
     Ok(())

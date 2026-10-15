@@ -46,6 +46,7 @@ pub struct WasmArgs {
     pub(crate) entry: Option<String>,
     pub(crate) strip_all: bool,
     pub(crate) strip_debug: bool,
+    pub(crate) allow_multiple_definitions: bool,
 }
 
 impl WasmArgs {
@@ -68,6 +69,7 @@ impl Default for WasmArgs {
             entry: Some(DEFAULT_ENTRY.to_owned()),
             strip_all: false,
             strip_debug: false,
+            allow_multiple_definitions: false,
         }
     }
 }
@@ -87,6 +89,10 @@ impl platform::Args for WasmArgs {
 
     fn should_strip_all(&self) -> bool {
         self.strip_all
+    }
+
+    fn allow_multiple_definitions(&self) -> bool {
+        self.allow_multiple_definitions
     }
 
     fn entry_point<'a>(
@@ -244,6 +250,14 @@ fn setup_argument_parser() -> ArgumentParser<WasmArgs> {
         .declare_with_param()
         .prefix("z")
         .help("Linker options")
+        .sub_option(
+            "muldefs",
+            "Allow multiple definitions",
+            |args, _modifier_stack| {
+                args.allow_multiple_definitions = true;
+                Ok(())
+            },
+        )
         .sub_option_with_value(
             "stack-size=",
             "Set the main stack size in linear memory",
@@ -274,6 +288,15 @@ fn setup_argument_parser() -> ArgumentParser<WasmArgs> {
         .help("Place stack at the end of linear memory after data")
         .execute(|args, _modifier_stack| {
             args.stack_first = false;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("allow-multiple-definition")
+        .help("Allow multiple definitions")
+        .execute(|args, _modifier_stack| {
+            args.allow_multiple_definitions = true;
             Ok(())
         });
 
