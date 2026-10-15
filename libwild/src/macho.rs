@@ -1657,7 +1657,8 @@ impl platform::SectionAttributes for SectionAttributes {
     }
 
     fn is_executable(&self) -> bool {
-        false
+        self.flags
+            .contains(macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS)
     }
 
     fn is_tls(&self) -> bool {
@@ -3157,6 +3158,10 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::FILE_HEADER);
         builder.add_section(output_section_id::LOAD_COMMANDS);
         // Content of the sections (e.g. __text, __data).
+        // `__stubs` and `__objc_stubs` go before `__text` because `thunks.rs` assumes all
+        // non-primary executable parts precede `primary_function_part_id` (`__text` align 4).
+        builder.add_section(output_section_id::PLT_GOT);
+        builder.add_section(output_section_id::OBJC_STUBS);
         builder.add_section(output_section_id::TEXT);
         builder.add_section(output_section_id::CSTRING);
         builder.add_section(output_section_id::OBJC_METHNAME);
@@ -3179,8 +3184,6 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::SWIFT5_ACFUNCS);
         builder.add_section(output_section_id::SWIFT_CONSTG);
         builder.add_section(output_section_id::SWIFT_MODHASH);
-        builder.add_section(output_section_id::PLT_GOT);
-        builder.add_section(output_section_id::OBJC_STUBS);
         // The `__DATA_CONST` sections go before `__DATA`'s: the zerofill at the end of `__DATA`
         // must not sit between the file's start and any segment carrying chained fixups - see
         // `SegmentType` for what goes wrong when it does.

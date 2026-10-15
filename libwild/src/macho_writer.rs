@@ -1866,11 +1866,14 @@ fn collect_unwind_entries(layout: &MachOLayout<'_>) -> Result<Vec<UnwindEntry>> 
                     }
 
                     let frame_offset = eh_frame.base + fde.output_offset;
-
-                    ensure!(
-                        frame_offset <= UNWIND_ARM64_DWARF_SECTION_OFFSET,
-                        "__eh_frame is too large for a DWARF unwind entry to reach into"
-                    );
+                    // A DWARF compact-unwind entry only has 24 bits (`0x00ff_ffff`, 16 MiB) for
+                    // the FDE offset. Past that, ld64 leaves the offset zero and libunwind falls
+                    // back to searching `__eh_frame` by PC.
+                    let frame_offset = if frame_offset <= UNWIND_ARM64_DWARF_SECTION_OFFSET {
+                        frame_offset
+                    } else {
+                        0
+                    };
 
                     entries.push(UnwindEntry {
                         function_address: fde.output_address,
@@ -1993,10 +1996,11 @@ fn read_compact_unwind_section(
                     )
                 })?;
 
-            ensure!(
-                frame_offset <= UNWIND_ARM64_DWARF_SECTION_OFFSET,
-                "__eh_frame is too large for a DWARF unwind entry to reach into"
-            );
+            let frame_offset = if frame_offset <= UNWIND_ARM64_DWARF_SECTION_OFFSET {
+                frame_offset
+            } else {
+                0
+            };
 
             encoding = (encoding & !UNWIND_ARM64_DWARF_SECTION_OFFSET) | frame_offset;
         }

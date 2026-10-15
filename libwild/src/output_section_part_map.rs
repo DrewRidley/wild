@@ -227,9 +227,9 @@ fn test_merge_parts() {
     );
 
     // Subtract the Mach-O specific sections, none of which an ELF link places: `__cstring`,
-    // `__const`, `__thread_vars`, `__common`, `__eh_frame` and the sixteen that hold Swift's
-    // metadata.
-    let num_regular_sections = output_sections.num_regular_sections() - 5 - 16;
+    // `__const`, `__thread_vars`, `__common`, `__eh_frame`, `__objc_selrefs` and the sixteen that
+    // hold Swift's metadata.
+    let num_regular_sections = output_sections.num_regular_sections() - 6 - 16;
     let mut num_sections_with_17 = 0;
 
     let mut sum_of_1s = output_sections.new_section_map::<u32>();
@@ -245,6 +245,7 @@ fn test_merge_parts() {
         output_section_id::THREAD_VARS,
         output_section_id::COMMON,
         output_section_id::MACHO_EH_FRAME,
+        output_section_id::OBJC_SELREFS,
         // Swift metadata, which only Mach-O has.
         output_section_id::SWIFT5_TYPEREF,
         output_section_id::SWIFT5_REFLSTR,
@@ -268,6 +269,8 @@ fn test_merge_parts() {
         output_section_id::INDIRECT_SYMTAB,
         output_section_id::UNWIND_INFO,
         output_section_id::EXPORT_TRIE,
+        output_section_id::OBJC_STUBS,
+        output_section_id::OBJC_METHNAME,
         output_section_id::CODE_SIGNATURE,
         // Wasm specific sections.
         output_section_id::WASM_TYPE,
